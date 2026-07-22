@@ -2249,18 +2249,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 			model = await resolveFallbackModel();
 
-			// Cold start against a discovery-only local provider (lm-studio, ollama,
-			// llama.cpp): those ship no bundled models, so the static+cached catalog
-			// resolved nothing above. The background discovery in main.ts fires only
-			// AFTER createAgentSession returns, so on a cache-cold boot nothing has
-			// populated the catalog yet and a configured local default silently
-			// degrades to "No models available" — even though `omp models` (which
-			// awaits discovery) lists them. Await one cache-aware discovery pass and
-			// retry resolution, matching `omp models`. Gated on the already-failed
-			// resolution and the presence of discoverable providers, so the common
-			// path (a bundled provider's key resolves a model above) never pays for
-			// it. (issue #6114)
-			if (!model && !hasExplicitModel && modelRegistry.getDiscoverableProviders().length > 0) {
+			// Retry the resolution once against freshly-discovered models when a
+			// configured default role can't be satisfied by the static+cached
+			// catalog. Discovery-only providers ship no bundled models — local
+			// runtimes (lm-studio, ollama, llama.cpp) and built-in-discovered
+			// gateways (litellm, openai-compat plugins) alike — so on a cache-cold
+			// boot the configured default resolves to nothing above. Two failure
+			// shapes:
+			//   1. No other authed provider → `model` is undefined and startup
+			//      prints "No models available" even though `omp models` (which
+			//      awaits discovery) lists them.
+			//   2. Another authed provider exists (e.g. a stray OPENAI/codex key) →
+			//      `pickDefaultAvailableModel` masks the miss with that provider's
+			//      bundled default, so the session silently ignores the configured
+			//      default role.
+			// The background discovery in main.ts fires only AFTER
+			// createAgentSession returns, so neither case sees the discovered
+			// catalog. Await one cache-aware discovery pass (bounded to at most one
+			// fetch per cache TTL, matching `omp models`) and retry — but only when
+			// the configured default role is genuinely unresolved, so the common
+			// path (default role satisfied on the first pass) never pays for it.
+			// (issues #6114, #3569)
+			const defaultRoleUnresolved = !defaultRoleSpec.model && Boolean(settings.getModelRole("default")?.trim());
+			const canDiscover = defaultRoleUnresolved || modelRegistry.getDiscoverableProviders().length > 0;
+			if (!hasExplicitModel && (!model || defaultRoleUnresolved) && canDiscover) {
 				await logger.time("resolveModelDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
 				model = await resolveFallbackModel();
 			}

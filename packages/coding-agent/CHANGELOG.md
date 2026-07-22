@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed the configured default model for discovery-only local providers (LM Studio, Ollama, llama.cpp) being ignored on a cache-cold interactive launch, surfacing as "No models available" even though `omp models` listed them. Startup now awaits one cache-aware discovery pass and retries resolution when the initial fallback finds no model and discoverable providers exist ([#6114](https://github.com/can1357/oh-my-pi/issues/6114)).
+- Fixed the configured `modelRoles.default` for a discovery-only provider (local runtimes LM Studio/Ollama/llama.cpp and gateways like LiteLLM) being ignored on a cache-cold interactive launch. Those providers ship no bundled models, so the configured default couldn't resolve against the static+cached catalog at startup — surfacing either as "No models available" or, when another authed provider was present, as a silent start on that provider's bundled default. Startup now awaits one cache-aware discovery pass and retries resolution whenever the configured default role is unresolved ([#6114](https://github.com/can1357/oh-my-pi/issues/6114)).
 
 ## [17.0.5] - 2026-07-18
 
