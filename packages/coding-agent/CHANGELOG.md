@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a terminal non-retryable provider error (zero content blocks, `stopReason: "error"`) after a failed tool result being silently dropped from the session: the `isEmptyErrorTurn` persistence gate skipped it and the run relied on a live pinned render that never fires when the main session's UI subscription is detached (e.g. while focused on a subagent transcript), so the failure vanished with no durable record. The empty error turn is now persisted on the terminal fall-through — matching the existing retry-budget/delay-cap paths — so unfocus/reload rebuilds keep the provider `errorMessage` ([#6250](https://github.com/can1357/oh-my-pi/issues/6250)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
