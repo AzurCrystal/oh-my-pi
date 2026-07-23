@@ -61,6 +61,16 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+async function writeConfigFile(configPath: string, settings: RawSettings): Promise<void> {
+	let writePath = configPath;
+	try {
+		writePath = await fs.promises.realpath(configPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	await Bun.write(writePath, YAML.stringify(settings, null, 2));
+}
+
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -1176,7 +1186,7 @@ export class Settings {
 		// 3. Write merged settings
 		if (migrated && Object.keys(settings).length > 0) {
 			try {
-				await Bun.write(this.#configPath, YAML.stringify(settings, null, 2));
+				await writeConfigFile(this.#configPath, settings);
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
@@ -1765,7 +1775,7 @@ export class Settings {
 
 				// Update our global with any external changes we preserved
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				await writeConfigFile(configPath, this.#global);
 				// These pending roles were included in this write. Remove each
 				// only if no newer local change arrived while Bun.write was in
 				// flight; a newer value still needs the queued follow-up save.
@@ -1827,7 +1837,7 @@ export class Settings {
 					setByPath(projectSettings, ["modelRoles", role], value);
 				}
 
-				await Bun.write(projectConfigPath, YAML.stringify(projectSettings, null, 2));
+				await writeConfigFile(projectConfigPath, projectSettings);
 			});
 			invalidateCapabilityFsCache(projectConfigPath);
 		} catch (error) {

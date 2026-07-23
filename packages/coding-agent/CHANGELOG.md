@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Fixed settings saves replacing symlinked global and project `config.yml` files, preserving dotfiles/Nix links by writing through to their targets instead ([#4452](https://github.com/can1357/oh-my-pi/issues/4452)).
 - Fixed discarded `Settings` instances keeping debounced save timers and chained background saves armed; discarding an instance now cancels its pending writes so they cannot race a successor's file locks.
 - Fixed `error.notify` raising a "Stopped with error" toast for provider failures while an auto-retry or async-delivery continuation was pending; the toast now waits for the true terminal settle.
 - Fixed terminal `yield` results racing post-turn maintenance, which could trigger an unnecessary automatic handoff or compaction.
