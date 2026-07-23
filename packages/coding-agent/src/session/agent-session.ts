@@ -3080,6 +3080,12 @@ export class AgentSession {
 		}
 	}
 
+	/** Drop mutable tool decisions and directives owned by the previous logical session. */
+	#clearSessionScopedToolState(): void {
+		this.#toolChoiceQueue.clear();
+		this.#acpPermissionDecisions.clear();
+	}
+
 	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {
 		const legacy = !this.#advisorConfigs?.length;
 		const roster: AdvisorConfig[] = legacy ? [{ name: "default" }] : this.#advisorConfigs!;
@@ -10238,6 +10244,7 @@ export class AgentSession {
 			this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
 		}
 
+		this.#clearSessionScopedToolState();
 		this.#clearCheckpointRuntimeState();
 		this.setTodoPhases([]);
 		this.#freshProviderSessionId = undefined;
@@ -17350,6 +17357,9 @@ export class AgentSession {
 
 			if (switchingToDifferentSession) {
 				await this.#resetMemoryContextForNewTranscript();
+			}
+			if (switchingToDifferentSession) {
+				this.#clearSessionScopedToolState();
 			}
 			this.#reconnectToAgent();
 			try {

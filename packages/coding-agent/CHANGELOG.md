@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Fixed `/new` and cross-session switches retaining staged preview resolve callbacks and per-session ACP `allow_always`/`reject_always` decisions from the previous session ([#4093](https://github.com/can1357/oh-my-pi/issues/4093)).
+
 - Fixed `error.notify` raising a "Stopped with error" toast for provider failures while an auto-retry or async-delivery continuation was pending; the toast now waits for the true terminal settle.
 - Fixed terminal `yield` results racing post-turn maintenance, which could trigger an unnecessary automatic handoff or compaction.
 - Fixed credential-shaped tokens (GitHub/GitLab/OpenAI/Anthropic key patterns) being redacted from outbound provider requests even with `secrets.enabled` off; the pattern redaction now follows the `secrets.enabled` ("Hide Secrets") setting like the secret obfuscator.

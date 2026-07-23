@@ -22,6 +22,7 @@ describe("AgentSession resolve reminder", () => {
 	let mock: MockModel;
 	let authStorage: AuthStorage | undefined;
 
+	const transitions: Array<"new" | "switch"> = ["new", "switch"];
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-resolve-reminder-test-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
@@ -54,7 +55,7 @@ describe("AgentSession resolve reminder", () => {
 
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.create(tempDir, path.join(tempDir, "sessions")),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -68,6 +69,26 @@ describe("AgentSession resolve reminder", () => {
 			removeSyncWithRetries(tempDir);
 		}
 	});
+
+	async function changeLogicalSession(transition: "new" | "switch"): Promise<void> {
+		if (transition === "new") {
+			expect(await session.newSession()).toBe(true);
+			return;
+		}
+		const targetId = `target-${Snowflake.next()}`;
+		const targetPath = path.join(tempDir, `${targetId}.jsonl`);
+		await Bun.write(
+			targetPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: targetId,
+				timestamp: new Date().toISOString(),
+				cwd: tempDir,
+			})}\n`,
+		);
+		expect(await session.switchSession(targetPath)).toBe(true);
+	}
 
 	it("delivers the resolve reminder via a non-forcing soft requirement, not a steer or a forced tool_choice", () => {
 		queueResolveHandler(toolSession, {
@@ -91,6 +112,21 @@ describe("AgentSession resolve reminder", () => {
 			expect(reminder.customType).toBe("resolve-reminder");
 		}
 		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+	});
+
+	it.each(transitions)("clears a staged preview after a successful %s session boundary", async transition => {
+		queueResolveHandler(toolSession, {
+			label: "AST Edit: 1 replacement in 1 file",
+			sourceToolName: "ast_edit",
+			apply: async () => ({ content: [{ type: "text", text: "Applied" }] }),
+		});
+		expect(session.peekPendingInvoker()).toBeDefined();
+		expect(isSoftToolRequirement(session.nextToolChoiceDirective())).toBe(true);
+
+		await changeLogicalSession(transition);
+
+		expect(session.peekPendingInvoker()).toBeUndefined();
+		expect(session.nextToolChoiceDirective()).toBeUndefined();
 	});
 
 	it("dispatches a staged preview through the production toolSession wiring and drains the gate", async () => {
