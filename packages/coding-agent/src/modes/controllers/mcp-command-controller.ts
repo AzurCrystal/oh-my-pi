@@ -51,6 +51,7 @@ import type { MCPAuthChallenge, MCPAuthConfig, MCPServerConfig, MCPServerConnect
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
 import { copyToClipboard } from "../../utils/clipboard";
+import { isTimeoutError } from "../../utils/fetch-timeout";
 import { openPath } from "../../utils/open";
 import { ChatBlock } from "../components/chat-block";
 import { MCPAddWizard } from "../components/mcp-add-wizard";
@@ -2121,12 +2122,19 @@ export class MCPCommandController {
 			if (Date.now() - startedAt >= timeoutMs) {
 				throw new Error("Smithery authorization timed out after 5 minutes.");
 			}
-			const response = await pollSmitheryCliAuthSession(sessionId, signal);
-			if (response.status === "success" && response.apiKey) {
-				return response.apiKey;
-			}
-			if (response.status === "error") {
-				throw new Error(response.message ?? "Smithery authorization failed.");
+			try {
+				const response = await pollSmitheryCliAuthSession(sessionId, signal);
+				if (response.status === "success" && response.apiKey) {
+					return response.apiKey;
+				}
+				if (response.status === "error") {
+					throw new Error(response.message ?? "Smithery authorization failed.");
+				}
+			} catch (error) {
+				// A single hung/slow poll aborts via the per-request timeout; keep
+				// polling until the overall 5-minute deadline rather than failing the
+				// whole browser login on one timed-out request.
+				if (!isTimeoutError(error)) throw error;
 			}
 			await Bun.sleep(pollIntervalMs);
 		}
