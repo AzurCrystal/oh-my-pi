@@ -11739,6 +11739,8 @@ export class AgentSession {
 				this.#finishBashSessionTransition(bashTransition, sessionTransitioned);
 			}
 
+			this.#clearSessionScopedToolState();
+
 			this.#clearCheckpointRuntimeState();
 			// agent.reset() clears the core steering/follow-up queues. Preserve any queued
 			// steers/follow-ups (RPC/SDK steer()/followUp() issued during the handoff, or a
