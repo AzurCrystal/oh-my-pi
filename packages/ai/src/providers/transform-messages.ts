@@ -524,6 +524,18 @@ export function transformMessages<TApi extends Api>(
 			// session-level model swaps (#2257).
 			const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
 			const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
+			// Anthropic's byte-for-byte rule — thinking blocks from its most
+			// recent response must be replayed unmodified — only protects
+			// Anthropic's OWN latest turn, i.e. one issued by the SAME provider
+			// (the anthropic-prefill pin keeps the outgoing model aligned across
+			// a same-provider id switch). A latest turn minted by a DIFFERENT
+			// provider carries a signature the target can never verify, so it
+			// must be stripped like any prior cross-issuer turn instead of riding
+			// the wire and wedging the session on a 400 `Invalid signature in
+			// thinking block` (#6379). Scope every latest-turn signature
+			// exemption to same-issuer replays.
+			const isLatestByteForByteAnthropic =
+				isLatestSurvivingAssistant && isAnthropicReplay && assistantMsg.provider === model.provider;
 			// Signature policy is a second axis. Anthropic cryptographically
 			// binds reasoning signatures to its key+session+model, so cross-model
 			// signatures must be stripped whenever a signing Anthropic endpoint
@@ -623,18 +635,24 @@ export function transformMessages<TApi extends Api>(
 							? { ...block, thinkingSignature: undefined }
 							: block;
 					if (isAnthropicReplay) {
-						// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
-						// even stripping a signature on the latest message.
-						if (isLatestSurvivingAssistant && abandonedToolUse) return block;
-						// Cross-model prior turns crossing an official Anthropic endpoint
-						// must strip the source signature so the downstream encoder
-						// applies its `replayUnsignedThinking` policy (unsigned thinking
-						// is emitted natively on Anthropic-compatible reasoning endpoints
-						// and demoted to text on official Anthropic). 3p ↔ 3p replays
-						// keep the signature so the reasoning chain stays signed on
-						// continuation (#2265).
+						// Latest same-issuer abandoned turn: Anthropic's byte-for-byte
+						// rule forbids even stripping a signature on its own latest
+						// message. A foreign-provider latest turn is not covered — fall
+						// through so its unverifiable signature is stripped (#6379).
+						if (isLatestByteForByteAnthropic && abandonedToolUse) return block;
+						// Cross-model turns crossing a signing Anthropic endpoint must
+						// strip the source signature so the downstream encoder applies
+						// its `replayUnsignedThinking` policy (unsigned thinking is
+						// emitted natively on Anthropic-compatible reasoning endpoints
+						// and demoted to text on official Anthropic). This covers the
+						// latest surviving turn too: Anthropic's byte-for-byte rule only
+						// protects its OWN latest response (same-issuer, exempted above),
+						// so a foreign latest turn's signature is stripped like any
+						// prior cross-issuer turn (#6379). 3p ↔ 3p replays keep the
+						// signature so the reasoning chain stays signed on continuation
+						// (#2265).
 						if (
-							!isLatestSurvivingAssistant &&
+							!isLatestByteForByteAnthropic &&
 							!isSameModel &&
 							signingAnthropicInvolved &&
 							sanitized.thinkingSignature
@@ -708,14 +726,15 @@ export function transformMessages<TApi extends Api>(
 
 				if (block.type === "redactedThinking") {
 					// Redacted thinking is native-only. Keep it for same-model
-					// signed replay, the latest byte-for-byte Anthropic turn, or
+					// signed replay, a same-issuer byte-for-byte latest turn, or
 					// compatible targets that will also emit sibling unsigned
 					// thinking natively. Drop it when the matching visible thinking
-					// was discarded, or when visible thinking was cross-model
-					// stripped and will be demoted to text.
+					// was discarded, when visible thinking was cross-model stripped and
+					// will be demoted to text, or when a foreign latest turn's block
+					// would otherwise ride to a signing endpoint (#6379).
 					if (isAnthropicReplay) {
 						if (dropsAllSameModelVisibleThinking) return [];
-						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
+						if (isSameModel || isLatestByteForByteAnthropic || replaysUnsignedAnthropicThinking) return block;
 						return [];
 					}
 					if (isSameModel) return block;

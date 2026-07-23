@@ -637,4 +637,101 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const wireBlobs = JSON.stringify(priorBlocks);
 		expect(wireBlobs).not.toContain("sig_sonnet");
 	});
+
+	it("strips a foreign anthropic-messages LATEST turn's signature on a signing Anthropic target (#6379)", () => {
+		// The latest surviving assistant was minted by a DIFFERENT provider on
+		// the anthropic-messages API (e.g. kimi-code/k3). Switching the target
+		// to a signing Anthropic model replayed that turn's foreign signature
+		// verbatim, wedging the session on `400 Invalid signature in thinking
+		// block`. Anthropic's byte-for-byte rule only protects its own latest
+		// response, so the foreign latest turn must be stripped like any prior
+		// cross-issuer turn.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-fable-5",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("which is larger, 17^3 or 3^17?"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "compare magnitudes", thinkingSignature: "kimi_foreign_sig" },
+					{ type: "text", text: "3^17 is larger." },
+				],
+				{ provider: "kimi-code", model: "k3", stopReason: "stop" },
+			),
+			makeUser("double-check with logarithms"),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistants = params.filter(p => p.role === "assistant");
+		const blocks = assistants[assistants.length - 1].content as WireBlock[];
+		// No native thinking block replays the unverifiable foreign signature.
+		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
+		const wire = JSON.stringify(params);
+		expect(wire).not.toContain("kimi_foreign_sig");
+		// The reasoning survives, demoted to bare Claude-dialect prose.
+		expect(wire).toContain(renderDemotedThinking(target.id, "compare magnitudes"));
+		expect(wire).toContain("3^17 is larger.");
+	});
+
+	it("strips a foreign abandoned tool-use LATEST turn's signature on a signing Anthropic target (#6379)", () => {
+		// Same class, abandoned-tool-use variant: the unconditional latest-turn
+		// exemption used to `return block` (original, still-signed) for a
+		// foreign latest turn. It must fall through and strip instead.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-fable-5",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("read the file"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "abandoned reasoning", thinkingSignature: "foreign_abandoned_sig" },
+					{ type: "toolCall", id: "toolu_x", name: "read", arguments: { path: "x" } },
+				],
+				{ provider: "kimi-code", model: "k3", stopReason: "stop" },
+			),
+			toolResult("toolu_x", "placeholder"),
+			makeUser("continue"),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const wire = JSON.stringify(params);
+		expect(wire).not.toContain("foreign_abandoned_sig");
+		const assistants = params.filter(p => p.role === "assistant");
+		const blocks = assistants[assistants.length - 1].content as WireBlock[];
+		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
+		const toolUse = blocks.find(b => b.type === "tool_use") as WireToolUseBlock | undefined;
+		expect(toolUse?.id).toBe("toolu_x");
+	});
+
+	it("keeps a same-model LATEST turn's signature on a signing Anthropic target (#6379 guard)", () => {
+		// The fix scopes the latest-turn exemption to same-model replays; it
+		// must NOT over-strip Anthropic's own byte-for-byte latest response.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-fable-5",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("q"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "own reasoning", thinkingSignature: "sig_own" },
+					{ type: "text", text: "answer" },
+				],
+				{ provider: "anthropic", model: "claude-fable-5", stopReason: "stop" },
+			),
+			makeUser("continue"),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistants = params.filter(p => p.role === "assistant");
+		const blocks = assistants[assistants.length - 1].content as WireBlock[];
+		const thinking = blocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
+		expect(thinking?.thinking).toBe("own reasoning");
+		expect(thinking?.signature).toBe("sig_own");
+	});
 });

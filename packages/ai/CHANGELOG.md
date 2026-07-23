@@ -10,6 +10,7 @@
 
 - Fixed outbound credential-pattern redaction (`[github_token_redacted]` & co.) running unconditionally: it is now opt-in via `configureCredentialRedaction` and disabled by default, so credential-shaped strings the user deliberately pastes reach the provider unmodified unless the host enables redaction.
 - Added interactive Meta Model API key login and `MODEL_API_KEY` / `META_API_KEY` environment authentication ([#4941](https://github.com/can1357/oh-my-pi/issues/4941)).
+- Fixed a session wedge (`400 Invalid signature in thinking block`) when switching into a signing Anthropic endpoint while the latest surviving assistant turn was produced by a different `anthropic-messages` provider: `transformMessages` now scopes its latest-turn byte-for-byte signature exemption to same-issuer (same-provider) replays, stripping a foreign provider's unverifiable signature like any prior cross-issuer turn so the encoder applies its `replayUnsignedThinking` policy ([#6379](https://github.com/can1357/oh-my-pi/issues/6379)).
 
 ## [17.0.9] - 2026-07-23
 
