@@ -207,6 +207,23 @@ class LspFlushAbortError extends Error {
 	}
 }
 
+/**
+ * A JSON-RPC error response returned by a language server for one of our
+ * requests. Carries the numeric `code` so callers can recognize protocol
+ * conditions — e.g. method-not-found (`-32601`) — that a message-string check
+ * would miss (servers vary the human-readable text: "method not found",
+ * "Unknown request", …).
+ */
+export class LspRequestError extends Error {
+	constructor(
+		readonly code: number,
+		serverMessage: string,
+	) {
+		super(`LSP error: ${serverMessage}`);
+		this.name = "LspRequestError";
+	}
+}
+
 async function writeMessage(
 	sink: Bun.FileSink,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
@@ -364,7 +381,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 						if (pending) {
 							client.pendingRequests.delete(message.id);
 							if ("error" in message && message.error) {
-								pending.reject(new Error(`LSP error: ${message.error.message}`));
+								pending.reject(new LspRequestError(message.error.code, message.error.message));
 							} else {
 								pending.resolve(message.result);
 							}

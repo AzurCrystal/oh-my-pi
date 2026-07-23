@@ -22,6 +22,7 @@ import {
 	getActiveClients,
 	getActiveOrPendingClient,
 	getOrCreateClient,
+	LspRequestError,
 	type LspServerStatus,
 	notifySaved,
 	notifyWorkspaceWatchedFiles,
@@ -497,6 +498,9 @@ async function enumerateRenamePairs(
 
 /** True when an LSP error indicates the server doesn't implement the requested method. */
 function isMethodNotFoundError(err: unknown): boolean {
+	// Prefer the JSON-RPC error code: servers vary the human-readable text
+	// ("method not found", "Unknown request", …) but the code is authoritative.
+	if (err instanceof LspRequestError && err.code === -32601) return true;
 	if (!(err instanceof Error)) return false;
 	const msg = err.message.toLowerCase();
 	return (
