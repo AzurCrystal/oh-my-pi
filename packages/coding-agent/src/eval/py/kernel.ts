@@ -11,7 +11,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
 import { Settings } from "../../config/settings";
 import { BaseKernel, getRemainingTimeMs, type KernelStartOptions } from "../kernel-base";
 import { PYTHON_PRELUDE } from "./prelude";
@@ -117,15 +116,23 @@ async function probePythonKernelAvailability(cwd: string, interpreter?: string):
 		const failures: string[] = [];
 		for (const runtime of runtimes) {
 			try {
-				const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
-					.quiet()
-					.nothrow()
-					.cwd(cwd)
-					.env(runtime.env);
-				if (probe.exitCode === 0) {
+				// Protocol modes keep a read pending on stdin. Do not inherit that
+				// pipe here: Bun Shell can leave the Python launcher waiting forever.
+				const probe = Bun.spawn([runtime.pythonPath, "-c", "import sys;sys.exit(0)"], {
+					cwd,
+					env: runtime.env,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+					timeout: STARTUP_TIMEOUT_MS,
+					killSignal: "SIGKILL",
+					windowsHide: true,
+				});
+				const exitCode = await probe.exited;
+				if (exitCode === 0) {
 					return { ok: true, pythonPath: runtime.pythonPath, runtime };
 				}
-				failures.push(`${runtime.pythonPath} (exit code ${probe.exitCode})`);
+				failures.push(`${runtime.pythonPath} (exit code ${exitCode})`);
 			} catch (err) {
 				failures.push(`${runtime.pythonPath} (${err instanceof Error ? err.message : String(err)})`);
 			}
