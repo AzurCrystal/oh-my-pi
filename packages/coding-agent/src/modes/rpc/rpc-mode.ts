@@ -369,8 +369,6 @@ const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = 
 	handoff: true,
 	approve_plan_proposal: true,
 	reject_plan_proposal: true,
-	begin_guided_goal: true,
-	answer_guided_goal: true,
 	prompt_agent: true,
 	generate_ttsr_rule: true,
 	mcp_add_server: true,
@@ -1592,27 +1590,21 @@ export async function runRpcMode(
 	};
 
 	const runReconciledRpcSessionTransition = async <T>(
-		freshSession: boolean,
+		_freshSession: boolean,
 		transition: () => Promise<{ result: T; honorPlanDefault: boolean }>,
 	): Promise<T> => {
 		const previousCwd = session.sessionManager.getCwd();
-		if (freshSession) {
-			const current = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
-			if (current.plan.enabled) await rpcWorkModes.exitRpcPlanMode(session);
-			else if (current.goal.goal) await rpcWorkModes.clearRpcGoal(session);
-			else if (current.vibe.enabled) await rpcWorkModes.exitRpcVibeMode(session);
-		} else if (session.getVibeModeState()?.enabled) {
+
+		// Vibe workers are process-level; tear them down before any session change.
+		if (session.getVibeModeState()?.enabled) {
 			await rpcWorkModes.exitRpcVibeMode(session);
 		}
 
+		// Dispose infrastructure that should not span sessions.
 		await rpcCollab.disposeRpcCollab(session);
 		await releaseVoice();
 		disposeRuntimeControl();
 		idleBehavior.dispose();
-		rpcWorkModes.disposeRpcWorkModes(session);
-		session.setPlanModeState(undefined);
-		session.setGoalModeState(undefined);
-		session.setVibeModeState(undefined);
 
 		let honorPlanDefault = false;
 		try {
@@ -1620,6 +1612,15 @@ export async function runRpcMode(
 			honorPlanDefault = outcome.honorPlanDefault;
 			return outcome.result;
 		} finally {
+			// Tear down work modes AFTER the transition commits.
+			// If the transition was cancelled (e.g. by a session_before_switch hook),
+			// the old session's persisted plan/goal state is intact and
+			// reconcileRpcWorkModes restores it from the mode_change log.
+			rpcWorkModes.disposeRpcWorkModes(session);
+			session.setPlanModeState(undefined);
+			session.setGoalModeState(undefined);
+			session.setVibeModeState(undefined);
+
 			try {
 				await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
 			} finally {
@@ -2119,26 +2120,6 @@ export async function runRpcMode(
 			case "get_goal_state":
 				return moduleCommand(id, "get_goal_state", () => rpcWorkModes.readRpcGoalState(session));
 
-			case "begin_guided_goal":
-				return moduleCommand(id, "begin_guided_goal", () =>
-					rpcWorkModes.beginRpcGuidedGoal(session, command.initialObjective),
-				);
-
-			case "answer_guided_goal":
-				return moduleCommand(id, "answer_guided_goal", () =>
-					rpcWorkModes.answerRpcGuidedGoal(session, command.answer),
-				);
-
-			case "accept_guided_goal":
-				return moduleCommand(id, "accept_guided_goal", () =>
-					rpcWorkModes.acceptRpcGuidedGoal(session, command.objective),
-				);
-
-			case "cancel_guided_goal":
-				return moduleCommand(id, "cancel_guided_goal", () => rpcWorkModes.cancelRpcGuidedGoal(session));
-
-			case "get_guided_goal_state":
-				return moduleCommand(id, "get_guided_goal_state", () => rpcWorkModes.readRpcGuidedGoalState(session));
 
 			case "enter_vibe_mode":
 				return moduleCommand(id, "enter_vibe_mode", () => rpcWorkModes.enterRpcVibeMode(session));
