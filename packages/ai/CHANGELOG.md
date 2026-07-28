@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Fixed
+
+- Fixed an HTTP 400 error when resuming or replaying OpenAI history after an interrupted native Computer Use turn.
+- Fixed connection 404 errors when using Google Vertex AI in multi-region locations (eu and us) by correctly resolving regional endpoint (REP) hosts.
+- Fixed a resource leak in SqliteAuthCredentialStore.close() where unclosed prepared statements kept the SQLite connection alive, preventing database file cleanup (especially on Windows where files remained locked).
+
 ## [17.1.7] - 2026-07-27
 
 ### Changed

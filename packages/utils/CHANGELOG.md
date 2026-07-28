@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Added
+
+- Added `setProcessName` utility to set the OS-visible process name on Linux via `bun:ffi`, bypassing Bun's `process.title` limitations.
+
+### Fixed
+
+- Fixed child shell environment filtering to drop launch-directory `.env` values in addition to Bun-autoloaded `.env.local` values.
+
 ## [17.1.5] - 2026-07-27
 
 ### Fixed
