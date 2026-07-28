@@ -16,12 +16,15 @@ describe("RpcClient prompt results", () => {
 		const unsubscribe = client.onPromptResult(completion.resolve);
 		try {
 			const pending: RpcPromptSubmissionResult = await client.promptWithResult("local-only");
-			expect(pending.agentInvoked).toBeUndefined();
+			expect(pending).toEqual({ requestId: "req_1" });
 			const frame = await completion.promise;
-			expect(frame).toEqual({ type: "prompt_result", id: "req_1", agentInvoked: false });
+			expect(frame).toEqual({ type: "prompt_result", id: pending.requestId, agentInvoked: false });
 
 			const immediate = await client.promptWithResult("agent");
-			expect(immediate).toEqual({ agentInvoked: true });
+			expect(immediate).toEqual({ requestId: "req_2", agentInvoked: true });
+
+			const immediateNoAgent = await client.promptWithResult("no-agent");
+			expect(immediateNoAgent).toEqual({ requestId: "req_3", agentInvoked: false });
 		} finally {
 			unsubscribe();
 		}

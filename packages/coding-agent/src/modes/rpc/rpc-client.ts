@@ -102,6 +102,7 @@ import type {
 	RpcPlanFinalizationStrategy,
 	RpcPlanModeSnapshot,
 	RpcPlanProposalSnapshot,
+	RpcPromptAcknowledgement,
 	RpcPromptHistoryEntry,
 	RpcPromptResultFrame,
 	RpcPromptSubmissionResult,
@@ -867,12 +868,12 @@ export class RpcClient {
 	}
 
 	/**
-	 * Send a prompt and retain any outcome known when the server acknowledges it.
+	 * Send a prompt and retain its request id plus any outcome known when the server acknowledges it.
 	 * An omitted `agentInvoked` means the prompt is still resolving asynchronously.
 	 */
 	async promptWithResult(message: string, images?: ImageContent[]): Promise<RpcPromptSubmissionResult> {
 		const response = await this.#send({ type: "prompt", message, images });
-		return this.#getData<RpcPromptSubmissionResult | undefined>(response) ?? {};
+		return { ...this.#getData<RpcPromptAcknowledgement | undefined>(response), requestId: response.id! };
 	}
 
 	/**

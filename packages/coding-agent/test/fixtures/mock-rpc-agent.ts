@@ -80,7 +80,7 @@ for await (const raw of console) {
 				continue;
 			}
 			if (frame.type === "prompt" && Bun.env.MOCK_RPC_PROMPT_RESULTS === "1") {
-				const agentInvoked = frame.message === "agent" ? true : undefined;
+				const agentInvoked = frame.message === "agent" ? true : frame.message === "no-agent" ? false : undefined;
 				writeFrame({
 					id,
 					type: "response",
