@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import {
 	RpcExtensionUserMessageTracker,
 	reportLocalOnlyPromptResult,
+	routeRpcCollabGuestPrompt,
 	watchAndReportLocalOnlyPromptResult,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type { ExtensionActions } from "../src/extensibility/extensions/types";
+import { RpcCollabGuestRoutingError } from "../src/modes/rpc/rpc-collab";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -22,6 +24,51 @@ async function waitForTrackedPromptHandlers(trackedPrompt: {
 	await Promise.resolve();
 	await Promise.resolve();
 }
+
+describe("routeRpcCollabGuestPrompt", () => {
+	test("emits exactly one correlated true result and acknowledges accepted relay input", () => {
+		const output: object[] = [];
+		const relay = vi.fn(() => {});
+
+		const response = routeRpcCollabGuestPrompt({
+			id: "req_guest",
+			relay,
+			output: frame => output.push(frame),
+		});
+
+		expect(relay).toHaveBeenCalledTimes(1);
+		expect(relay).toHaveBeenCalledWith();
+		expect(output).toEqual([{ type: "prompt_result", id: "req_guest", agentInvoked: true }]);
+		expect(response).toEqual({
+			id: "req_guest",
+			type: "response",
+			command: "prompt",
+			success: true,
+			data: { agentInvoked: true },
+		});
+	});
+
+	test("returns relay errors without emitting a terminal prompt outcome", () => {
+		const output: object[] = [];
+		const response = routeRpcCollabGuestPrompt({
+			id: "req_guest",
+			relay: () => {
+				throw new RpcCollabGuestRoutingError("relay unavailable", "link_unavailable");
+			},
+			output: frame => output.push(frame),
+		});
+
+		expect(output).toEqual([]);
+		expect(response).toEqual({
+			id: "req_guest",
+			type: "response",
+			command: "prompt",
+			success: false,
+			error: "relay unavailable",
+			code: "link_unavailable",
+		});
+	});
+});
 
 describe("reportLocalOnlyPromptResult", () => {
 	test("emits prompt_result when prompt resolves without invoking the agent or extension user message", async () => {

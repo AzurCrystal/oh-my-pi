@@ -89,6 +89,7 @@ import {
 	isInteractiveHost,
 	isRecord,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	Snowflake,
@@ -648,16 +649,12 @@ export class AgentSession {
 	 *  queue was consumed normally or a new turn already started. */
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
-		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
-		// dispose) call #disconnectFromAgent() BEFORE `await abort()`, so abort's own
-		// finally lands here with no listener attached. Auto-resuming now would snapshot
-		// the still-old context (the transition hasn't reached agent.reset() yet), start a
-		// stale provider turn that races the reset, and — once reconnected — append its
-		// output to the fresh session (issue #5800). A disconnected session never owns the
-		// queue: the transition does. newSession/switchSession drop the queue (reset /
-		// clearAllQueues), so nothing survives; compaction preserves it and re-drains itself
-		// after #reconnectToAgent (see compact()'s finally); an explicit prompt flushes it
-		// in every case.
+		// Session transitions call #disconnectFromAgent() BEFORE `await abort()`, so
+		// abort's own finally lands here with no listener attached. Auto-resuming
+		// then would race the transition and could append old-context output to the
+		// destination session (issue #5800). Successful new/switch transitions drop
+		// their queues; rollback paths that restore queues explicitly re-drain only
+		// after reconnecting. Compaction likewise re-drains after reconnecting.
 		if (this.#unsubscribeAgent === undefined) return;
 		// A concern steered into a resumed streaming run after a user interrupt can
 		// strand at the turn tail (steered past the loop's final boundary poll). While
@@ -673,6 +670,26 @@ export class AgentSession {
 		}
 		this.#scheduleQueuedMessageDrain();
 		this.#resumeStrandedIrcAsides();
+	}
+	/** Resume queues restored by a failed transition. Hidden next-turn context
+	 *  starts one replacement turn first; its prompt consumes that context and
+	 *  the normal settle drain handles any remaining steer/follow-up. The aborted
+	 *  provider turn stays ended — this only makes the restored session runnable. */
+	#drainRestoredQueuedMessages(): void {
+		if (this.#unsubscribeAgent === undefined) return;
+		if (this.#pendingNextTurnMessages.length > 0) {
+			this.#scheduleHiddenNextTurnMessageDrain();
+			return;
+		}
+		// A follow-up was waiting for the now-cancelled turn to finish. With that
+		// turn restored at a user-message tail, Agent.continue() cannot start from
+		// the follow-up queue alone; promote it to the steering queue so it becomes
+		// the replacement turn's valid user tail without copying or duplicating it.
+		const followUp = this.agent.peekFollowUpQueue();
+		if (this.agent.peekSteeringQueue().length === 0 && followUp.length > 0) {
+			this.agent.replaceQueues([...followUp], []);
+		}
+		this.#drainStrandedQueuedMessages();
 	}
 
 	/** IRC records that arrive after the loop's final aside poll — or while an abort skipped that
@@ -5439,7 +5456,11 @@ export class AgentSession {
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
 		this.#pendingNextTurnMessages.push(message);
-		if (!triggerTurn) return;
+		if (triggerTurn) this.#scheduleHiddenNextTurnMessageDrain();
+	}
+
+	#scheduleHiddenNextTurnMessageDrain(): void {
+		if (this.#pendingNextTurnMessages.length === 0) return;
 		const generation = this.#promptGeneration;
 		if (this.#scheduledHiddenNextTurnGeneration === generation) {
 			return;
@@ -6086,6 +6107,7 @@ export class AgentSession {
 						this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
 					} finally {
 						this.#reconnectToAgent();
+						this.#drainRestoredQueuedMessages();
 					}
 				}
 			} else {
@@ -7081,9 +7103,9 @@ export class AgentSession {
 	 */
 	async switchSession(sessionPath: string, options?: SessionTransitionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
-		const switchingToDifferentSession = previousSessionFile
-			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
-			: true;
+		const switchingToDifferentSession =
+			previousSessionFile === undefined ||
+			normalizePathForComparison(previousSessionFile) !== normalizePathForComparison(sessionPath);
 		// Emit session_before_switch event (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({

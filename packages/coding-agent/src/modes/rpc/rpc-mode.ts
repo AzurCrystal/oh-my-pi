@@ -17,7 +17,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { configureCredentialRedaction, redactSensitiveInObject } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, normalizePathForComparison, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
 import { onSettingChanged } from "../../config/settings";
@@ -167,7 +167,10 @@ export type RpcSessionChangeResult =
 	| { type: "branch"; data: { text: string; cancelled: boolean } }
 	| { type: "fork"; data: { cancelled: boolean } };
 
-export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
+export type RpcSessionChangeSession = Pick<
+	AgentSession,
+	"sessionFile" | "newSession" | "switchSession" | "branch" | "fork"
+>;
 
 /** What a session-change transition reports back to the RPC reconciliation cycle. */
 export interface RpcSessionTransitionOutcome<T> {
@@ -176,6 +179,14 @@ export interface RpcSessionTransitionOutcome<T> {
 	committed: boolean;
 	/** True when the incoming session may adopt the plan-on-startup default. */
 	honorPlanDefault: boolean;
+}
+
+/** Logical file identity used to distinguish a reload from a destructive switch. */
+export function isSameRpcSessionReload(currentSessionFile: string | undefined, targetSessionFile: string): boolean {
+	return (
+		currentSessionFile !== undefined &&
+		normalizePathForComparison(currentSessionFile) === normalizePathForComparison(targetSessionFile)
+	);
 }
 
 /**
@@ -188,13 +199,16 @@ export interface RpcSessionTransitionOutcome<T> {
  * committed — a hook that cancels the change never reaches `prepare` at all.
  *
  * `reconcile` also runs when `prepare` itself fails, so it owns re-establishing
- * the runtime behaviors `prepare` may have already released.
+ * the runtime behaviors `prepare` may have already released. A logical reload
+ * sets `preserveCurrentSessionOnSuccess`, which deliberately reconciles like a
+ * rollback even though reloading the transcript succeeded.
  */
 export async function runRpcSessionTransitionAtCommit<T>(
 	transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
 	prepare: () => Promise<void>,
 	reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>,
 	honorPlanDefaultOnCommit = false,
+	preserveCurrentSessionOnSuccess = false,
 ): Promise<T> {
 	let prepared = false;
 	const beforeCommit = async (): Promise<void> => {
@@ -209,9 +223,14 @@ export async function runRpcSessionTransitionAtCommit<T>(
 		honorPlanDefault = honorPlanDefaultOnCommit;
 	};
 	try {
-		const outcome = await transition({ beforeCommit, onCommitted });
-		committed ||= outcome.committed;
-		honorPlanDefault ||= outcome.honorPlanDefault;
+		const transitionOptions: SessionTransitionOptions = preserveCurrentSessionOnSuccess
+			? { beforeCommit }
+			: { beforeCommit, onCommitted };
+		const outcome = await transition(transitionOptions);
+		if (!preserveCurrentSessionOnSuccess) {
+			committed ||= outcome.committed;
+			honorPlanDefault ||= outcome.honorPlanDefault;
+		}
 		return outcome.result;
 	} finally {
 		if (prepared) await reconcile({ committed, honorPlanDefault });
@@ -243,6 +262,34 @@ export async function tryRunRpcSkillCommand(
 		{ streamingBehavior },
 	);
 	return { agentInvoked: true };
+}
+
+/**
+ * Relays a guest prompt and reports its accepted terminal outcome.
+ *
+ * The collaboration relay only needs prompt content. Correlation stays on the
+ * RPC connection that accepted the request.
+ */
+export function routeRpcCollabGuestPrompt(input: {
+	id: string | undefined;
+	relay: () => void;
+	output: (frame: object) => void;
+}): RpcResponse {
+	try {
+		input.relay();
+	} catch (relayError) {
+		const message = relayError instanceof Error ? relayError.message : String(relayError);
+		const code = relayError instanceof rpcCollab.RpcCollabGuestRoutingError ? relayError.code : "operation_failed";
+		return { id: input.id, type: "response", command: "prompt", success: false, error: message, code };
+	}
+	input.output({ type: "prompt_result", id: input.id, agentInvoked: true });
+	return {
+		id: input.id,
+		type: "response",
+		command: "prompt",
+		success: true,
+		data: { agentInvoked: true },
+	};
 }
 
 export function reportLocalOnlyPromptResult(input: {
@@ -617,8 +664,9 @@ export async function handleRpcSessionChange(
 		}
 
 		case "switch_session": {
+			const sameSessionReload = isSameRpcSessionReload(session.sessionFile, command.sessionPath);
 			const cancelled = !(await session.switchSession(command.sessionPath, transitionOptions));
-			if (!cancelled) subagentRegistry?.clear();
+			if (!cancelled && !sameSessionReload) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}
 
@@ -1681,6 +1729,7 @@ export async function runRpcMode(
 	const runReconciledRpcSessionTransition = async <T>(
 		transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
 		honorPlanDefaultOnCommit = false,
+		preserveCurrentSessionOnSuccess = false,
 	): Promise<T> => {
 		const previousCwd = session.sessionManager.getCwd();
 		let workModeSuspension: VibeScopeSuspension | undefined;
@@ -1715,6 +1764,7 @@ export async function runRpcMode(
 				}
 			},
 			honorPlanDefaultOnCommit,
+			preserveCurrentSessionOnSuccess,
 		);
 	};
 
@@ -1736,15 +1786,17 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "prompt", () =>
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
-					);
-				}
 				const resolvedPrompt = (agentInvoked: boolean): RpcResponse => {
 					output({ type: "prompt_result", id, agentInvoked });
 					return success(id, "prompt", { agentInvoked });
 				};
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeRpcCollabGuestPrompt({
+						id,
+						relay: () => rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+						output,
+					});
+				}
 				let message = command.message.trim();
 				let images = command.images ? [...command.images] : undefined;
 				let inputAgentInvoked: Promise<boolean> | undefined;
@@ -1943,27 +1995,34 @@ export async function runRpcMode(
 				if (guestBlock) {
 					return error(id, command.type, guestBlock.message, guestBlock.code);
 				}
+				let sameSessionReload = false;
 				let resolvedCommand: RpcSessionChangeCommand = command;
 				if (command.type === "switch_session") {
 					const sessionPath = await resolveRpcSessionReference(command.sessionPath);
 					if (!sessionPath) {
 						return error(id, "switch_session", `Session "${command.sessionPath}" not found`, "unknown_session");
 					}
+					sameSessionReload = isSameRpcSessionReload(session.sessionFile, sessionPath);
 					resolvedCommand = { ...command, sessionPath };
 				}
-				const result = await runReconciledRpcSessionTransition(async transitionOptions => {
-					const changed = await handleRpcSessionChange(
-						session,
-						resolvedCommand,
-						subagentRegistry,
-						transitionOptions,
-					);
-					return {
-						result: changed,
-						committed: !changed.data.cancelled,
-						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
-					};
-				}, command.type === "new_session");
+				const result = await runReconciledRpcSessionTransition(
+					async transitionOptions => {
+						const changed = await handleRpcSessionChange(
+							session,
+							resolvedCommand,
+							subagentRegistry,
+							transitionOptions,
+						);
+						const committed = !changed.data.cancelled;
+						return {
+							result: changed,
+							committed,
+							honorPlanDefault: command.type === "new_session" && committed,
+						};
+					},
+					command.type === "new_session",
+					sameSessionReload,
+				);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}

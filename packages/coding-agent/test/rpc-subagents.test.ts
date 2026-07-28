@@ -8,6 +8,7 @@ import * as rpcCollab from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-collab";
 import {
 	getRpcSessionTransitionGuestBlock,
 	handleRpcSessionChange,
+	isSameRpcSessionReload,
 	type RpcSessionChangeCommand,
 	type RpcSessionChangeResult,
 	type RpcSessionChangeSession,
@@ -75,6 +76,7 @@ function createRegistryWithSnapshot(): RpcSubagentRegistry {
 }
 
 type SessionChangeStubOptions = {
+	sessionFile?: string;
 	newSession?: boolean;
 	switchSession?: boolean;
 	branch?: { selectedText: string; selectedImages: ImageContent[]; cancelled: boolean };
@@ -97,6 +99,7 @@ function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessi
 		if (options.failAfterCommit) throw options.failAfterCommit;
 	};
 	return {
+		sessionFile: options.sessionFile,
 		newSession: async sessionOptions => {
 			const changed = options.newSession ?? true;
 			if (changed) await transition(sessionOptions, true);
@@ -244,6 +247,37 @@ describe("RPC subagent registry", () => {
 		registry.dispose();
 	});
 
+	test("preserves the registry for a logical same-session reload and clears a different switch", async () => {
+		const currentSessionFile = path.resolve("current-session.jsonl");
+		const logicalReloadPath =
+			process.platform === "win32"
+				? currentSessionFile.toUpperCase().replaceAll("\\", "/")
+				: path.normalize(currentSessionFile);
+		expect(isSameRpcSessionReload(currentSessionFile, logicalReloadPath)).toBe(true);
+
+		const registry = createRegistryWithSnapshot();
+		try {
+			const reloadResult = await handleRpcSessionChange(
+				createSessionChangeSession({ switchSession: true, sessionFile: currentSessionFile }),
+				{ type: "switch_session", sessionPath: logicalReloadPath },
+				registry,
+			);
+			expect(reloadResult).toEqual({ type: "switch_session", data: { cancelled: false } });
+			expect(registry.getSubagents()).toMatchObject([{ id: "SubagentA" }]);
+
+			const differentSessionFile = path.resolve("different-session.jsonl");
+			expect(isSameRpcSessionReload(currentSessionFile, differentSessionFile)).toBe(false);
+			await handleRpcSessionChange(
+				createSessionChangeSession({ switchSession: true, sessionFile: currentSessionFile }),
+				{ type: "switch_session", sessionPath: differentSessionFile },
+				registry,
+			);
+			expect(registry.getSubagents()).toHaveLength(0);
+		} finally {
+			registry.dispose();
+		}
+	});
+
 	test("clears stale snapshots after successful RPC session changes", async () => {
 		const cases: Array<{
 			command: RpcSessionChangeCommand;
@@ -337,6 +371,8 @@ describe("RPC subagent registry", () => {
 				prepared: 0,
 				reconciled: 0,
 				honorPlanDefault: false,
+				suspensionCommitted: 0,
+				suspensionRolledBack: 0,
 			};
 			return {
 				state,
@@ -351,7 +387,12 @@ describe("RPC subagent registry", () => {
 				reconcile: async ({ committed, honorPlanDefault }: { committed: boolean; honorPlanDefault: boolean }) => {
 					state.reconciled++;
 					state.honorPlanDefault = honorPlanDefault;
-					if (committed) state.attachmentsReleased++;
+					if (committed) {
+						state.attachmentsReleased++;
+						state.suspensionCommitted++;
+					} else {
+						state.suspensionRolledBack++;
+					}
 					state.modeLive = true;
 					for (const handle of idleHandles) handle.disposed = true;
 					idleHandles.push({ disposed: false });
@@ -398,6 +439,36 @@ describe("RPC subagent registry", () => {
 			attachmentsReleased: 0,
 		});
 		expect(abortedFork.liveIdleHandles()).toBe(1);
+
+		// Reloading the current logical file succeeds, but RPC must roll its
+		// reversible Vibe suspension back rather than terminate workers or release
+		// session-owned attachments.
+		const sameReload = createRuntime();
+		const sameReloadResult = await runRpcSessionTransitionAtCommit(
+			async transitionOptions => {
+				const result = await handleRpcSessionChange(
+					createSessionChangeSession({ switchSession: true }),
+					{ type: "switch_session", sessionPath: "/tmp/current.jsonl" },
+					undefined,
+					transitionOptions,
+				);
+				return { result, committed: !result.data.cancelled, honorPlanDefault: false };
+			},
+			sameReload.prepare,
+			sameReload.reconcile,
+			false,
+			true,
+		);
+		expect(sameReloadResult.data.cancelled).toBe(false);
+		expect(sameReload.state).toMatchObject({
+			modeLive: true,
+			prepared: 1,
+			reconciled: 1,
+			attachmentsReleased: 0,
+			suspensionCommitted: 0,
+			suspensionRolledBack: 1,
+		});
+		expect(sameReload.liveIdleHandles()).toBe(1);
 
 		// A failure before the switch can commit keeps outgoing attachments.
 		const failedSwitch = createRuntime();

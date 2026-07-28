@@ -77,7 +77,7 @@ The table below names the 18 asynchronous frames and event variants a standalone
 | `extension_ui_request` | An extension, login flow, collab host, or tool needs host UI. Requests that expect an answer are completed with `extension_ui_response`. | Automatic; use `RpcClient.onExtensionUiRequest`. |
 | `extension_error` | An extension event handler throws. | Automatic raw stdout frame; the TypeScript client has no dedicated listener. |
 | `available_commands_update` | Emitted once at startup and whenever slash-command metadata changes. | Automatic; use `RpcClient.onAvailableCommandsUpdate`. |
-| `prompt_result` | A successfully resolved `prompt` reports whether it invoked agent work (`true`) or completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`. | Automatic; use `RpcClient.onPromptResult`. Use `promptWithResult` when the outcome already known in the acknowledgement is also needed. |
+| `prompt_result` | A successfully resolved `prompt` reports whether agent-facing input handled it (`true`) or it completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`; this is distinct from agent lifecycle completion. | Automatic; use `RpcClient.onPromptResult`. Use `promptWithResult` when the outcome already known in the acknowledgement is also needed. |
 | `subagent_lifecycle` | A subscribed subagent starts, stops, or changes lifecycle state. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentLifecycle`. |
 | `subagent_progress` | A subscribed subagent publishes progress. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentProgress`. |
 | `subagent_event` | A subscribed subagent emits its underlying session event. | Send `set_subagent_subscription` with `level: "events"`, then use `RpcClient.onSubagentEvent`. |
@@ -138,7 +138,7 @@ Important edge behavior from runtime:
 - Unknown command responses preserve the request `id` when one was provided.
 - Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means it invoked agent work; omitted means the outcome is still resolving and will arrive in the correlated `prompt_result`.
+- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally; `true` means agent-facing input handled it but does not guarantee a new agent lifecycle; omitted means the outcome is still resolving and will arrive in the correlated `prompt_result`.
 - `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
 
 ## Command Schema (canonical)
@@ -376,6 +376,10 @@ These commands operate on the active Hindsight bank. Bulk refresh and seeding re
 
 `new_session`, `switch_session`, `branch`, and `fork` reconcile work modes around the change. The outgoing session's transient runtime is released without persisting anything — plan and goal give their pre-mode tools and model back, and vibe workers are suspended rather than killed — so the destination hydrates from a clean base and a mode-less target inherits no mode tooling. A change reported as `cancelled: true`, or one that fails before commit, leaves the still-current session operational with its recorded mode, tools, model, hosted collaboration relay, voice capture, and process-local vibe workers intact; hosting, voice, and suspended workers are released only once the change commits. These four commands and deletion of the active session fail with `code: "operation_failed"` while joined as a collaboration guest; call `leave_collab_session` first.
 
+When `switch_session` resolves to the active session file, path identity uses the runtime's platform-aware canonical comparison (including Windows casing and separators). This is a reload, not a destructive switch: RPC rolls the reversible work-mode suspension back, preserves process-local vibe workers and the RPC subagent registry, and keeps session-owned attachments. Switching to a different logical file remains destructive.
+
+A transition that aborts the outgoing provider turn and then fails before commit does not resurrect that cancelled turn. It reconnects the restored session and automatically consumes its restored steering, follow-up, or deferred hidden queue so the session returns to normal operation without a manual prompt.
+
 `get_sessions` defaults to the current cwd and a limit of 100, supports case-insensitive full-text substring filtering, and caps the limit at 1,000. `cwd` selects another workspace when `scope` is not `"all"`. Results are sorted by newest modification time and omit `allMessagesText`.
 
 Deleting the active session uses the canonical drop/new-session path so the live session never points at a deleted file; it may return `code: "cancelled"` if that transition is cancelled. A non-active path not owned by the session index returns `code: "unknown_session"`.
@@ -493,7 +497,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 }
 ```
 
-`data.agentInvoked: false` is an immediate outcome for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` is an immediate outcome for prompts that invoke agent work. Older runtimes may omit `data`; current runtimes always follow with one correlated `prompt_result` when the outcome is known.
+`data.agentInvoked: false` is an immediate outcome for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the agent-facing input path handled the prompt; it does not guarantee a new `agent_start`. Older runtimes may omit `data`; current runtimes always follow with one correlated `prompt_result` when the outcome is known.
 
 `prompt_result` carries that terminal prompt outcome for both values:
 
@@ -504,7 +508,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 ]
 ```
 
-Local-only slash commands may emit `command_output` frames before their `prompt_result`. They do not emit `agent_end`. A `true` result means agent work was invoked; use `agent_end` separately when the host must wait for that run to finish.
+Local-only slash commands may emit `command_output` frames before their `prompt_result`. They do not emit `agent_end`. A `true` result likewise does not identify a new lifecycle: a steer can join an active run, and an accepted collaboration-guest relay is processed by the authoritative host. Track `agent_start`/`agent_end` separately when the host must wait for a run.
 
 ### `get_state` payload
 
@@ -934,7 +938,8 @@ That means:
 
 - command acceptance != prompt outcome or run completion
 - each prompt outcome arrives in the same-id `prompt_result`
-- agent runs complete via `agent_end`; local-only prompts have no agent lifecycle
+- `prompt_result.agentInvoked: true` means handled input, not necessarily a new lifecycle
+- local agent runs are tracked independently through `agent_start` and `agent_end`
 
 ### While streaming
 

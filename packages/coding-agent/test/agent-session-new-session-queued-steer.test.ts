@@ -140,12 +140,22 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		expect(branchText).not.toContain(LATE_OUTPUT);
 	});
 
-	it("restores the outgoing agent and queues when abort fails after disconnect", async () => {
+	it("restores and automatically drains the outgoing queue after a post-abort failure", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const activeCallStarted = Promise.withResolvers<void>();
+		const restoredQueueCallStarted = Promise.withResolvers<void>();
 		let providerCalls = 0;
 		const mock: MockModel = createMockModel({
 			handler: async () => {
 				providerCalls++;
+				if (providerCalls === 1) {
+					return { content: [OLD_ASSISTANT], stopReason: "stop" };
+				}
+				if (providerCalls === 2) {
+					activeCallStarted.resolve();
+					return { content: ["aborted old turn"], stopReason: "stop", delayMs: 60_000 };
+				}
+				restoredQueueCallStarted.resolve();
 				return { content: [`response-${providerCalls}`], stopReason: "stop" };
 			},
 		});
@@ -163,30 +173,25 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 
 		await session.prompt(OLD_USER);
-		agent.steer({
-			role: "custom",
-			customType: "xdev-mount-notice",
-			content: HIDDEN_XDEV,
-			display: false,
-			timestamp: Date.now(),
-		});
+		const activePrompt = session.prompt("active old-session turn");
+		await activeCallStarted.promise;
+		await session.prompt(HIDDEN_XDEV, { streamingBehavior: "followUp" });
+		expect(agent.hasQueuedMessages()).toBe(true);
+
 		const before = collectText(agent.state.messages);
-		const failure = new Error("abort cleanup failed");
-		const originalAbort = session.abort.bind(session);
-		const abort = vi.spyOn(session, "abort").mockImplementationOnce(async options => {
-			await originalAbort(options);
-			throw failure;
-		});
+		const failure = new Error("new-session storage failed after abort");
+		const startNewSession = vi.spyOn(sessionManager, "newSession").mockRejectedValueOnce(failure);
 
 		await expect(session.newSession()).rejects.toBe(failure);
-
-		expect(collectText(agent.state.messages)).toEqual(before);
-		expect(agent.hasQueuedMessages()).toBe(true);
-		abort.mockRestore();
-
-		await session.prompt("retry current session");
+		await activePrompt;
+		await restoredQueueCallStarted.promise;
 		await agent.waitForIdle();
-		expect(providerCalls).toBeGreaterThan(1);
+
+		expect(collectText(agent.state.messages).slice(0, before.length)).toEqual(before);
+		expect(providerCalls).toBe(3);
+		expect(collectText(mock.calls[2]?.context.messages ?? []).filter(text => text === HIDDEN_XDEV)).toHaveLength(1);
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(startNewSession).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps the committed session connected when post-reset initialization throws", async () => {
