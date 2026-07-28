@@ -664,8 +664,11 @@ export async function handleRpcSessionChange(
 		}
 
 		case "switch_session": {
-			const sameSessionReload = isSameRpcSessionReload(session.sessionFile, command.sessionPath);
-			const cancelled = !(await session.switchSession(command.sessionPath, transitionOptions));
+			const activeSessionFile = session.sessionFile;
+			const sameSessionReload = isSameRpcSessionReload(activeSessionFile, command.sessionPath);
+			const switchSessionFile =
+				sameSessionReload && activeSessionFile !== undefined ? activeSessionFile : command.sessionPath;
+			const cancelled = !(await session.switchSession(switchSessionFile, transitionOptions));
 			if (!cancelled && !sameSessionReload) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}

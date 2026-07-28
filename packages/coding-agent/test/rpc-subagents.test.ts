@@ -79,6 +79,7 @@ type SessionChangeStubOptions = {
 	sessionFile?: string;
 	newSession?: boolean;
 	switchSession?: boolean;
+	switchSessionPaths?: string[];
 	branch?: { selectedText: string; selectedImages: ImageContent[]; cancelled: boolean };
 	fork?: boolean;
 	/** Thrown after reversible preparation but before the session commits. */
@@ -105,7 +106,8 @@ function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessi
 			if (changed) await transition(sessionOptions, true);
 			return changed;
 		},
-		switchSession: async (_sessionPath, sessionOptions) => {
+		switchSession: async (sessionPath, sessionOptions) => {
+			options.switchSessionPaths?.push(sessionPath);
 			const changed = options.switchSession ?? true;
 			if (changed) await transition(sessionOptions, true);
 			return changed;
@@ -247,31 +249,43 @@ describe("RPC subagent registry", () => {
 		registry.dispose();
 	});
 
-	test("preserves the registry for a logical same-session reload and clears a different switch", async () => {
+	test("preserves the active path spelling for a logical same-session reload", async () => {
 		const currentSessionFile = path.resolve("current-session.jsonl");
 		const logicalReloadPath =
 			process.platform === "win32"
 				? currentSessionFile.toUpperCase().replaceAll("\\", "/")
-				: path.normalize(currentSessionFile);
+				: `${path.dirname(currentSessionFile)}${path.sep}reload-parent${path.sep}..${path.sep}${path.basename(currentSessionFile)}`;
 		expect(isSameRpcSessionReload(currentSessionFile, logicalReloadPath)).toBe(true);
 
 		const registry = createRegistryWithSnapshot();
+		const reloadPaths: string[] = [];
 		try {
 			const reloadResult = await handleRpcSessionChange(
-				createSessionChangeSession({ switchSession: true, sessionFile: currentSessionFile }),
+				createSessionChangeSession({
+					switchSession: true,
+					switchSessionPaths: reloadPaths,
+					sessionFile: currentSessionFile,
+				}),
 				{ type: "switch_session", sessionPath: logicalReloadPath },
 				registry,
 			);
 			expect(reloadResult).toEqual({ type: "switch_session", data: { cancelled: false } });
+			expect(reloadPaths).toEqual([currentSessionFile]);
 			expect(registry.getSubagents()).toMatchObject([{ id: "SubagentA" }]);
 
 			const differentSessionFile = path.resolve("different-session.jsonl");
+			const differentPaths: string[] = [];
 			expect(isSameRpcSessionReload(currentSessionFile, differentSessionFile)).toBe(false);
 			await handleRpcSessionChange(
-				createSessionChangeSession({ switchSession: true, sessionFile: currentSessionFile }),
+				createSessionChangeSession({
+					switchSession: true,
+					switchSessionPaths: differentPaths,
+					sessionFile: currentSessionFile,
+				}),
 				{ type: "switch_session", sessionPath: differentSessionFile },
 				registry,
 			);
+			expect(differentPaths).toEqual([differentSessionFile]);
 			expect(registry.getSubagents()).toHaveLength(0);
 		} finally {
 			registry.dispose();
