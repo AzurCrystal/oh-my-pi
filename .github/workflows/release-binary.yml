@@ -1,0 +1,127 @@
+name: Build & Release OMP Binary
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-binary:
+    name: "Build: ${{ matrix.target_id }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              os: ubuntu-22.04,
+              target_id: linux-x64,
+              binary_path: packages/coding-agent/binaries/omp-linux-x64,
+              native_targets: linux-x64-baseline,
+            }
+          - {
+              os: ubuntu-24.04-arm,
+              target_id: linux-arm64,
+              binary_path: packages/coding-agent/binaries/omp-linux-arm64,
+              native_targets: linux-arm64,
+            }
+          - {
+              os: macos-14,
+              target_id: darwin-arm64,
+              binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
+              native_targets: darwin-arm64,
+            }
+          - {
+              os: macos-15-intel,
+              target_id: darwin-x64,
+              binary_path: packages/coding-agent/binaries/omp-darwin-x64,
+              native_targets: darwin-x64-baseline,
+            }
+          - {
+              os: ubuntu-22.04,
+              target_id: win32-x64,
+              binary_path: packages/coding-agent/binaries/omp-windows-x64.exe,
+              native_targets: win32-x64-baseline,
+            }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3"
+
+      - name: Cache bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+
+      - run: bun install --frozen-lockfile
+
+      # Build native addons from source using Bazel + Rust
+      - name: Build native addon (bazel)
+        uses: ./.github/actions/bazel-natives
+        with:
+          targets: ${{ matrix.native_targets }}
+          cache-scope: release-${{ matrix.target_id }}
+
+      - name: Build release binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target_id }}
+        run: bun run ci:release:build-binaries
+
+      - name: Smoke release binary
+        if: matrix.target_id != 'win32-x64'
+        run: |
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --version
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-binary-${{ matrix.target_id }}
+          path: ${{ matrix.binary_path }}
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: omp-binary-*
+          path: packages/coding-agent/binaries
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd packages/coding-agent/binaries
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OMP $TAG (app-server RPC expansion)" \
+            --notes "Fork of can1357/oh-my-pi with PR #6843 (expanded RPC app-server interface) and blocker fixes applied.
+
+          Includes:
+          - 185 typed RPC commands covering plan/goal/vibe/loop work modes
+          - Session lifecycle, settings, MCP admin, diagnostics, voice, collaboration
+          - Fix: guided-goal import of non-existent module removed
+          - Fix: plan_paused mutual exclusion
+          - Fix: session transition mode teardown ordering
+          - Fix: approve/reject plan proposal race condition" \
+            --generate-notes \
+            omp-* || gh release upload "$TAG" omp-* --clobber

@@ -1,0 +1,81 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Check for upstream releases every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Specific upstream tag to merge (e.g. v17.2.0). Leave empty to auto-detect latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/can1357/oh-my-pi.git || true
+
+      - name: Fetch upstream
+        run: git fetch upstream --tags
+
+      - name: Determine target tag
+        id: target
+        run: |
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            TAG="${{ inputs.upstream_tag }}"
+          else
+            # Find the latest upstream release tag not yet merged
+            TAG=$(git tag --sort=-creatordate | grep '^v' | head -1)
+            if git log --oneline main | grep -q "Merge upstream $TAG"; then
+              echo "Already up to date with $TAG"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream tag
+        if: steps.target.outputs.skip != 'true'
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          echo "Merging upstream $TAG into main..."
+          git checkout main
+          if git merge "$TAG" --no-edit -m "Merge upstream $TAG into fork"; then
+            echo "Merge successful, pushing..."
+            git push origin main
+          else
+            echo "::warning::Merge conflict with upstream $TAG. Manual resolution required."
+            echo "Conflicting files:"
+            git diff --name-only --diff-filter=U
+            # Abort the failed merge to keep main clean
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Create release tag
+        if: steps.target.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          FORK_TAG="${TAG}-fork.1"
+          git tag "$FORK_TAG"
+          git push origin "$FORK_TAG"
+          echo "Created tag $FORK_TAG — release-binary workflow will build and publish."
