@@ -32,18 +32,34 @@ ExtensionUiMethod: TypeAlias = Literal[
     "setStatus",
     "setWidget",
     "setTitle",
+    "setWorkingMessage",
     "set_editor_text",
+    "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal[
     "select", "confirm", "input", "editor"
 ]
 PassiveExtensionUiMethod: TypeAlias = Literal[
-    "notify", "setStatus", "setWidget", "setTitle", "set_editor_text"
+    "notify",
+    "setStatus",
+    "setWidget",
+    "setTitle",
+    "setWorkingMessage",
+    "set_editor_text",
+    "open_url",
 ]
 ValueExtensionUiMethod: TypeAlias = Literal["select", "input", "editor"]
 
 PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = frozenset(
-    {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+    {
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "setWorkingMessage",
+        "set_editor_text",
+        "open_url",
+    }
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = (
     frozenset({"select", "confirm", "input", "editor"})
@@ -78,7 +94,9 @@ _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
         "setStatus",
         "setWidget",
         "setTitle",
+        "setWorkingMessage",
         "set_editor_text",
+        "open_url",
     }
 )
 _AGENT_MESSAGE_ROLE_VALUES: Final[frozenset[str]] = frozenset(
@@ -786,6 +804,20 @@ class BashResult:
     output_bytes: int
     artifact_id: str | None = None
 
+@dataclass(slots=True, frozen=True)
+class PythonResult:
+    output: str
+    exit_code: int | None
+    cancelled: bool
+    truncated: bool
+    total_lines: int
+    total_bytes: int
+    output_lines: int
+    output_bytes: int
+    display_outputs: tuple[JsonObject, ...]
+    stdin_requested: bool
+    artifact_id: str | None = None
+
 
 @dataclass(slots=True, frozen=True)
 class CompactionResult:
@@ -884,6 +916,9 @@ class ExtensionUiRequest:
     widget_lines: tuple[str, ...] | None = None
     widget_placement: WidgetPlacement | None = None
     text: str | None = None
+    url: str | None = None
+    launch_url: str | None = None
+    instructions: str | None = None
     type: Literal["extension_ui_request"] = "extension_ui_request"
 
     def is_passive(self) -> bool:
@@ -949,6 +984,12 @@ class MessageEndEvent:
     message: AgentMessage
     type: Literal["message_end"] = "message_end"
 
+
+@dataclass(slots=True, frozen=True)
+class ContextMessageAddedEvent:
+    message: AgentMessage
+    display: bool
+    type: Literal["context_message_added"] = "context_message_added"
 
 @dataclass(slots=True, frozen=True)
 class ToolExecutionStartEvent:
@@ -1047,9 +1088,102 @@ class TodoAutoClearEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class ExecOutputEvent:
+    source: Literal["bash", "python"]
+    chunk: str
+    id: str | None = None
+    type: Literal["exec_output"] = "exec_output"
+
+
+@dataclass(slots=True, frozen=True)
+class BtwOutputEvent:
+    chunk: str
+    id: str | None = None
+    type: Literal["btw_output"] = "btw_output"
+
+
+@dataclass(slots=True, frozen=True)
+class IdleRecapEvent:
+    recap: str
+    type: Literal["idle_recap"] = "idle_recap"
+
+
+@dataclass(slots=True, frozen=True)
+class TtsrGenerationEvent:
+    event: JsonObject
+    id: str | None = None
+    type: Literal["ttsr_generation_event"] = "ttsr_generation_event"
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsUpdateEvent:
+    path: str
+    value: JsonValue
+    type: Literal["settings_update"] = "settings_update"
+
+
+@dataclass(slots=True, frozen=True)
+class RawSseUpdateEvent:
+    snapshot: JsonObject
+    type: Literal["raw_sse_update"] = "raw_sse_update"
+
+
+@dataclass(slots=True, frozen=True)
+class McpAuthChallengeEvent:
+    challenge: JsonObject
+    type: Literal["mcp_auth_challenge"] = "mcp_auth_challenge"
+
+
+@dataclass(slots=True, frozen=True)
+class VoiceEvent:
+    event: JsonObject
+    type: Literal["voice_event"] = "voice_event"
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableCommandsUpdateEvent:
+    commands: tuple[JsonObject, ...]
+    type: Literal["available_commands_update"] = "available_commands_update"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentLifecycleEvent:
+    payload: JsonObject
+    type: Literal["subagent_lifecycle"] = "subagent_lifecycle"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentProgressEvent:
+    payload: JsonObject
+    type: Literal["subagent_progress"] = "subagent_progress"
+
+
+@dataclass(slots=True, frozen=True)
+class SubagentEvent:
+    payload: JsonObject
+    type: Literal["subagent_event"] = "subagent_event"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
+
+@dataclass(slots=True, frozen=True)
+class ProviderRequestObservationEvent:
+    stage: Literal["context", "before_provider_request"]
+    request_id: int
+    messages: JsonValue | None = None
+    payload: JsonValue | None = None
+    serialization_error: str | None = None
+    type: Literal["provider_request_observation"] = "provider_request_observation"
+
+
+@dataclass(slots=True, frozen=True)
+class ExtensionUiCancelEvent:
+    target_id: str
+    timed_out: bool | None = None
+    type: Literal["extension_ui_cancel"] = "extension_ui_cancel"
 
 
 RpcAgentEvent: TypeAlias = (
@@ -1060,6 +1194,7 @@ RpcAgentEvent: TypeAlias = (
     | MessageStartEvent
     | MessageUpdateEvent
     | MessageEndEvent
+    | ContextMessageAddedEvent
     | ToolExecutionStartEvent
     | ToolExecutionUpdateEvent
     | ToolExecutionEndEvent
@@ -1074,10 +1209,25 @@ RpcAgentEvent: TypeAlias = (
     | TodoAutoClearEvent
 )
 
+
 RpcNotification: TypeAlias = (
     ReadyEvent
     | ExtensionUiRequest
+    | ExtensionUiCancelEvent
     | ExtensionError
+    | ExecOutputEvent
+    | BtwOutputEvent
+    | IdleRecapEvent
+    | TtsrGenerationEvent
+    | SettingsUpdateEvent
+    | RawSseUpdateEvent
+    | McpAuthChallengeEvent
+    | VoiceEvent
+    | ProviderRequestObservationEvent
+    | AvailableCommandsUpdateEvent
+    | SubagentLifecycleEvent
+    | SubagentProgressEvent
+    | SubagentEvent
     | RpcAgentEvent
     | UnknownNotification
 )
@@ -1356,6 +1506,24 @@ def parse_bash_result(payload: JsonObject) -> BashResult:
     )
 
 
+def parse_python_result(payload: JsonObject) -> PythonResult:
+    return PythonResult(
+        output=str(payload.get("output", "")),
+        exit_code=_optional_int(payload, "exitCode"),
+        cancelled=bool(payload.get("cancelled", False)),
+        truncated=bool(payload.get("truncated", False)),
+        total_lines=int(payload.get("totalLines", 0)),
+        total_bytes=int(payload.get("totalBytes", 0)),
+        output_lines=int(payload.get("outputLines", 0)),
+        output_bytes=int(payload.get("outputBytes", 0)),
+        display_outputs=_clone_json_objects(
+            payload.get("displayOutputs"), field="python.displayOutputs"
+        ),
+        stdin_requested=bool(payload.get("stdinRequested", False)),
+        artifact_id=_optional_str(payload, "artifactId"),
+    )
+
+
 def parse_compaction_result(payload: JsonObject) -> CompactionResult:
     return CompactionResult(
         summary=str(payload.get("summary", "")),
@@ -1487,6 +1655,9 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
             ),
         ),
         text=_optional_str(payload, "text"),
+        url=_optional_str(payload, "url"),
+        launch_url=_optional_str(payload, "launchUrl"),
+        instructions=_optional_str(payload, "instructions"),
     )
 
 
@@ -1518,10 +1689,111 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 payload, "maxReassembledFrameBytes"
             ),
         )
+    if event_type == "extension_ui_cancel":
+        return ExtensionUiCancelEvent(
+            target_id=_require_str(payload, "targetId"),
+            timed_out=_optional_bool(payload, "timedOut"),
+        )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "exec_output":
+        return ExecOutputEvent(
+            source=cast(
+                Literal["bash", "python"],
+                _require_literal(
+                    payload.get("source"),
+                    frozenset({"bash", "python"}),
+                    field="exec_output.source",
+                ),
+            ),
+            chunk=_require_str(payload, "chunk"),
+            id=_optional_str(payload, "id"),
+        )
+    if event_type == "btw_output":
+        return BtwOutputEvent(
+            chunk=_require_str(payload, "chunk"),
+            id=_optional_str(payload, "id"),
+        )
+    if event_type == "idle_recap":
+        return IdleRecapEvent(recap=_require_str(payload, "recap"))
+    if event_type == "ttsr_generation_event":
+        return TtsrGenerationEvent(
+            event=_clone_json_object(
+                payload.get("event"), field="ttsr_generation_event.event"
+            ),
+            id=_optional_str(payload, "id"),
+        )
+    if event_type == "settings_update":
+        return SettingsUpdateEvent(
+            path=_require_str(payload, "path"),
+            value=_clone_json_value(payload.get("value"), field="settings_update.value"),
+        )
+    if event_type == "raw_sse_update":
+        return RawSseUpdateEvent(
+            snapshot=_clone_json_object(payload.get("snapshot"), field="raw_sse_update.snapshot")
+        )
+    if event_type == "mcp_auth_challenge":
+        return McpAuthChallengeEvent(
+            challenge=_clone_json_object(
+                payload.get("challenge"), field="mcp_auth_challenge.challenge"
+            )
+        )
+    if event_type == "voice_event":
+        return VoiceEvent(
+            event=_clone_json_object(payload.get("event"), field="voice_event.event")
+        )
+    if event_type == "provider_request_observation":
+        stage = _require_literal(
+            payload.get("stage"),
+            frozenset({"context", "before_provider_request"}),
+            field="provider_request_observation.stage",
+        )
+        request_id = _optional_int(payload, "requestId")
+        if request_id is None:
+            raise ValueError("provider_request_observation.requestId must be an integer")
+        if stage == "context":
+            return ProviderRequestObservationEvent(
+                stage=cast(Literal["context"], stage),
+                request_id=request_id,
+                messages=_clone_json_value(
+                    payload.get("messages"), field="provider_request_observation.messages"
+                ),
+                serialization_error=_optional_str(payload, "serializationError"),
+            )
+        return ProviderRequestObservationEvent(
+            stage=cast(Literal["before_provider_request"], stage),
+            request_id=request_id,
+            payload=_clone_json_value(
+                payload.get("payload"), field="provider_request_observation.payload"
+            ),
+            serialization_error=_optional_str(payload, "serializationError"),
+        )
+    if event_type == "available_commands_update":
+        return AvailableCommandsUpdateEvent(
+            commands=_clone_json_objects(
+                payload.get("commands"), field="available_commands_update.commands"
+            )
+        )
+    if event_type == "subagent_lifecycle":
+        return SubagentLifecycleEvent(
+            payload=_clone_json_object(
+                payload.get("payload"), field="subagent_lifecycle.payload"
+            )
+        )
+    if event_type == "subagent_progress":
+        return SubagentProgressEvent(
+            payload=_clone_json_object(
+                payload.get("payload"), field="subagent_progress.payload"
+            )
+        )
+    if event_type == "subagent_event":
+        return SubagentEvent(
+            payload=_clone_json_object(
+                payload.get("payload"), field="subagent_event.payload"
+            )
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
@@ -1577,6 +1849,16 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 _clone_json_object(payload.get("message"), field="message_end.message"),
                 field="message_end.message",
             )
+        )
+    if event_type == "context_message_added":
+        return ContextMessageAddedEvent(
+            message=_parse_agent_message(
+                _clone_json_object(
+                    payload.get("message"), field="context_message_added.message"
+                ),
+                field="context_message_added.message",
+            ),
+            display=bool(payload.get("display", False)),
         )
     if event_type == "tool_execution_start":
         return ToolExecutionStartEvent(

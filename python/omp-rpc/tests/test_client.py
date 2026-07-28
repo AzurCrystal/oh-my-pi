@@ -10,6 +10,7 @@ import tempfile
 import textwrap
 import threading
 import time
+from pathlib import Path
 import unittest
 
 from omp_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
@@ -757,6 +758,149 @@ BROKEN_STARTUP_SERVER = textwrap.dedent(
 )
 
 
+ASYNC_FRAMES_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def respond(request_id, command, data):
+        print(json.dumps({
+            "id": request_id,
+            "type": "response",
+            "command": command,
+            "success": True,
+            "data": data,
+        }), flush=True)
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command["id"]
+        command_type = command["type"]
+        if command_type == "get_raw_sse":
+            print(json.dumps({
+                "type": "exec_output",
+                "source": "python",
+                "id": "py-1",
+                "chunk": "streamed",
+            }), flush=True)
+            print(json.dumps({
+                "type": "btw_output",
+                "id": "btw-1",
+                "chunk": "side answer",
+            }), flush=True)
+            print(json.dumps({
+                "type": "idle_recap",
+                "recap": "idle summary",
+            }), flush=True)
+            print(json.dumps({
+                "type": "ttsr_generation_event",
+                "id": "ttsr-1",
+                "event": {"type": "tts_rule_delta", "attempt": 1, "delta": "draft"},
+            }), flush=True)
+            print(json.dumps({
+                "type": "settings_update",
+                "path": "voice.enabled",
+                "value": True,
+            }), flush=True)
+            print(json.dumps({
+                "type": "raw_sse_update",
+                "snapshot": {"records": [{"event": "data"}]},
+            }), flush=True)
+            print(json.dumps({
+                "type": "mcp_auth_challenge",
+                "challenge": {"id": "challenge-1", "scheme": "Bearer"},
+            }), flush=True)
+            print(json.dumps({
+                "type": "voice_event",
+                "event": {"type": "stt_transcript", "text": "hello"},
+            }), flush=True)
+            print(json.dumps({
+                "type": "available_commands_update",
+                "commands": [{"name": "reload", "source": "builtin"}],
+            }), flush=True)
+            print(json.dumps({
+                "type": "subagent_lifecycle",
+                "payload": {"id": "agent-1", "status": "running"},
+            }), flush=True)
+            print(json.dumps({
+                "type": "subagent_progress",
+                "payload": {"id": "agent-1", "progress": 0.5},
+            }), flush=True)
+            print(json.dumps({
+                "type": "subagent_event",
+                "payload": {"id": "agent-1", "event": {"type": "message"}},
+            }), flush=True)
+            print(json.dumps({
+                "type": "extension_ui_cancel",
+                "targetId": "dialog-1",
+                "timedOut": True,
+            }), flush=True)
+            print(json.dumps({
+                "type": "provider_request_observation",
+                "stage": "context",
+                "requestId": 1,
+                "messages": [{"role": "user", "content": "rewritten context"}],
+            }), flush=True)
+            print(json.dumps({
+                "type": "provider_request_observation",
+                "stage": "before_provider_request",
+                "requestId": 1,
+                "payload": {"model": "test-model"},
+            }), flush=True)
+            print(json.dumps({
+                "type": "context_message_added",
+                "message": {
+                    "role": "custom",
+                    "customType": "system-reminder",
+                    "content": "injected context",
+                    "display": False,
+                },
+                "display": False,
+            }), flush=True)
+            respond(request_id, command_type, {"records": []})
+        elif command_type == "python":
+            respond(request_id, command_type, {
+                "output": "python\\n",
+                "exitCode": 0,
+                "cancelled": False,
+                "truncated": False,
+                "totalLines": 1,
+                "totalBytes": 7,
+                "outputLines": 1,
+                "outputBytes": 7,
+                "displayOutputs": [{"type": "text/plain", "data": "ok"}],
+                "stdinRequested": False,
+            })
+        elif command_type == "set_goal_budget":
+            respond(request_id, command_type, command)
+        else:
+            respond(request_id, command_type, {})
+    """
+)
+
+DELTA_COMMANDS_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    published_text = None
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        if command["type"] == "publish_editor_text":
+            published_text = command["text"]
+        print(json.dumps({
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": True,
+            "data": {"received": command, "publishedText": published_text},
+        }), flush=True)
+    """
+)
+
+
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
         return RpcClient(
@@ -849,6 +993,246 @@ class RpcClientTests(unittest.TestCase):
             result = client.bash("echo hello")
             self.assertEqual(result.output, "hello\n")
             self.assertEqual(result.exit_code, 0)
+
+    def test_python_and_async_frame_listeners(self) -> None:
+        seen: dict[str, list[object]] = {
+            "exec": [],
+            "btw": [],
+            "idle": [],
+            "ttsr": [],
+            "settings": [],
+            "sse": [],
+            "challenge": [],
+            "voice": [],
+            "commands": [],
+            "lifecycle": [],
+            "progress": [],
+            "subagent": [],
+            "ui_cancel": [],
+            "provider_observation": [],
+            "context_message": [],
+        }
+
+        with self.make_client(server=ASYNC_FRAMES_SERVER) as client:
+            client.on_exec_output(lambda event: seen["exec"].append(event))
+            client.on_settings_update(lambda event: seen["settings"].append(event))
+            client.on_btw_output(lambda event: seen["btw"].append(event))
+            client.on_idle_recap(lambda event: seen["idle"].append(event))
+            client.on_raw_sse_update(lambda event: seen["sse"].append(event))
+            client.on_mcp_auth_challenge(
+                lambda event: seen["challenge"].append(event)
+            )
+            client.on_ttsr_generation_event(lambda event: seen["ttsr"].append(event))
+            client.on_voice_event(lambda event: seen["voice"].append(event))
+            client.on_available_commands_update(
+                lambda event: seen["commands"].append(event)
+            )
+            client.on_subagent_lifecycle(
+                lambda event: seen["lifecycle"].append(event)
+            )
+            client.on_subagent_progress(
+                lambda event: seen["progress"].append(event)
+            )
+            client.on_subagent_event(lambda event: seen["subagent"].append(event))
+            client.on_extension_ui_cancel(lambda event: seen["ui_cancel"].append(event))
+            client.on_provider_request_observation(
+                lambda event: seen["provider_observation"].append(event)
+            )
+            client.on_context_message_added(
+                lambda event: seen["context_message"].append(event)
+            )
+
+            snapshot = client.get_raw_sse()
+            result = client.python("print('python')")
+            goal = client.set_goal_budget(None)
+
+        self.assertEqual(snapshot["records"], [])
+        self.assertEqual(result.output, "python\n")
+        self.assertEqual(result.display_outputs[0]["data"], "ok")
+        self.assertEqual(goal["tokenBudget"], None)
+        self.assertEqual(seen["exec"][0].chunk, "streamed")
+        self.assertEqual(seen["btw"][0].id, "btw-1")
+        self.assertEqual(seen["btw"][0].chunk, "side answer")
+        self.assertEqual(seen["idle"][0].recap, "idle summary")
+        self.assertEqual(seen["ttsr"][0].event["delta"], "draft")
+        self.assertEqual(seen["settings"][0].path, "voice.enabled")
+        self.assertEqual(seen["sse"][0].snapshot["records"][0]["event"], "data")
+        self.assertEqual(seen["challenge"][0].challenge["id"], "challenge-1")
+        self.assertEqual(seen["voice"][0].event["text"], "hello")
+        self.assertEqual(seen["commands"][0].commands[0]["name"], "reload")
+        self.assertEqual(seen["lifecycle"][0].payload["status"], "running")
+        self.assertEqual(seen["progress"][0].payload["progress"], 0.5)
+        self.assertEqual(seen["subagent"][0].payload["event"]["type"], "message")
+        self.assertTrue(seen["ui_cancel"][0].timed_out)
+        self.assertEqual(seen["provider_observation"][0].messages[0]["content"], "rewritten context")
+        self.assertEqual(seen["provider_observation"][1].payload["model"], "test-model")
+        self.assertFalse(seen["context_message"][0].display)
+        self.assertEqual(seen["context_message"][0].message["content"], "injected context")
+
+    def test_delta_command_methods_preserve_protocol_payloads(self) -> None:
+        with self.make_client(server=DELTA_COMMANDS_SERVER) as client:
+            with self.assertRaises(TypeError):
+                client.logout("openai")  # type: ignore[call-arg]
+            approved = client.approve_plan_proposal(
+                edited_content="revised plan",
+                strategy="keep-context",
+                execution_model={"provider": "openai", "modelId": "gpt-5.6"},
+                thinking_level="high",
+            )
+            ask = client.ask_btw("side question")
+            cancel_btw = client.cancel_btw()
+            branch_btw = client.branch_btw()
+            generated = client.generate_ttsr_rule(
+                "rule complaint", feedback="be specific", previous_rule="old rule"
+            )
+            enabled = client.enable_loop(
+                "keep going", action="compact", count=3, duration_ms=500
+            )
+            disabled = client.disable_loop()
+            loop_state = client.get_loop_state()
+            cancelled_iteration = client.cancel_loop_iteration()
+            paused = client.pause_agents()
+            resumed = client.resume_agents()
+            pause_state = client.get_pause_state()
+            session_tree = client.get_session_tree()
+            client.publish_editor_text("host draft")
+            last_answer = client.get_last_btw_answer()
+            plan_paused = client.pause_plan_mode()
+            plan_resumed = client.resume_plan_mode()
+            roles = client.get_model_roles()
+            role_set = client.set_model_role("reviewer", "openai/gpt-5.6", "project")
+            role_cleared = client.clear_model_role("reviewer", "project")
+            client.subscribe_provider_request_observations()
+            client.unsubscribe_provider_request_observations()
+            logout = client.logout("openai", 7)
+            removed_account = client.remove_login_account("openai", 8)
+            removed_provider = client.remove_provider_credentials("openai")
+            mcp_added = client.mcp_add_server(
+                "demo", {"command": "demo-mcp", "args": []}, "project"
+            )
+            mcp_removed = client.mcp_remove_server("demo", "project")
+            mcp_enabled = client.mcp_set_server_enabled("demo", True)
+            mcp_reloaded = client.mcp_reload()
+            mcp_reconnected = client.mcp_reconnect_server("demo")
+            mcp_unauthenticated = client.mcp_unauth_server("demo")
+            mcp_reauth_started = client.mcp_begin_reauth("demo")
+            mcp_reauth_completed = client.mcp_complete_reauth("flow-1", "code")
+            client.mcp_cancel_reauth("flow-1")
+            smithery_started = client.mcp_begin_smithery_login()
+            smithery_completed = client.mcp_complete_smithery_login("session-1", "key")
+            smithery_logged_out = client.mcp_logout_smithery()
+            registry = client.mcp_search_registry("filesystem", 10, True)
+            deployed = client.mcp_deploy_registry_result(
+                {"id": "server-1"}, "project", {"token": "secret"}, "demo"
+            )
+
+        self.assertEqual(approved["received"]["editedContent"], "revised plan")
+        self.assertEqual(approved["received"]["strategy"], "keep-context")
+        self.assertEqual(
+            approved["received"]["executionModel"]["modelId"], "gpt-5.6"
+        )
+        self.assertEqual(approved["received"]["thinkingLevel"], "high")
+        self.assertEqual(
+            [
+                response["received"]["type"]
+                for response in (
+                    ask,
+                    cancel_btw,
+                    branch_btw,
+                    generated,
+                    enabled,
+                    disabled,
+                    loop_state,
+                    cancelled_iteration,
+                    paused,
+                    resumed,
+                    pause_state,
+                    session_tree,
+                    last_answer,
+                    plan_paused,
+                    plan_resumed,
+                    roles,
+                    role_set,
+                    role_cleared,
+                    logout,
+                    removed_account,
+                    removed_provider,
+                    mcp_added,
+                    mcp_removed,
+                    mcp_enabled,
+                    mcp_reloaded,
+                    mcp_reconnected,
+                    mcp_unauthenticated,
+                    mcp_reauth_started,
+                    mcp_reauth_completed,
+                    smithery_started,
+                    smithery_completed,
+                    smithery_logged_out,
+                    registry,
+                    deployed,
+                )
+            ],
+            [
+                "ask_btw",
+                "cancel_btw",
+                "branch_btw",
+                "generate_ttsr_rule",
+                "enable_loop",
+                "disable_loop",
+                "get_loop_state",
+                "cancel_loop_iteration",
+                "pause_agents",
+                "resume_agents",
+                "get_pause_state",
+                "get_session_tree",
+                "get_last_btw_answer",
+                "pause_plan_mode",
+                "resume_plan_mode",
+                "get_model_roles",
+                "set_model_role",
+                "clear_model_role",
+                "logout",
+                "remove_login_account",
+                "remove_provider_credentials",
+                "mcp_add_server",
+                "mcp_remove_server",
+                "mcp_set_server_enabled",
+                "mcp_reload",
+                "mcp_reconnect_server",
+                "mcp_unauth_server",
+                "mcp_begin_reauth",
+                "mcp_complete_reauth",
+                "mcp_begin_smithery_login",
+                "mcp_complete_smithery_login",
+                "mcp_logout_smithery",
+                "mcp_search_registry",
+                "mcp_deploy_registry_result",
+            ],
+        )
+        self.assertEqual(generated["received"]["previousRule"], "old rule")
+        self.assertEqual(enabled["received"]["durationMs"], 500)
+        self.assertEqual(last_answer["publishedText"], "host draft")
+        self.assertEqual(plan_paused["received"]["type"], "pause_plan_mode")
+        self.assertEqual(plan_resumed["received"]["type"], "resume_plan_mode")
+        self.assertEqual(roles["received"]["type"], "get_model_roles")
+        self.assertEqual(role_set["received"]["scope"], "project")
+        self.assertEqual(role_cleared["received"]["role"], "reviewer")
+        self.assertEqual(logout["received"]["credentialId"], 7)
+        self.assertEqual(removed_account["received"]["credentialId"], 8)
+        self.assertEqual(removed_provider["received"]["type"], "remove_provider_credentials")
+        self.assertEqual(mcp_added["received"]["config"]["command"], "demo-mcp")
+        self.assertEqual(mcp_removed["received"]["scope"], "project")
+        self.assertTrue(mcp_enabled["received"]["enabled"])
+        self.assertEqual(mcp_reloaded["received"]["type"], "mcp_reload")
+        self.assertEqual(mcp_reconnected["received"]["name"], "demo")
+        self.assertEqual(mcp_unauthenticated["received"]["name"], "demo")
+        self.assertEqual(mcp_reauth_started["received"]["type"], "mcp_begin_reauth")
+        self.assertEqual(mcp_reauth_completed["received"]["completion"], "code")
+        self.assertEqual(smithery_started["received"]["type"], "mcp_begin_smithery_login")
+        self.assertEqual(smithery_completed["received"]["apiKey"], "key")
+        self.assertEqual(smithery_logged_out["received"]["type"], "mcp_logout_smithery")
+        self.assertEqual(registry["received"]["semantic"], True)
+        self.assertEqual(deployed["received"]["values"]["token"], "secret")
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:
@@ -1009,7 +1393,7 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(stats.tokens.total, 15)
 
             exported = client.export_html("/tmp/custom.html")
-            self.assertEqual(str(exported), "/tmp/custom.html")
+            self.assertEqual(exported, Path("/tmp/custom.html"))
 
             new_session = client.new_session()
             switched = client.switch_session("/tmp/session.jsonl")

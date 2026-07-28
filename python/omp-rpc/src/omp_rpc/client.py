@@ -23,6 +23,7 @@ from .protocol import (
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     AutoRetryEndEvent,
+    AvailableCommandsUpdateEvent,
     AutoRetryStartEvent,
     BashResult,
     BranchMessage,
@@ -31,7 +32,11 @@ from .protocol import (
     CompactionResult,
     ExtensionError,
     ExtensionUiRequest,
+    ExecOutputEvent,
+    ExtensionUiCancelEvent,
+    BtwOutputEvent,
     ImageContent,
+    ContextMessageAddedEvent,
     InterruptMode,
     JsonObject,
     JsonValue,
@@ -39,28 +44,38 @@ from .protocol import (
     MessagesPage,
     MessageStartEvent,
     MessageUpdateEvent,
+    IdleRecapEvent,
     ModelCycleResult,
     ModelInfo,
     ReadyEvent,
     RetryFallbackAppliedEvent,
+    McpAuthChallengeEvent,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
     RpcNotification,
     SessionState,
     SessionStats,
     SteeringMode,
+    PythonResult,
     StreamingBehavior,
     ThinkingLevel,
     ThinkingLevelCycleResult,
+    ProviderRequestObservationEvent,
+    RawSseUpdateEvent,
     TodoItem,
     TodoPhase,
+    SubagentEvent,
     TodoStatus,
+    SubagentLifecycleEvent,
+    SubagentProgressEvent,
     TodoAutoClearEvent,
     TodoReminderEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
+    SettingsUpdateEvent,
     ToolExecutionUpdateEvent,
     TtsrTriggeredEvent,
+    TtsrGenerationEvent,
     TurnEndEvent,
     TurnStartEvent,
     UnknownNotification,
@@ -73,7 +88,9 @@ from .protocol import (
     parse_compaction_result,
     parse_model_cycle_result,
     parse_model_info,
+    VoiceEvent,
     parse_notification,
+    parse_python_result,
     parse_session_state,
     parse_session_stats,
     parse_thinking_level_cycle_result,
@@ -83,9 +100,22 @@ from .protocol import (
 AgentEventListener = Callable[[RpcAgentEvent], None]
 NotificationListener = Callable[[RpcNotification], None]
 UiRequestListener = Callable[[ExtensionUiRequest], None]
+ExtensionUiCancelListener = Callable[[ExtensionUiCancelEvent], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
+ExecOutputListener = Callable[[ExecOutputEvent], None]
+BtwOutputListener = Callable[[BtwOutputEvent], None]
+IdleRecapListener = Callable[[IdleRecapEvent], None]
+SettingsUpdateListener = Callable[[SettingsUpdateEvent], None]
+RawSseUpdateListener = Callable[[RawSseUpdateEvent], None]
+McpAuthChallengeListener = Callable[[McpAuthChallengeEvent], None]
+VoiceEventListener = Callable[[VoiceEvent], None]
+ProviderRequestObservationListener = Callable[[ProviderRequestObservationEvent], None]
+AvailableCommandsUpdateListener = Callable[[AvailableCommandsUpdateEvent], None]
+SubagentLifecycleListener = Callable[[SubagentLifecycleEvent], None]
+SubagentProgressListener = Callable[[SubagentProgressEvent], None]
+SubagentEventListener = Callable[[SubagentEvent], None]
 AgentStartListener = Callable[[AgentStartEvent], None]
 AgentEndListener = Callable[[AgentEndEvent], None]
 TurnStartListener = Callable[[TurnStartEvent], None]
@@ -93,6 +123,7 @@ TurnEndListener = Callable[[TurnEndEvent], None]
 MessageStartListener = Callable[[MessageStartEvent], None]
 MessageUpdateListener = Callable[[MessageUpdateEvent], None]
 MessageEndListener = Callable[[MessageEndEvent], None]
+ContextMessageAddedListener = Callable[[ContextMessageAddedEvent], None]
 ToolExecutionStartListener = Callable[[ToolExecutionStartEvent], None]
 ToolExecutionUpdateListener = Callable[[ToolExecutionUpdateEvent], None]
 ToolExecutionEndListener = Callable[[ToolExecutionEndEvent], None]
@@ -103,6 +134,7 @@ AutoRetryEndListener = Callable[[AutoRetryEndEvent], None]
 RetryFallbackAppliedListener = Callable[[RetryFallbackAppliedEvent], None]
 RetryFallbackSucceededListener = Callable[[RetryFallbackSucceededEvent], None]
 TtsrTriggeredListener = Callable[[TtsrTriggeredEvent], None]
+TtsrGenerationListener = Callable[[TtsrGenerationEvent], None]
 TodoReminderListener = Callable[[TodoReminderEvent], None]
 TodoAutoClearListener = Callable[[TodoAutoClearEvent], None]
 ProtocolErrorListener = Callable[["RpcProtocolError"], None]
@@ -543,6 +575,24 @@ class RpcClient:
         self._extension_error_listeners: list[ExtensionErrorListener] = []
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
         self._listener_error_listeners: list[ListenerErrorListener] = []
+        self._exec_output_listeners: list[ExecOutputListener] = []
+        self._extension_ui_cancel_listeners: list[ExtensionUiCancelListener] = []
+        self._btw_output_listeners: list[BtwOutputListener] = []
+        self._idle_recap_listeners: list[IdleRecapListener] = []
+        self._settings_update_listeners: list[SettingsUpdateListener] = []
+        self._raw_sse_update_listeners: list[RawSseUpdateListener] = []
+        self._mcp_auth_challenge_listeners: list[McpAuthChallengeListener] = []
+        self._ttsr_generation_listeners: list[TtsrGenerationListener] = []
+        self._voice_event_listeners: list[VoiceEventListener] = []
+        self._provider_request_observation_listeners: list[
+            ProviderRequestObservationListener
+        ] = []
+        self._available_commands_update_listeners: list[
+            AvailableCommandsUpdateListener
+        ] = []
+        self._subagent_lifecycle_listeners: list[SubagentLifecycleListener] = []
+        self._subagent_progress_listeners: list[SubagentProgressListener] = []
+        self._subagent_event_listeners: list[SubagentEventListener] = []
 
     def __enter__(self) -> RpcClient:
         return self.start()
@@ -749,6 +799,11 @@ class RpcClient:
     def on_message_end(self, listener: MessageEndListener) -> Callable[[], None]:
         return self._add_typed_event_listener("message_end", listener)
 
+    def on_context_message_added(
+        self, listener: ContextMessageAddedListener
+    ) -> Callable[[], None]:
+        return self._add_typed_event_listener("context_message_added", listener)
+
     def on_tool_execution_start(
         self, listener: ToolExecutionStartListener
     ) -> Callable[[], None]:
@@ -805,11 +860,90 @@ class RpcClient:
         self._ui_request_listeners.append(listener)
         return lambda: self._remove_listener(self._ui_request_listeners, listener)
 
+    def on_extension_ui_cancel(
+        self, listener: ExtensionUiCancelListener
+    ) -> Callable[[], None]:
+        self._extension_ui_cancel_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._extension_ui_cancel_listeners, listener
+        )
+
     def on_extension_error(
         self, listener: ExtensionErrorListener
     ) -> Callable[[], None]:
         self._extension_error_listeners.append(listener)
         return lambda: self._remove_listener(self._extension_error_listeners, listener)
+
+    def on_exec_output(self, listener: ExecOutputListener) -> Callable[[], None]:
+        self._exec_output_listeners.append(listener)
+        return lambda: self._remove_listener(self._exec_output_listeners, listener)
+
+    def on_btw_output(self, listener: BtwOutputListener) -> Callable[[], None]:
+        self._btw_output_listeners.append(listener)
+        return lambda: self._remove_listener(self._btw_output_listeners, listener)
+
+    def on_idle_recap(self, listener: IdleRecapListener) -> Callable[[], None]:
+        self._idle_recap_listeners.append(listener)
+        return lambda: self._remove_listener(self._idle_recap_listeners, listener)
+
+    def on_settings_update(self, listener: SettingsUpdateListener) -> Callable[[], None]:
+        self._settings_update_listeners.append(listener)
+        return lambda: self._remove_listener(self._settings_update_listeners, listener)
+
+    def on_raw_sse_update(self, listener: RawSseUpdateListener) -> Callable[[], None]:
+        self._raw_sse_update_listeners.append(listener)
+        return lambda: self._remove_listener(self._raw_sse_update_listeners, listener)
+
+    def on_provider_request_observation(
+        self, listener: ProviderRequestObservationListener
+    ) -> Callable[[], None]:
+        self._provider_request_observation_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._provider_request_observation_listeners, listener
+        )
+
+    def on_ttsr_generation_event(
+        self, listener: TtsrGenerationListener
+    ) -> Callable[[], None]:
+        self._ttsr_generation_listeners.append(listener)
+        return lambda: self._remove_listener(self._ttsr_generation_listeners, listener)
+
+
+    def on_mcp_auth_challenge(
+        self, listener: McpAuthChallengeListener
+    ) -> Callable[[], None]:
+        self._mcp_auth_challenge_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._mcp_auth_challenge_listeners, listener
+        )
+
+    def on_voice_event(self, listener: VoiceEventListener) -> Callable[[], None]:
+        self._voice_event_listeners.append(listener)
+        return lambda: self._remove_listener(self._voice_event_listeners, listener)
+
+    def on_available_commands_update(
+        self, listener: AvailableCommandsUpdateListener
+    ) -> Callable[[], None]:
+        self._available_commands_update_listeners.append(listener)
+        return lambda: self._remove_listener(
+            self._available_commands_update_listeners, listener
+        )
+
+    def on_subagent_lifecycle(
+        self, listener: SubagentLifecycleListener
+    ) -> Callable[[], None]:
+        self._subagent_lifecycle_listeners.append(listener)
+        return lambda: self._remove_listener(self._subagent_lifecycle_listeners, listener)
+
+    def on_subagent_progress(
+        self, listener: SubagentProgressListener
+    ) -> Callable[[], None]:
+        self._subagent_progress_listeners.append(listener)
+        return lambda: self._remove_listener(self._subagent_progress_listeners, listener)
+
+    def on_subagent_event(self, listener: SubagentEventListener) -> Callable[[], None]:
+        self._subagent_event_listeners.append(listener)
+        return lambda: self._remove_listener(self._subagent_event_listeners, listener)
 
     def on_protocol_error(self, listener: ProtocolErrorListener) -> Callable[[], None]:
         self._protocol_error_listeners.append(listener)
@@ -910,6 +1044,404 @@ class RpcClient:
             payload["timedOut"] = True
         self._send_notification(payload)
 
+    def negotiate_protocol(self, protocol_version: int) -> JsonObject:
+        return self._request("negotiate_protocol", protocolVersion=protocol_version)
+
+    def complete(
+        self, lines: Sequence[str], cursor: Mapping[str, int]
+    ) -> JsonObject:
+        return self._request(
+            "complete",
+            lines=cast(JsonValue, list(lines)),
+            cursor=cast(JsonValue, dict(cursor)),
+        )
+
+    def apply_completion(
+        self, lines: Sequence[str], cursor: Mapping[str, int], item: JsonObject
+    ) -> JsonObject:
+        return self._request(
+            "apply_completion",
+            lines=cast(JsonValue, list(lines)),
+            cursor=cast(JsonValue, dict(cursor)),
+            item=cast(JsonValue, item),
+        )
+
+    def get_available_commands(self) -> JsonObject:
+        return self._request("get_available_commands")
+
+    def get_settings(self) -> JsonObject:
+        return self._request("get_settings")
+
+    def set_setting(self, path: str, value: JsonValue) -> JsonObject:
+        return self._request("set_setting", path=path, value=value)
+
+    def get_extensions(self, *, cwd: str | Path | None = None) -> JsonObject:
+        return self._request(
+            "get_extensions", cwd=str(cwd) if cwd is not None else None
+        )
+
+    def get_repo_status(
+        self, *, cwd: str | Path | None = None, include_pr: bool | None = None
+    ) -> JsonObject:
+        return self._request(
+            "get_repo_status",
+            cwd=str(cwd) if cwd is not None else None,
+            includePr=include_pr,
+        )
+
+    def get_usage_reports(self) -> JsonObject:
+        return self._request("get_usage_reports")
+
+    def subscribe_provider_request_observations(self) -> None:
+        self._request("subscribe_provider_request_observations")
+
+    def unsubscribe_provider_request_observations(self) -> None:
+        self._request("unsubscribe_provider_request_observations")
+
+    def set_subagent_subscription(self, level: str) -> JsonObject:
+        return self._request("set_subagent_subscription", level=level)
+
+    def get_subagents(self) -> JsonObject:
+        return self._request("get_subagents")
+
+    def get_subagent_messages(
+        self,
+        *,
+        subagent_id: str | None = None,
+        session_file: str | Path | None = None,
+        from_byte: int | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "get_subagent_messages",
+            subagentId=subagent_id,
+            sessionFile=str(session_file) if session_file is not None else None,
+            fromByte=from_byte,
+        )
+
+    def enter_plan_mode(
+        self, plan_file_path: str | Path | None = None, *, workflow: str | None = None
+    ) -> JsonObject:
+        return self._request(
+            "enter_plan_mode",
+            planFilePath=str(plan_file_path) if plan_file_path is not None else None,
+            workflow=workflow,
+        )
+
+    def pause_plan_mode(self) -> JsonObject:
+        return self._request("pause_plan_mode")
+
+    def resume_plan_mode(self) -> JsonObject:
+        return self._request("resume_plan_mode")
+
+    def exit_plan_mode(self) -> JsonObject:
+        return self._request("exit_plan_mode")
+
+    def get_plan_mode_state(self) -> JsonObject:
+        return self._request("get_plan_mode_state")
+
+    def submit_plan_review(self, title: str | None = None) -> JsonObject:
+        return self._request("submit_plan_review", title=title)
+
+    def approve_plan_proposal(
+        self,
+        *,
+        edited_content: str | None = None,
+        strategy: str | None = None,
+        execution_model: Mapping[str, str] | None = None,
+        thinking_level: ThinkingLevel | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "approve_plan_proposal",
+            editedContent=edited_content,
+            strategy=strategy,
+            executionModel=cast(JsonValue, dict(execution_model))
+            if execution_model is not None
+            else None,
+            thinkingLevel=thinking_level,
+        )
+
+    def reject_plan_proposal(self, feedback: str | None = None) -> JsonObject:
+        return self._request("reject_plan_proposal", feedback=feedback)
+
+    def create_goal(
+        self, objective: str, token_budget: int | None = None
+    ) -> JsonObject:
+        return self._request(
+            "create_goal", objective=objective, tokenBudget=token_budget
+        )
+
+    def pause_goal(self) -> JsonObject:
+        return self._request("pause_goal")
+
+    def resume_goal(self) -> JsonObject:
+        return self._request("resume_goal")
+
+    def switch_goal(
+        self, objective: str, token_budget: int | None = None
+    ) -> JsonObject:
+        return self._request(
+            "switch_goal", objective=objective, tokenBudget=token_budget
+        )
+
+    def clear_goal(self) -> JsonObject:
+        return self._request("clear_goal")
+
+    def set_goal_budget(self, token_budget: int | None) -> JsonObject:
+        return self._request_with_nulls(
+            "set_goal_budget", {"tokenBudget": token_budget}
+        )
+
+    def get_goal_state(self) -> JsonObject:
+        return self._request("get_goal_state")
+
+    def begin_guided_goal(self, initial_objective: str) -> JsonObject:
+        return self._request(
+            "begin_guided_goal", initialObjective=initial_objective
+        )
+
+    def answer_guided_goal(self, answer: str) -> JsonObject:
+        return self._request("answer_guided_goal", answer=answer)
+
+    def accept_guided_goal(self, objective: str) -> JsonObject:
+        return self._request("accept_guided_goal", objective=objective)
+
+    def cancel_guided_goal(self) -> JsonObject:
+        return self._request("cancel_guided_goal")
+
+    def get_guided_goal_state(self) -> JsonObject:
+        return self._request("get_guided_goal_state")
+
+    def enter_vibe_mode(self) -> JsonObject:
+        return self._request("enter_vibe_mode")
+
+    def exit_vibe_mode(self) -> JsonObject:
+        return self._request("exit_vibe_mode")
+
+    def get_vibe_mode_state(self) -> JsonObject:
+        return self._request("get_vibe_mode_state")
+
+    def get_work_mode_state(self) -> JsonObject:
+        return self._request("get_work_mode_state")
+
+    def enable_loop(
+        self,
+        prompt: str,
+        *,
+        action: str | None = None,
+        count: int | None = None,
+        duration_ms: int | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "enable_loop",
+            prompt=prompt,
+            action=action,
+            count=count,
+            durationMs=duration_ms,
+        )
+
+    def disable_loop(self) -> JsonObject:
+        return self._request("disable_loop")
+
+    def get_loop_state(self) -> JsonObject:
+        return self._request("get_loop_state")
+
+    def cancel_loop_iteration(self) -> JsonObject:
+        return self._request("cancel_loop_iteration")
+
+    def pause_agents(self) -> JsonObject:
+        return self._request("pause_agents")
+
+    def resume_agents(self) -> JsonObject:
+        return self._request("resume_agents")
+
+    def get_pause_state(self) -> JsonObject:
+        return self._request("get_pause_state")
+
+    def get_session_tree(self) -> JsonObject:
+        return self._request("get_session_tree")
+
+    def get_controllable_agents(self) -> JsonObject:
+        return self._request("get_controllable_agents")
+
+    def revive_agent(self, agent_id: str) -> JsonObject:
+        return self._request("revive_agent", agentId=agent_id)
+
+    def kill_agent(self, agent_id: str) -> JsonObject:
+        return self._request("kill_agent", agentId=agent_id)
+
+    def prompt_agent(self, agent_id: str, text: str) -> JsonObject:
+        return self._request("prompt_agent", agentId=agent_id, text=text)
+
+    def spawn_background_agent(self, work: str) -> JsonObject:
+        return self._request("spawn_background_agent", work=work)
+
+    def get_advisor_config(self, scope: str) -> JsonObject:
+        return self._request("get_advisor_config", scope=scope)
+
+    def set_advisor_config(
+        self,
+        scope: str,
+        instructions: str | None,
+        advisors: Sequence[JsonObject],
+    ) -> JsonObject:
+        return self._request_with_nulls(
+            "set_advisor_config",
+            {
+                "scope": scope,
+                "instructions": instructions,
+                "advisors": cast(JsonValue, list(advisors)),
+            },
+        )
+
+    def generate_ttsr_rule(
+        self,
+        complaint: str,
+        *,
+        feedback: str | None = None,
+        previous_rule: str | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "generate_ttsr_rule",
+            complaint=complaint,
+            feedback=feedback,
+            previousRule=previous_rule,
+        )
+
+    def build_ttsr_rule(
+        self,
+        name: str,
+        description: str,
+        conditions: Sequence[str],
+        scopes: Sequence[str],
+        body: str,
+    ) -> JsonObject:
+        return self._request(
+            "build_ttsr_rule",
+            name=name,
+            description=description,
+            conditions=cast(JsonValue, list(conditions)),
+            scopes=cast(JsonValue, list(scopes)),
+            body=body,
+        )
+
+    def register_ttsr_rule(
+        self,
+        scope: str,
+        name: str,
+        description: str,
+        conditions: Sequence[str],
+        scopes: Sequence[str],
+        body: str,
+        overwrite: bool,
+    ) -> JsonObject:
+        return self._request(
+            "register_ttsr_rule",
+            scope=scope,
+            name=name,
+            description=description,
+            conditions=cast(JsonValue, list(conditions)),
+            scopes=cast(JsonValue, list(scopes)),
+            body=body,
+            overwrite=overwrite,
+        )
+
+    def get_ttsr_rules(self) -> JsonObject:
+        return self._request("get_ttsr_rules")
+
+    def remove_ttsr_rule(self, name: str, delete_persisted: bool) -> JsonObject:
+        return self._request(
+            "remove_ttsr_rule", name=name, deletePersisted=delete_persisted
+        )
+
+    def get_agent_definitions(self) -> JsonObject:
+        return self._request("get_agent_definitions")
+
+    def get_agent_definition(
+        self, name: str, scope: str | None = None
+    ) -> JsonObject:
+        return self._request_with_nulls(
+            "get_agent_definition", {"name": name, "scope": scope}
+        )
+
+    def set_agent_definition(
+        self, scope: str, name: str, content: str, overwrite: bool
+    ) -> JsonObject:
+        return self._request(
+            "set_agent_definition",
+            scope=scope,
+            name=name,
+            content=content,
+            overwrite=overwrite,
+        )
+
+    def delete_agent_definition(self, scope: str, name: str) -> JsonObject:
+        return self._request("delete_agent_definition", scope=scope, name=name)
+
+    def get_mental_models(self, detail: str) -> JsonObject:
+        return self._request("get_mental_models", detail=detail)
+
+    def get_mental_model(self, mental_model_id: str, detail: str) -> JsonObject:
+        return self._request(
+            "get_mental_model", mentalModelId=mental_model_id, detail=detail
+        )
+
+    def create_mental_model(
+        self,
+        name: str,
+        source_query: str,
+        *,
+        mental_model_id: str | None = None,
+        tags: Sequence[str] | None = None,
+        max_tokens: int | None = None,
+        mode: str | None = None,
+        refresh_after_consolidation: bool | None = None,
+    ) -> JsonObject:
+        return self._request_with_nulls(
+            "create_mental_model",
+            {
+                "name": name,
+                "sourceQuery": source_query,
+                "mentalModelId": mental_model_id,
+                "tags": cast(JsonValue, list(tags)) if tags is not None else None,
+                "maxTokens": max_tokens,
+                "mode": mode,
+                "refreshAfterConsolidation": refresh_after_consolidation,
+            },
+        )
+
+    def refresh_mental_model(self, mental_model_id: str) -> JsonObject:
+        return self._request(
+            "refresh_mental_model", mentalModelId=mental_model_id
+        )
+
+    def refresh_auto_mental_models(self) -> JsonObject:
+        return self._request("refresh_auto_mental_models")
+
+    def get_mental_model_history(self, mental_model_id: str) -> JsonObject:
+        return self._request(
+            "get_mental_model_history", mentalModelId=mental_model_id
+        )
+
+    def seed_mental_models(self) -> JsonObject:
+        return self._request("seed_mental_models")
+
+    def delete_mental_model(self, mental_model_id: str) -> JsonObject:
+        return self._request(
+            "delete_mental_model", mentalModelId=mental_model_id
+        )
+
+    def reload_mental_models(self) -> JsonObject:
+        return self._request("reload_mental_models")
+
+    def get_theme(self) -> JsonObject:
+        return self._request("get_theme")
+
+    def get_keybindings(self) -> JsonObject:
+        return self._request("get_keybindings")
+
+    def get_session_view(self) -> JsonObject:
+        return self._request("get_session_view")
+
     def get_state(self) -> SessionState:
         payload = self._request("get_state")
         return parse_session_state(payload)
@@ -921,13 +1453,53 @@ class RpcClient:
             raise RpcError("set_model returned an empty payload")
         return model
 
-    def cycle_model(self) -> ModelCycleResult | None:
-        return parse_model_cycle_result(self._request("cycle_model"))
+    def set_model_temporary(
+        self,
+        provider: str,
+        model_id: str,
+        *,
+        thinking_level: ThinkingLevel | None = None,
+        ephemeral: bool | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "set_model_temporary",
+            provider=provider,
+            modelId=model_id,
+            thinkingLevel=thinking_level,
+            ephemeral=ephemeral,
+        )
+
+    def cycle_model(
+        self, direction: str | None = None
+    ) -> ModelCycleResult | None:
+        return parse_model_cycle_result(
+            self._request("cycle_model", direction=direction)
+        )
+
+    def cycle_role_models(
+        self, role_order: Sequence[str], direction: str | None = None
+    ) -> JsonObject:
+        return self._request(
+            "cycle_role_models",
+            roleOrder=cast(JsonValue, list(role_order)),
+            direction=direction,
+        )
 
     def get_available_models(self) -> tuple[ModelInfo, ...]:
         payload = self._request("get_available_models")
         models = cast(list[JsonObject], payload.get("models") or [])
         return tuple(filter(None, (parse_model_info(model) for model in models)))
+
+    def get_model_roles(self) -> JsonObject:
+        return self._request("get_model_roles")
+
+    def set_model_role(self, role: str, model: str, scope: str) -> JsonObject:
+        return self._request(
+            "set_model_role", role=role, model=model, scope=scope
+        )
+
+    def clear_model_role(self, role: str, scope: str) -> JsonObject:
+        return self._request("clear_model_role", role=role, scope=scope)
 
     def set_thinking_level(self, level: ThinkingLevel) -> None:
         self._request("set_thinking_level", level=level)
@@ -944,6 +1516,15 @@ class RpcClient:
     def set_interrupt_mode(self, mode: InterruptMode) -> None:
         self._request("set_interrupt_mode", mode=mode)
 
+    def get_queued_messages(self) -> JsonObject:
+        return self._request("get_queued_messages")
+
+    def pop_queued_message(self) -> JsonObject:
+        return self._request("pop_queued_message")
+
+    def clear_queue(self) -> JsonObject:
+        return self._request("clear_queue")
+
     def compact(self, custom_instructions: str | None = None) -> CompactionResult:
         payload = self._request("compact", customInstructions=custom_instructions)
         return parse_compaction_result(payload)
@@ -957,12 +1538,40 @@ class RpcClient:
     def abort_retry(self) -> None:
         self._request("abort_retry")
 
-    def bash(self, command: str) -> BashResult:
-        payload = self._request("bash", command=command)
+    def retry(self) -> JsonObject:
+        return self._request("retry")
+
+    def bash(
+        self,
+        command: str,
+        *,
+        exclude_from_context: bool | None = None,
+        use_user_shell: bool | None = None,
+        follow_cwd: bool | None = None,
+    ) -> BashResult:
+        payload = self._request(
+            "bash",
+            command=command,
+            excludeFromContext=exclude_from_context,
+            useUserShell=use_user_shell,
+            followCwd=follow_cwd,
+        )
         return parse_bash_result(payload)
 
     def abort_bash(self) -> None:
         self._request("abort_bash")
+
+    def python(
+        self, code: str, *, exclude_from_context: bool | None = None
+    ) -> PythonResult:
+        return parse_python_result(
+            self._request(
+                "python", code=code, excludeFromContext=exclude_from_context
+            )
+        )
+
+    def abort_python(self) -> None:
+        self._request("abort_python")
 
     def get_session_stats(self) -> SessionStats:
         payload = self._request("get_session_stats")
@@ -981,6 +1590,7 @@ class RpcClient:
         )
 
     def switch_session(self, session_path: str | Path) -> CancellationResult:
+        """Switch by absolute path, session-id prefix, filename prefix, or partial title."""
         return parse_cancellation_result(
             self._request("switch_session", sessionPath=str(session_path))
         )
@@ -1002,6 +1612,71 @@ class RpcClient:
     def get_todos(self) -> tuple[TodoPhase, ...]:
         return self.get_state().todo_phases
 
+
+    def get_sessions(
+        self,
+        *,
+        scope: str | None = None,
+        cwd: str | Path | None = None,
+        query: str | None = None,
+        limit: int | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "get_sessions",
+            scope=scope,
+            cwd=str(cwd) if cwd is not None else None,
+            query=query,
+            limit=limit,
+        )
+
+    def delete_session(self, session_path: str | Path) -> None:
+        self._request("delete_session", sessionPath=str(session_path))
+
+    def get_prompt_history(
+        self,
+        *,
+        cwd: str | Path | None = None,
+        query: str | None = None,
+        limit: int | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "get_prompt_history",
+            cwd=str(cwd) if cwd is not None else None,
+            query=query,
+            limit=limit,
+        )
+
+    def fork(self) -> CancellationResult:
+        return parse_cancellation_result(self._request("fork"))
+
+    def navigate_tree(
+        self,
+        target_id: str,
+        *,
+        summarize: bool | None = None,
+        custom_instructions: str | None = None,
+        allow_ask_reopen: bool | None = None,
+        reanswer_ask_result: JsonObject | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "navigate_tree",
+            targetId=target_id,
+            summarize=summarize,
+            customInstructions=custom_instructions,
+            allowAskReopen=allow_ask_reopen,
+            reanswerAskResult=cast(JsonValue, reanswer_ask_result)
+            if reanswer_ask_result is not None
+            else None,
+        )
+
+    def resume_after_ask_reanswer(self) -> None:
+        self._request("resume_after_ask_reanswer")
+
+    def generate_title(self, text: str) -> JsonObject:
+        return self._request("generate_title", text=text)
+
+    def handoff(self, custom_instructions: str | None = None) -> JsonObject:
+        return self._request("handoff", customInstructions=custom_instructions)
     def set_todos(
         self, todos: Sequence[TodoSeed | TodoPhaseSeed]
     ) -> tuple[TodoPhase, ...]:
@@ -1011,6 +1686,233 @@ class RpcClient:
 
     def clear_todos(self) -> tuple[TodoPhase, ...]:
         return self.set_todos(())
+
+    def get_login_providers(self) -> JsonObject:
+        return self._request("get_login_providers")
+
+    def login(
+        self,
+        provider_id: str,
+        *,
+        on_open_url: Callable[[ExtensionUiRequest], None] | None = None,
+        on_manual_code_input: Callable[[ExtensionUiRequest], str] | None = None,
+    ) -> JsonObject:
+        def handle(request: ExtensionUiRequest) -> None:
+            if request.method == "open_url" and on_open_url is not None:
+                on_open_url(request)
+            elif request.method == "input" and on_manual_code_input is not None:
+                self.send_ui_value(request.id, on_manual_code_input(request))
+
+        unsubscribe = self.on_ui_request(handle)
+        try:
+            return self._request("login", providerId=provider_id)
+        finally:
+            unsubscribe()
+
+    def logout(self, provider_id: str, credential_id: int) -> JsonObject:
+        """Remove exactly one stored OAuth account; sibling accounts are preserved."""
+        return self._request(
+            "logout", providerId=provider_id, credentialId=credential_id
+        )
+
+    def remove_login_account(
+        self, provider_id: str, credential_id: int
+    ) -> JsonObject:
+        return self._request(
+            "remove_login_account", providerId=provider_id, credentialId=credential_id
+        )
+
+    def remove_provider_credentials(self, provider_id: str) -> JsonObject:
+        """Destructively remove every stored credential for one provider."""
+        return self._request("remove_provider_credentials", providerId=provider_id)
+
+    def mcp_add_server(
+        self, name: str, config: JsonObject, scope: str
+    ) -> JsonObject:
+        return self._request(
+            "mcp_add_server", name=name, config=cast(JsonValue, config), scope=scope
+        )
+
+    def mcp_remove_server(self, name: str, scope: str) -> JsonObject:
+        return self._request("mcp_remove_server", name=name, scope=scope)
+
+    def mcp_set_server_enabled(self, name: str, enabled: bool) -> JsonObject:
+        return self._request("mcp_set_server_enabled", name=name, enabled=enabled)
+
+    def mcp_reload(self) -> JsonObject:
+        return self._request("mcp_reload")
+
+    def mcp_reconnect_server(self, name: str) -> JsonObject:
+        return self._request("mcp_reconnect_server", name=name)
+
+    def mcp_unauth_server(self, name: str) -> JsonObject:
+        return self._request("mcp_unauth_server", name=name)
+
+    def mcp_begin_reauth(self, name: str) -> JsonObject:
+        return self._request("mcp_begin_reauth", name=name)
+
+    def mcp_complete_reauth(
+        self, flow_id: str, completion: str | None = None
+    ) -> JsonObject:
+        return self._request(
+            "mcp_complete_reauth", flowId=flow_id, completion=completion
+        )
+
+    def mcp_cancel_reauth(self, flow_id: str) -> None:
+        self._request("mcp_cancel_reauth", flowId=flow_id)
+
+    def mcp_begin_smithery_login(self) -> JsonObject:
+        return self._request("mcp_begin_smithery_login")
+
+    def mcp_complete_smithery_login(
+        self, session_id: str, api_key: str | None = None
+    ) -> JsonObject:
+        return self._request(
+            "mcp_complete_smithery_login", sessionId=session_id, apiKey=api_key
+        )
+
+    def mcp_logout_smithery(self) -> JsonObject:
+        return self._request("mcp_logout_smithery")
+
+    def mcp_search_registry(
+        self, query: str, limit: int | None = None, semantic: bool | None = None
+    ) -> JsonObject:
+        return self._request(
+            "mcp_search_registry", query=query, limit=limit, semantic=semantic
+        )
+
+    def mcp_deploy_registry_result(
+        self,
+        result: JsonObject,
+        scope: str,
+        values: Mapping[str, str],
+        name: str | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "mcp_deploy_registry_result",
+            result=cast(JsonValue, result),
+            scope=scope,
+            name=name,
+            values=cast(JsonValue, dict(values)),
+        )
+
+
+    def start_cpu_profile(self) -> None:
+        self._request("start_cpu_profile")
+
+    def stop_cpu_profile(self) -> JsonObject:
+        return self._request("stop_cpu_profile")
+
+    def create_heap_profile(self) -> JsonObject:
+        return self._request("create_heap_profile")
+
+    def create_support_bundle(self) -> JsonObject:
+        return self._request("create_support_bundle")
+
+    def create_work_profile(self) -> JsonObject:
+        return self._request("create_work_profile")
+
+    def get_recent_logs(
+        self, *, max_lines: int | None = None, older_days: int | None = None
+    ) -> JsonObject:
+        return self._request(
+            "get_recent_logs", maxLines=max_lines, olderDays=older_days
+        )
+
+    def get_raw_sse(self) -> JsonObject:
+        return self._request("get_raw_sse")
+
+    def subscribe_raw_sse(self) -> None:
+        self._request("subscribe_raw_sse")
+
+    def unsubscribe_raw_sse(self) -> None:
+        self._request("unsubscribe_raw_sse")
+
+    def start_inspector(self) -> JsonObject:
+        return self._request("start_inspector")
+
+    def get_system_info(self) -> JsonObject:
+        return self._request("get_system_info")
+
+    def get_startup_warnings(self) -> JsonObject:
+        return self._request("get_startup_warnings")
+
+    def get_artifacts_directory(self) -> JsonObject:
+        return self._request("get_artifacts_directory")
+
+    def clear_artifact_cache(self, days_old: int | None = None) -> JsonObject:
+        return self._request("clear_artifact_cache", daysOld=days_old)
+
+    def get_mcp_auth_challenges(self) -> JsonObject:
+        return self._request("get_mcp_auth_challenges")
+
+    def resolve_mcp_auth_challenge(
+        self, challenge_id: str, config: JsonObject | None = None
+    ) -> JsonObject:
+        return self._request(
+            "resolve_mcp_auth_challenge",
+            challengeId=challenge_id,
+            config=cast(JsonValue, config) if config is not None else None,
+        )
+
+    def start_live(self, voice: str | None = None) -> JsonObject:
+        return self._request("start_live", voice=voice)
+
+    def stop_live(self) -> JsonObject:
+        return self._request("stop_live")
+
+    def get_live_status(self) -> JsonObject:
+        return self._request("get_live_status")
+
+    def toggle_live_mute(self) -> JsonObject:
+        return self._request("toggle_live_mute")
+
+    def start_stt(self) -> JsonObject:
+        return self._request("start_stt")
+
+    def stop_stt(self) -> JsonObject:
+        return self._request("stop_stt")
+
+    def toggle_stt(self) -> JsonObject:
+        return self._request("toggle_stt")
+
+    def get_stt_status(self) -> JsonObject:
+        return self._request("get_stt_status")
+
+    def speak_text(self, text: str) -> JsonObject:
+        return self._request("speak_text", text=text)
+
+    def clear_speech(self) -> JsonObject:
+        return self._request("clear_speech")
+
+    def duck_speech(self) -> JsonObject:
+        return self._request("duck_speech")
+
+    def unduck_speech(self) -> JsonObject:
+        return self._request("unduck_speech")
+
+    def get_speech_status(self) -> JsonObject:
+        return self._request("get_speech_status")
+
+    def set_speech_settings(
+        self, *, enabled: bool | None = None, mode: str | None = None
+    ) -> JsonObject:
+        return self._request("set_speech_settings", enabled=enabled, mode=mode)
+
+    def start_collab_hosting(self, relay_url: str | None = None) -> JsonObject:
+        return self._request("start_collab_hosting", relayUrl=relay_url)
+
+    def stop_collab_hosting(self) -> None:
+        self._request("stop_collab_hosting")
+
+    def get_collab_status(self) -> JsonObject:
+        return self._request("get_collab_status")
+
+    def join_collab_session(self, link: str) -> JsonObject:
+        return self._request("join_collab_session", link=link)
+
+    def leave_collab_session(self) -> None:
+        self._request("leave_collab_session")
 
     def get_messages(self) -> tuple[AgentMessage, ...]:
         if self._protocol_version == 2:
@@ -1172,6 +2074,21 @@ class RpcClient:
             images=list(images) if images is not None else None,
         )
         self._mark_agent_run_scheduled()
+
+    def ask_btw(self, question: str) -> JsonObject:
+        return self._request("ask_btw", question=question)
+
+    def get_last_btw_answer(self) -> JsonObject:
+        return self._request("get_last_btw_answer")
+
+    def cancel_btw(self) -> JsonObject:
+        return self._request("cancel_btw")
+
+    def branch_btw(self) -> JsonObject:
+        return self._request("branch_btw")
+
+    def publish_editor_text(self, text: str) -> None:
+        self._request("publish_editor_text", text=text)
 
     def prompt_and_wait(
         self,
@@ -1362,12 +2279,22 @@ class RpcClient:
                 self._event_condition.wait(remaining)
 
     def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+        return self._request_payload(
+            command_type, {key: value for key, value in payload.items() if value is not None}
+        )
+
+    def _request_with_nulls(
+        self, command_type: str, payload: JsonObject
+    ) -> JsonObject:
+        return self._request_payload(command_type, payload)
+
+    def _request_payload(
+        self, command_type: str, payload: JsonObject
+    ) -> JsonObject:
         process = self._require_process()
         request_id = self._next_request_id()
         envelope: JsonObject = {"id": request_id, "type": command_type}
-        for key, value in payload.items():
-            if value is not None:
-                envelope[key] = value
+        envelope.update(payload)
 
         response_queue: queue.Queue[JsonObject | BaseException] = queue.Queue(maxsize=1)
         with self._state_lock:
@@ -1894,6 +2821,131 @@ class RpcClient:
                         listener_notification.type,
                         self._extension_error_listeners,
                         cast(ExtensionError, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, ExecOutputEvent):
+                    self._dispatch_listeners(
+                        "exec_output",
+                        listener_notification.type,
+                        self._exec_output_listeners,
+                        cast(ExecOutputEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, BtwOutputEvent):
+                    self._dispatch_listeners(
+                        "btw_output",
+                        listener_notification.type,
+                        self._btw_output_listeners,
+                        cast(BtwOutputEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, IdleRecapEvent):
+                    self._dispatch_listeners(
+                        "idle_recap",
+                        listener_notification.type,
+                        self._idle_recap_listeners,
+                        cast(IdleRecapEvent, listener_notification),
+                    )
+                    continue
+                if isinstance(notification, ExtensionUiCancelEvent):
+                    self._dispatch_listeners(
+                        "extension_ui_cancel",
+                        listener_notification.type,
+                        self._extension_ui_cancel_listeners,
+                        cast(ExtensionUiCancelEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, SettingsUpdateEvent):
+                    self._dispatch_listeners(
+                        "settings_update",
+                        listener_notification.type,
+                        self._settings_update_listeners,
+                        cast(SettingsUpdateEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, RawSseUpdateEvent):
+                    self._dispatch_listeners(
+                        "raw_sse_update",
+                        listener_notification.type,
+                        self._raw_sse_update_listeners,
+                        cast(RawSseUpdateEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, McpAuthChallengeEvent):
+                    self._dispatch_listeners(
+                        "mcp_auth_challenge",
+                        listener_notification.type,
+                        self._mcp_auth_challenge_listeners,
+                        cast(McpAuthChallengeEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, TtsrGenerationEvent):
+                    self._dispatch_listeners(
+                        "ttsr_generation_event",
+                        listener_notification.type,
+                        self._ttsr_generation_listeners,
+                        cast(TtsrGenerationEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, VoiceEvent):
+                    self._dispatch_listeners(
+                        "voice_event",
+                        listener_notification.type,
+                        self._voice_event_listeners,
+                        cast(VoiceEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, ProviderRequestObservationEvent):
+                    self._dispatch_listeners(
+                        "provider_request_observation",
+                        listener_notification.type,
+                        self._provider_request_observation_listeners,
+                        cast(ProviderRequestObservationEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, AvailableCommandsUpdateEvent):
+                    self._dispatch_listeners(
+                        "available_commands_update",
+                        listener_notification.type,
+                        self._available_commands_update_listeners,
+                        cast(AvailableCommandsUpdateEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, SubagentLifecycleEvent):
+                    self._dispatch_listeners(
+                        "subagent_lifecycle",
+                        listener_notification.type,
+                        self._subagent_lifecycle_listeners,
+                        cast(SubagentLifecycleEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, SubagentProgressEvent):
+                    self._dispatch_listeners(
+                        "subagent_progress",
+                        listener_notification.type,
+                        self._subagent_progress_listeners,
+                        cast(SubagentProgressEvent, listener_notification),
+                    )
+                    continue
+
+                if isinstance(notification, SubagentEvent):
+                    self._dispatch_listeners(
+                        "subagent_event",
+                        listener_notification.type,
+                        self._subagent_event_listeners,
+                        cast(SubagentEvent, listener_notification),
                     )
                     continue
 
