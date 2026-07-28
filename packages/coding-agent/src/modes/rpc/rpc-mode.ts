@@ -48,7 +48,6 @@ import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../../system-prompt";
-import { isLowSignalTitleInput } from "../../tiny/text";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
 import { buildSessionAutocompleteProvider } from "../completions";
@@ -664,7 +663,7 @@ function isRpcSecretFieldName(name: string): boolean {
 	return SECRET_KEY_PATTERN.test(name) || RPC_SECRET_FIELD_NAMES[name.toLowerCase()] === true;
 }
 
-function redactRpcUrlSecrets(value: string): string {
+export function redactRpcUrlSecrets(value: string): string {
 	const shape = URL.canParse(value)
 		? "absolute"
 		: value.startsWith("//")
@@ -673,7 +672,9 @@ function redactRpcUrlSecrets(value: string): string {
 				? "query"
 				: value.startsWith("/") || value.startsWith("./") || value.startsWith("../")
 					? "path"
-					: undefined;
+					: !/\s/.test(value) && URL.canParse(value, RPC_URL_REDACTION_ORIGIN)
+						? "rootless"
+						: undefined;
 	if (!shape) return value;
 
 	let parsed: URL;
@@ -710,7 +711,9 @@ function redactRpcUrlSecrets(value: string): string {
 				? parsed.href.slice(parsed.protocol.length)
 				: shape === "query"
 					? `${parsed.search}${parsed.hash}`
-					: `${parsed.pathname}${parsed.search}${parsed.hash}`;
+					: shape === "rootless"
+						? `${parsed.pathname.slice(1)}${parsed.search}${parsed.hash}`
+						: `${parsed.pathname}${parsed.search}${parsed.hash}`;
 	return serialized.replaceAll(encodeURIComponent(RPC_REDACTED_CREDENTIAL), RPC_REDACTED_CREDENTIAL);
 }
 
@@ -1451,44 +1454,14 @@ export async function runRpcMode(
 		}
 	};
 
-	const generateAndApplyTitle = async (
-		text: string,
-		onlyIfUnnamed: boolean,
-	): Promise<{ title: string | null; applied: boolean }> => {
-		if (onlyIfUnnamed && session.sessionManager.getSessionName()) return { title: null, applied: false };
+	const generateAndApplyTitle = async (text: string): Promise<{ title: string | null; applied: boolean }> => {
 		const title = await session.generateTitle(text);
-		if (!title || (onlyIfUnnamed && session.sessionManager.getSessionName())) {
-			return { title, applied: false };
-		}
+		if (!title) return { title, applied: false };
 		const applied = await session.setSessionName(title, "auto");
 		if (applied) {
 			output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 		}
 		return { title, applied };
-	};
-
-	const maybeStartTitleGeneration = (text: string): void => {
-		const runner = session.extensionRunner;
-		const extensionCommandSpace = text.indexOf(" ");
-		const isLocalExtensionCommand =
-			text.startsWith("/") &&
-			runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
-				undefined;
-		if (
-			isLocalExtensionCommand ||
-			session.sessionManager.getSessionName() ||
-			$env.PI_NO_TITLE ||
-			isLowSignalTitleInput(text)
-		) {
-			return;
-		}
-		void generateAndApplyTitle(text, true).catch(titleError => {
-			logger.warn("title-generator: uncaught auto-title error", {
-				sessionId: session.sessionId,
-				reason: "uncaught-auto-title-error",
-				error: titleError instanceof Error ? titleError.message : String(titleError),
-			});
-		});
 	};
 
 	const resolveRpcModel = async (provider: string, modelId: string): Promise<Model | undefined> => {
@@ -1708,7 +1681,6 @@ export async function runRpcMode(
 				const builtinResult = await executeRpcBuiltinSlashCommand(message);
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
-						maybeStartTitleGeneration(builtinResult.prompt);
 						watchAndReportLocalOnlyPromptResult({
 							id,
 							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
@@ -1721,7 +1693,6 @@ export async function runRpcMode(
 					return success(id, "prompt", { agentInvoked: false });
 				}
 
-				maybeStartTitleGeneration(message);
 				// Don't await - events will stream
 				// Extension commands are executed immediately, file prompt templates are expanded
 				// If streaming and streamingBehavior specified, queues via steer/followUp
@@ -2717,7 +2688,7 @@ export async function runRpcMode(
 			}
 
 			case "generate_title": {
-				return success(id, "generate_title", await generateAndApplyTitle(command.text, false));
+				return success(id, "generate_title", await generateAndApplyTitle(command.text));
 			}
 
 			case "handoff": {

@@ -22,7 +22,7 @@ omp --mode rpc [regular CLI options]
 Behavior notes:
 
 - `@file` CLI arguments are rejected in RPC mode.
-- The first non-low-signal prompt in an unnamed session starts automatic title generation unless `PI_NO_TITLE` is set. An applied title emits `session_info_update`.
+- RPC startup sets `PI_NO_TITLE=1`, so `prompt` never starts an implicit title-generation model call. Clients control titles explicitly with `set_session_name` or `generate_title`.
 - RPC mode resets workflow-altering `todo.*`, `task.*`, `memory.backend`/`memories.enabled`, `advisor.*`, `async.*`, and `bash.autoBackground.*` settings to their built-in defaults instead of inheriting user overrides.
 - The process reads stdin as JSONL (`readJsonl(Bun.stdin.stream())`).
 - At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
@@ -77,7 +77,7 @@ The table below names the 18 asynchronous frames and event variants a standalone
 | `extension_ui_request` | An extension, login flow, collab host, or tool needs host UI. Requests that expect an answer are completed with `extension_ui_response`. | Automatic; use `RpcClient.onExtensionUiRequest`. |
 | `extension_error` | An extension event handler throws. | Automatic raw stdout frame; the TypeScript client has no dedicated listener. |
 | `available_commands_update` | Emitted once at startup and whenever slash-command metadata changes. | Automatic; use `RpcClient.onAvailableCommandsUpdate`. |
-| `prompt_result` | An immediately acknowledged scheduled `prompt` later finishes locally without invoking the agent. | Automatic raw stdout frame; correlate by `id`. The TypeScript client has no dedicated listener. |
+| `prompt_result` | An immediately acknowledged scheduled `prompt` later finishes locally without invoking the agent. | Automatic; use `RpcClient.onPromptResult` and correlate by `id`. Use `promptWithResult` when the immediate `agentInvoked` outcome is also needed. |
 | `subagent_lifecycle` | A subscribed subagent starts, stops, or changes lifecycle state. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentLifecycle`. |
 | `subagent_progress` | A subscribed subagent publishes progress. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentProgress`. |
 | `subagent_event` | A subscribed subagent emits its underlying session event. | Send `set_subagent_subscription` with `level: "events"`, then use `RpcClient.onSubagentEvent`. |
@@ -382,7 +382,7 @@ These commands operate on the active Hindsight bank. Bulk refresh and seeding re
 
 Deleting the active session uses the canonical drop/new-session path so the live session never points at a deleted file; it may return `code: "cancelled"` if that transition is cancelled. A non-active path not owned by the session index returns `code: "unknown_session"`.
 
-`navigate_tree` returns navigation state including optional ask-reopen/reanswer fields. After a committed historical ask reanswer, send `resume_after_ask_reanswer` once the host has rebuilt its transcript. `generate_title` returns `{ title, applied }`; ordinary non-low-signal prompts also start automatic title generation for unnamed sessions unless `PI_NO_TITLE` is set.
+`navigate_tree` returns navigation state including optional ask-reopen/reanswer fields. After a committed historical ask reanswer, send `resume_after_ask_reanswer` once the host has rebuilt its transcript. `generate_title` performs the explicit model call, applies the result to the active session, emits `session_info_update` when applied, and returns `{ title, applied }`. `set_session_name` applies a client-provided title without a model call. Ordinary `prompt` commands never generate or change titles.
 
 Prompt-history search defaults to the session cwd and a limit of 100, clamped to 1–1,000. Entries contain `text`, optional `cwd`, optional `sessionId`, and optional ISO-8601 `at`.
 
@@ -1017,7 +1017,7 @@ Extensions in RPC mode use request/response UI frames.
 - `notify`, `setStatus`, `setWorkingMessage`, `setWidget`, `setTitle`, `set_editor_text`
 - `open_url` (emitted by RPC login flows)
 
-Automatic session titling is independent of extension UI and emits `session_info_update`. Extension `setTitle` UI requests are suppressed by default because many hosts have no terminal-title surface; set `PI_RPC_EMIT_TITLE=1` to emit those requests.
+Session titles are client-controlled through `set_session_name` and `generate_title`; `prompt` does not generate one implicitly. An applied `generate_title` emits `session_info_update`. Extension `setTitle` UI requests are suppressed by default because many hosts have no terminal-title surface; set `PI_RPC_EMIT_TITLE=1` to emit those requests.
 
 Example:
 
@@ -1274,4 +1274,4 @@ stdin:
 
 The client spawns `bun <cliPath> --mode rpc`, negotiates protocol v2, correlates responses by generated `req_<n>` ids, exposes `onSessionEvent`/`onEvent` plus the frame-specific listeners named above, and handles registered host-tool calls through `setCustomTools()`. Provider observations require both `subscribeProviderRequestObservations()` and `onProviderRequestObservation()`; extension dialog cancellation uses `onExtensionUiCancel()`.
 
-Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error` and `prompt_result`, which do not have dedicated listener methods.
+Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error`, which has no dedicated listener method; `prompt_result` uses `onPromptResult()`.
