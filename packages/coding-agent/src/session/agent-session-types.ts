@@ -266,6 +266,10 @@ export interface SessionHandoffOptions {
 	onSwitchCancelled?: () => void;
 }
 
+export interface SessionTransitionOptions {
+	beforeCommit?: () => Promise<void>;
+}
+
 /** Result from cycleModel(). */
 export interface ModelCycleResult {
 	model: Model;

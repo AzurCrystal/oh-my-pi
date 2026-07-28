@@ -225,6 +225,7 @@ import type {
 	SessionHandoffOptions,
 	SessionOAuthAccountList,
 	SessionStats,
+	SessionTransitionOptions,
 	UsageFallbackConfirmation,
 } from "./agent-session-types";
 import {
@@ -6005,8 +6006,8 @@ export class AgentSession {
 	 * @param options - Optional initial messages and parent session path
 	 * @returns true if completed, false if cancelled by hook
 	 */
-	async newSession(options?: NewSessionOptions): Promise<boolean> {
-		this.#assertVibeSessionTransitionAllowed("start a new session");
+	async newSession(options?: NewSessionOptions & SessionTransitionOptions): Promise<boolean> {
+		const { beforeCommit, ...newSessionOptions } = options ?? {};
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -6021,16 +6022,19 @@ export class AgentSession {
 			}
 		}
 
+		await beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("start a new session");
+
 		this.#disconnectFromAgent();
 		await this.abort();
 		this.#cancelOwnAsyncJobs();
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
-		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
+		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: newSessionOptions.drop !== true });
 		let sessionTransitioned = false;
 		try {
 			this.agent.reset();
-			if (options?.drop && previousSessionFile) {
+			if (newSessionOptions.drop && previousSessionFile) {
 				// Detach the advisor recorder feed and drain its writer BEFORE deleting the
 				// old artifacts dir: `await this.abort()` only stops the primary, so a still-
 				// running advisor turn could otherwise finish, emit `message_end`, and recreate
@@ -6046,7 +6050,7 @@ export class AgentSession {
 				await this.sessionManager.flush();
 			}
 			await this.sessionManager.newSession({
-				...options,
+				...newSessionOptions,
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
 			this.#bash.markSessionTransition(bashTransition);
@@ -6108,8 +6112,7 @@ export class AgentSession {
 	 * Unlike newSession(), this preserves all messages in the agent state.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
-		this.#assertVibeSessionTransitionAllowed("fork the session");
+	async fork(options?: SessionTransitionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
@@ -6123,6 +6126,9 @@ export class AgentSession {
 				return false;
 			}
 		}
+
+		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("fork the session");
 
 		await this.#bash.flushPending();
 		// Flush current session to ensure all entries are written
@@ -7008,7 +7014,7 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(sessionPath: string, options?: SessionTransitionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -7025,6 +7031,8 @@ export class AgentSession {
 				return false;
 			}
 		}
+
+		await options?.beforeCommit?.();
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
@@ -7267,7 +7275,10 @@ export class AgentSession {
 	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
-	async branch(entryId: string): Promise<{
+	async branch(
+		entryId: string,
+		options?: SessionTransitionOptions,
+	): Promise<{
 		selectedText: string;
 		selectedImages: ImageContent[];
 		cancelled: boolean;
@@ -7296,6 +7307,8 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
+
+		await options?.beforeCommit?.();
 
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
