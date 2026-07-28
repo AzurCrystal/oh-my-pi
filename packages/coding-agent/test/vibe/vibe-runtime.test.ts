@@ -759,8 +759,8 @@ describe("vibe session registry", () => {
 	});
 
 	it("reattaches an exact zero-turn worker and job on suspension rollback", async () => {
-		const register = vi.fn(() => "zero-turn-job");
-		const manager = { register } as unknown as AsyncJobManager;
+		const manager = createManager();
+		const register = vi.spyOn(manager, "register").mockReturnValue("zero-turn-job");
 		const session = createSession({ manager, sessionManager: SessionManager.inMemory(".") });
 		const registry = VibeSessionRegistry.global();
 		const spawned = await registry.spawn(session, {
