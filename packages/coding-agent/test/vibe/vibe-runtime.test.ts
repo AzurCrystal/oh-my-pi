@@ -702,7 +702,9 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await firstJobs.getJob(spawned.jobId)!.promise;
-		expect(await registry.suspendScope(registry.ownerScope(firstSession), firstJobs)).toBe(1);
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(firstSession), firstJobs);
+		expect(suspension.count).toBe(1);
+		await suspension.commit();
 		expect(AgentRegistry.global().get("idle-dispose")).toBeUndefined();
 		expect(
 			parentManager.getEntries().some(entry => {
@@ -726,6 +728,30 @@ describe("vibe session registry", () => {
 		await turnJob.promise;
 		expect(revived.prompts).toEqual([INITIAL_VIBE_TASK, FOLLOW_UP_VIBE_TASK]);
 		expect(turnJob.resultText).toContain('turn="2"');
+	});
+
+	it("reattaches an exact zero-turn worker and job on suspension rollback", async () => {
+		const register = vi.fn(() => "zero-turn-job");
+		const manager = { register } as unknown as AsyncJobManager;
+		const session = createSession({ manager, sessionManager: SessionManager.inMemory(".") });
+		const registry = VibeSessionRegistry.global();
+		const spawned = await registry.spawn(session, {
+			cli: "fast",
+			name: "zero-turn",
+			prompt: INITIAL_VIBE_TASK,
+		});
+		expect(spawned.jobId).toBe("zero-turn-job");
+		expect(registry.screens(session)).toMatchObject([{ id: "zero-turn", state: "starting", turns: 0 }]);
+
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(session), manager);
+		expect(suspension.count).toBe(1);
+		expect(registry.listIds(session)).toEqual([]);
+
+		await suspension.rollback();
+
+		expect(registry.listIds(session)).toEqual(["zero-turn"]);
+		expect(registry.screens(session)).toMatchObject([{ id: "zero-turn", state: "starting", turns: 0 }]);
+		expect(register).toHaveBeenCalledTimes(1);
 	});
 
 	it("suspends a blocked in-flight worker for fresh-process disposal without tombstoning it", async () => {
@@ -769,7 +795,9 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await pollUntil(() => AgentRegistry.global().get("running-dispose")?.status === "running");
-		expect(await registry.suspendScope(registry.ownerScope(firstSession), firstJobs)).toBe(1);
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(firstSession), firstJobs);
+		expect(suspension.count).toBe(1);
+		await suspension.commit();
 		expect(
 			parentManager.getEntries().some(entry => {
 				if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) return false;
@@ -834,13 +862,15 @@ describe("vibe session registry", () => {
 
 		vi.useFakeTimers();
 		try {
-			const suspension = registry.suspendScope(registry.ownerScope(session), manager);
+			const suspension = await registry.suspendScopeReversibly(registry.ownerScope(session), manager);
+			expect(suspension.count).toBe(1);
+			const committed = suspension.commit();
 			await disposed.promise;
 			await flushMicrotasks();
 			expect(vi.getTimerCount()).toBeGreaterThan(0);
 			vi.advanceTimersByTime(250);
 
-			expect(await suspension).toBe(1);
+			await committed;
 			expect(manager.getJob(jobId)!.status).toBe("cancelled");
 			expect(fake.isDisposed()).toBe(true);
 			expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
@@ -1041,7 +1071,9 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await jobsA.getJob(workerA.jobId)!.promise;
-		expect(await registry.suspendScope(registry.ownerScope(sessionA), jobsA)).toBe(1);
+		const suspensionA = await registry.suspendScopeReversibly(registry.ownerScope(sessionA), jobsA);
+		expect(suspensionA.count).toBe(1);
+		await suspensionA.commit();
 		expect(AgentRegistry.global().get("shared-name")).toBeUndefined();
 
 		const workerB = await registry.spawn(sessionB, {
@@ -1051,7 +1083,9 @@ describe("vibe session registry", () => {
 		});
 		expect(workerB.id).toBe("shared-name");
 		await jobsB.getJob(workerB.jobId)!.promise;
-		expect(await registry.suspendScope(registry.ownerScope(sessionB), jobsB)).toBe(1);
+		const suspensionB = await registry.suspendScopeReversibly(registry.ownerScope(sessionB), jobsB);
+		expect(suspensionB.count).toBe(1);
+		await suspensionB.commit();
 		const revived: { sessionFile?: string; prompts?: string[] } = {};
 		installPersistedReviver(revived);
 		expect(await registry.rehydrate(sessionA)).toBe(1);
@@ -1117,7 +1151,9 @@ describe("vibe session registry", () => {
 		await pollUntil(() => workerA !== undefined);
 		const oldRef = AgentRegistry.global().get("reused");
 		if (!oldRef) throw new Error("Expected parent A worker ref");
-		expect(await registry.suspendScope(registry.ownerScope(sessionA), jobsA)).toBe(1);
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(sessionA), jobsA);
+		expect(suspension.count).toBe(1);
+		await suspension.commit();
 
 		const second = await registry.spawn(sessionB, { cli: "fast", name: "reused", prompt: INITIAL_VIBE_TASK });
 		await jobsB.getJob(second.jobId)!.promise;
@@ -1251,7 +1287,8 @@ describe("vibe session registry", () => {
 			prompt: INITIAL_VIBE_TASK,
 		});
 		await jobs.getJob(spawned.jobId)!.promise;
-		await registry.suspendScope(registry.ownerScope(session), jobs);
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(session), jobs);
+		await suspension.commit();
 		const otherWorker = createFakeWorkerSession();
 		const otherSessionFile = path.join(path.dirname(parentSessionFile), "other-parent", "collision.jsonl");
 		const otherRef = AgentRegistry.global().register({

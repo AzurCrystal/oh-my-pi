@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -138,5 +138,50 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		expect(branchText).not.toContain(OLD_ASSISTANT);
 		// Contract 3: no late output appended to the fresh session.
 		expect(branchText).not.toContain(LATE_OUTPUT);
+	});
+
+	it("preserves the outgoing agent and queues when persistence preflight fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let providerCalls = 0;
+		const mock: MockModel = createMockModel({
+			handler: async () => {
+				providerCalls++;
+				return { content: [`response-${providerCalls}`], stopReason: "stop" };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+
+		await session.prompt(OLD_USER);
+		agent.steer({
+			role: "custom",
+			customType: "xdev-mount-notice",
+			content: HIDDEN_XDEV,
+			display: false,
+			timestamp: Date.now(),
+		});
+		const before = collectText(agent.state.messages);
+		const failure = new Error("session flush failed");
+		const flush = vi.spyOn(sessionManager, "flush").mockRejectedValueOnce(failure);
+
+		await expect(session.newSession()).rejects.toBe(failure);
+
+		expect(collectText(agent.state.messages)).toEqual(before);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		flush.mockRestore();
+
+		await session.prompt("retry current session");
+		await agent.waitForIdle();
+		expect(providerCalls).toBeGreaterThan(1);
 	});
 });

@@ -51,6 +51,7 @@ import { buildAvailableSlashCommands } from "../../slash-commands/available-comm
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../../system-prompt";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import type { VibeScopeSuspension } from "../../vibe/runtime";
 import { buildSessionAutocompleteProvider } from "../completions";
 import { loadAllExtensions } from "../components/extensions/state-manager";
 import { shouldSkipHistory } from "../controllers/input-controller";
@@ -174,6 +175,15 @@ export interface RpcSessionTransitionOutcome<T> {
 	/** True when the incoming session may adopt the plan-on-startup default. */
 	honorPlanDefault: boolean;
 }
+export function getRpcSessionTransitionGuestBlock(
+	session: AgentSession,
+): { message: string; code: "operation_failed" } | undefined {
+	if (!rpcCollab.isRpcCollabGuest(session)) return undefined;
+	return {
+		message: "Session changes are unavailable while joined as a collaboration guest. Run leave_collab_session first.",
+		code: "operation_failed",
+	};
+}
 
 /**
  * Runs a cancellable session change surrounded by one RPC reconciliation cycle.
@@ -191,6 +201,7 @@ export async function runRpcSessionTransitionAtCommit<T>(
 	transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
 	prepare: () => Promise<void>,
 	reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>,
+	honorPlanDefaultOnCommit = false,
 ): Promise<T> {
 	let prepared = false;
 	const beforeCommit = async (): Promise<void> => {
@@ -200,10 +211,14 @@ export async function runRpcSessionTransitionAtCommit<T>(
 	};
 	let committed = false;
 	let honorPlanDefault = false;
+	const onCommitted = (): void => {
+		committed = true;
+		honorPlanDefault = honorPlanDefaultOnCommit;
+	};
 	try {
-		const outcome = await transition({ beforeCommit });
-		committed = outcome.committed;
-		honorPlanDefault = outcome.honorPlanDefault;
+		const outcome = await transition({ beforeCommit, onCommitted });
+		committed ||= outcome.committed;
+		honorPlanDefault ||= outcome.honorPlanDefault;
 		return outcome.result;
 	} finally {
 		if (prepared) await reconcile({ committed, honorPlanDefault });
@@ -1671,38 +1686,41 @@ export async function runRpcMode(
 
 	const runReconciledRpcSessionTransition = async <T>(
 		transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
+		honorPlanDefaultOnCommit = false,
 	): Promise<T> => {
 		const previousCwd = session.sessionManager.getCwd();
+		let workModeSuspension: VibeScopeSuspension | undefined;
 		return runRpcSessionTransitionAtCommit(
 			transition,
 			async () => {
-				// Reversible: nothing here is persisted, so a cancelled or failed
-				// transition rebuilds the outgoing session's mode from its own entries
-				// when the reconciler below runs. It also has to precede the guest
-				// unwind, whose own session restore rejects an active vibe mode.
-				await rpcWorkModes.clearRpcTransientModeState(session);
-				// A guest replica owns the session's contents, and leaving restores the
-				// local session, so it has to unwind before the requested change starts:
-				// deferring it would silently switch away from the client's destination.
-				// Hosting is left alone here — it survives a transition that fails.
-				if (rpcCollab.isRpcCollabGuest(session)) await rpcCollab.disposeRpcCollab(session);
+				// Restoring tools/model and detaching process-local vibe records are
+				// reversible until the session operation reports its commit boundary.
+				workModeSuspension = await rpcWorkModes.clearRpcTransientModeState(session, {
+					reversibleVibeSuspension: true,
+				});
 				disposeRpcRuntimeBehaviors();
 			},
 			async ({ committed, honorPlanDefault }) => {
-				// A relay the client hosts and a live microphone belong to the
-				// conversation that owned them: only a committed transition releases
-				// them, so a failed one leaves the still-current session operational.
-				if (committed) await releaseRpcSessionAttachments();
 				try {
-					await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
-				} finally {
-					try {
-						await reconcileRpcWorkModes(honorPlanDefault);
-					} finally {
-						installRpcRuntimeBehaviors();
+					if (workModeSuspension) {
+						if (committed) await workModeSuspension.commit();
+						else await workModeSuspension.rollback();
+						workModeSuspension = undefined;
 					}
+					// A relay the client hosts and a live microphone belong to the
+					// conversation that owned them: only a committed transition releases
+					// them, so a failed one leaves the still-current session operational.
+					if (committed) await releaseRpcSessionAttachments();
+					try {
+						await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
+					} finally {
+						await reconcileRpcWorkModes(honorPlanDefault);
+					}
+				} finally {
+					installRpcRuntimeBehaviors();
 				}
 			},
+			honorPlanDefaultOnCommit,
 		);
 	};
 
@@ -1909,6 +1927,10 @@ export async function runRpcMode(
 			case "switch_session":
 			case "branch":
 			case "fork": {
+				const guestBlock = getRpcSessionTransitionGuestBlock(session);
+				if (guestBlock) {
+					return error(id, command.type, guestBlock.message, guestBlock.code);
+				}
 				let resolvedCommand: RpcSessionChangeCommand = command;
 				if (command.type === "switch_session") {
 					const sessionPath = await resolveRpcSessionReference(command.sessionPath);
@@ -1929,7 +1951,7 @@ export async function runRpcMode(
 						committed: !changed.data.cancelled,
 						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
 					};
-				});
+				}, command.type === "new_session");
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}
@@ -2649,6 +2671,10 @@ export async function runRpcMode(
 				const activeSessionFile = session.sessionManager.getSessionFile();
 				const active = activeSessionFile !== undefined && target === path.resolve(activeSessionFile);
 				if (active) {
+					const guestBlock = getRpcSessionTransitionGuestBlock(session);
+					if (guestBlock) {
+						return error(id, "delete_session", guestBlock.message, guestBlock.code);
+					}
 					try {
 						if (session.isCompacting) {
 							session.abortCompaction();
@@ -2658,7 +2684,7 @@ export async function runRpcMode(
 							const created = await session.newSession({ drop: true, ...transitionOptions });
 							if (created) subagentRegistry?.clear();
 							return { result: created, committed: created, honorPlanDefault: created };
-						});
+						}, true);
 						if (!deleted) {
 							return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
 						}

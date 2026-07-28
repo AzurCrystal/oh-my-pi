@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import * as rpcCollab from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-collab";
 import {
+	getRpcSessionTransitionGuestBlock,
 	handleRpcSessionChange,
 	type RpcSessionChangeCommand,
 	type RpcSessionChangeResult,
@@ -13,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionTransitionOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import {
 	type AgentProgress,
@@ -29,6 +32,7 @@ import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 const tempPaths: string[] = [];
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	for (const tempPath of tempPaths.splice(0)) {
 		removeSyncWithRetries(tempPath);
 	}
@@ -75,41 +79,63 @@ type SessionChangeStubOptions = {
 	switchSession?: boolean;
 	branch?: { selectedText: string; selectedImages: ImageContent[]; cancelled: boolean };
 	fork?: boolean;
-	/** Thrown after `beforeCommit` ran, standing in for a failed flush or fork. */
+	/** Thrown after reversible preparation but before the session commits. */
+	failBeforeCommit?: Error;
+	/** Thrown after the session has crossed its irreversible commit boundary. */
 	failAfterCommit?: Error;
 };
 
 function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessionChangeSession {
-	const commit = async (sessionOptions: SessionTransitionOptions | undefined): Promise<void> => {
+	const transition = async (
+		sessionOptions: SessionTransitionOptions | undefined,
+		committed: boolean,
+	): Promise<void> => {
 		await sessionOptions?.beforeCommit?.();
+		if (options.failBeforeCommit) throw options.failBeforeCommit;
+		if (!committed) return;
+		sessionOptions?.onCommitted?.();
 		if (options.failAfterCommit) throw options.failAfterCommit;
 	};
 	return {
 		newSession: async sessionOptions => {
 			const changed = options.newSession ?? true;
-			if (changed) await commit(sessionOptions);
+			if (changed) await transition(sessionOptions, true);
 			return changed;
 		},
 		switchSession: async (_sessionPath, sessionOptions) => {
 			const changed = options.switchSession ?? true;
-			if (changed) await commit(sessionOptions);
+			if (changed) await transition(sessionOptions, true);
 			return changed;
 		},
 		branch: async (_entryId, sessionOptions) => {
 			const result = options.branch ?? { selectedText: "branched text", selectedImages: [], cancelled: false };
-			if (!result.cancelled) await commit(sessionOptions);
+			if (!result.cancelled) await transition(sessionOptions, true);
 			return result;
 		},
 		fork: async sessionOptions => {
-			// A fork whose session copy never materializes reports "cancelled" after
-			// the commit hook already ran.
-			await commit(sessionOptions);
-			return options.fork ?? true;
+			// A non-persisted fork can return false after reversible preparation,
+			// but it never reports the irreversible commit callback.
+			const changed = options.fork ?? true;
+			await transition(sessionOptions, changed);
+			return changed;
 		},
 	};
 }
 
 describe("RPC subagent registry", () => {
+	test("blocks guest session changes without leaving the collaboration", () => {
+		const session = {} as AgentSession;
+		vi.spyOn(rpcCollab, "isRpcCollabGuest").mockReturnValue(true);
+		const leave = vi.spyOn(rpcCollab, "leaveRpcCollabSession");
+
+		expect(getRpcSessionTransitionGuestBlock(session)).toEqual({
+			message:
+				"Session changes are unavailable while joined as a collaboration guest. Run leave_collab_session first.",
+			code: "operation_failed",
+		});
+		expect(leave).not.toHaveBeenCalled();
+	});
+
 	test("defaults subagent frame emission to off while tracking snapshots", () => {
 		const eventBus = new EventBus();
 		const frames: RpcSubagentFrame[] = [];
@@ -303,9 +329,15 @@ describe("RPC subagent registry", () => {
 			reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>;
 		};
 
-		const createRuntime = (options: { modeTeardownError?: Error } = {}) => {
+		const createRuntime = (options: { modeTeardownError?: Error; reconcileError?: Error } = {}) => {
 			const idleHandles: IdleHandle[] = [{ disposed: false }];
-			const state = { modeLive: true, attachmentsReleased: 0, prepared: 0, reconciled: 0 };
+			const state = {
+				modeLive: true,
+				attachmentsReleased: 0,
+				prepared: 0,
+				reconciled: 0,
+				honorPlanDefault: false,
+			};
 			return {
 				state,
 				liveIdleHandles: () => idleHandles.filter(handle => !handle.disposed).length,
@@ -316,12 +348,14 @@ describe("RPC subagent registry", () => {
 					state.modeLive = false;
 					for (const handle of idleHandles) handle.disposed = true;
 				},
-				reconcile: async ({ committed }: { committed: boolean; honorPlanDefault: boolean }) => {
+				reconcile: async ({ committed, honorPlanDefault }: { committed: boolean; honorPlanDefault: boolean }) => {
 					state.reconciled++;
+					state.honorPlanDefault = honorPlanDefault;
 					if (committed) state.attachmentsReleased++;
 					state.modeLive = true;
 					for (const handle of idleHandles) handle.disposed = true;
 					idleHandles.push({ disposed: false });
+					if (options.reconcileError) throw options.reconcileError;
 				},
 			};
 		};
@@ -338,6 +372,7 @@ describe("RPC subagent registry", () => {
 				},
 				runtime.prepare,
 				runtime.reconcile,
+				command.type === "new_session",
 			);
 
 		// A hook that cancels the change never reaches teardown at all.
@@ -349,8 +384,8 @@ describe("RPC subagent registry", () => {
 		expect(hookCancelled.state).toMatchObject({ modeLive: true, prepared: 0, reconciled: 0, attachmentsReleased: 0 });
 		expect(hookCancelled.liveIdleHandles()).toBe(1);
 
-		// A fork that aborts after the commit hook keeps the outgoing session's
-		// collaboration and voice attachments, and restores its runtime behaviors.
+		// A fork that cannot materialize after reversible preparation keeps the
+		// outgoing collaboration and voice attachments and restores its runtime.
 		const abortedFork = createRuntime();
 		const forkResult = await runTransition(abortedFork, createSessionChangeSession({ fork: false }), {
 			type: "fork",
@@ -364,16 +399,34 @@ describe("RPC subagent registry", () => {
 		});
 		expect(abortedFork.liveIdleHandles()).toBe(1);
 
-		// The same holds when the transition throws past the commit point.
+		// A failure before the switch can commit keeps outgoing attachments.
 		const failedSwitch = createRuntime();
 		await expect(
-			runTransition(failedSwitch, createSessionChangeSession({ failAfterCommit: new Error("flush failed") }), {
+			runTransition(failedSwitch, createSessionChangeSession({ failBeforeCommit: new Error("flush failed") }), {
 				type: "switch_session",
 				sessionPath: "/tmp/target.jsonl",
 			}),
 		).rejects.toThrow("flush failed");
 		expect(failedSwitch.state).toMatchObject({ modeLive: true, prepared: 1, reconciled: 1, attachmentsReleased: 0 });
 		expect(failedSwitch.liveIdleHandles()).toBe(1);
+
+		// A later failure remains committed even though the operation never returns.
+		const failedAfterCommit = createRuntime();
+		await expect(
+			runTransition(
+				failedAfterCommit,
+				createSessionChangeSession({ failAfterCommit: new Error("post-commit hook failed") }),
+				{ type: "new_session" },
+			),
+		).rejects.toThrow("post-commit hook failed");
+		expect(failedAfterCommit.state).toMatchObject({
+			modeLive: true,
+			prepared: 1,
+			reconciled: 1,
+			attachmentsReleased: 1,
+			honorPlanDefault: true,
+		});
+		expect(failedAfterCommit.liveIdleHandles()).toBe(1);
 
 		// Teardown that fails halfway still reconciles, and leaves exactly one idle
 		// handle instead of stacking a second one on top of the live one.
@@ -388,6 +441,18 @@ describe("RPC subagent registry", () => {
 			attachmentsReleased: 0,
 		});
 		expect(failedTeardown.liveIdleHandles()).toBe(1);
+
+		const failedReconcile = createRuntime({ reconcileError: new Error("mode reconciliation failed") });
+		await expect(
+			runTransition(failedReconcile, createSessionChangeSession({}), { type: "new_session" }),
+		).rejects.toThrow("mode reconciliation failed");
+		expect(failedReconcile.state).toMatchObject({
+			modeLive: true,
+			prepared: 1,
+			reconciled: 1,
+			attachmentsReleased: 1,
+		});
+		expect(failedReconcile.liveIdleHandles()).toBe(1);
 
 		// Only a committed transition releases the irreversible attachments.
 		const committed = createRuntime();

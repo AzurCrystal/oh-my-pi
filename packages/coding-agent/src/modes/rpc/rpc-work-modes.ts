@@ -23,7 +23,12 @@ import type { ToolSession } from "../../tools";
 import { normalizeLocalScheme, resolveToCwd } from "../../tools/path-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
 import { VIBE_TOOL_NAMES } from "../../tools/vibe";
-import { type VibeOwnerScope, type VibeParentSession, VibeSessionRegistry } from "../../vibe/runtime";
+import {
+	type VibeOwnerScope,
+	type VibeParentSession,
+	type VibeScopeSuspension,
+	VibeSessionRegistry,
+} from "../../vibe/runtime";
 import { readRpcLoopState } from "./rpc-runtime-control";
 
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
@@ -996,32 +1001,26 @@ export function disposeRpcWorkModes(session: AgentSession): void {
 
 /**
  * Releases the transient work-mode runtime a session holds, without persisting a
- * `mode_change`: plan and goal hand their pre-mode tool set back (plus the
- * pre-plan model), vibe detaches its workers by suspending the owner scope
- * instead of killing them, and the in-memory plan/goal/vibe state is dropped
- * along with every subscription.
+ * `mode_change`. External tool/model restoration completes before any snapshot
+ * is discarded, so a failed clear can be retried against the original base.
  *
- * The transcript stays the only owner of the recorded mode, so this is safe to
- * run before a session transition that may still be cancelled or fail: the
- * outgoing session rehydrates verbatim from its own entries. It is equally safe
- * during a normal shutdown, which must not append anything.
+ * A transition may request a reversible vibe suspension. Its caller must commit
+ * or roll back the returned token after learning which session stayed current.
  */
-export async function clearRpcTransientModeState(session: AgentSession): Promise<void> {
+export async function clearRpcTransientModeState(
+	session: AgentSession,
+	options?: { reversibleVibeSuspension?: boolean },
+): Promise<VibeScopeSuspension | undefined> {
 	const runtime = runtimes.get(session);
 	const restoreTools = runtime?.planPreviousTools ?? runtime?.goalPreviousTools;
 	const restoreModel = runtime?.planPreviousModel;
 	const vibeEnabled = session.getVibeModeState()?.enabled === true;
 	const vibeScope = runtime?.vibeOwnerScope;
 	const vibeTools = runtime?.vibePreviousTools;
+	let vibeSuspension: VibeScopeSuspension | undefined;
 
-	session.setPlanModeState(undefined);
-	session.setGoalModeState(undefined);
-	session.setVibeModeState(undefined);
-	// Detach the workers before touching tools: suspending is reversible through
-	// `rehydrate`, and a failure further down must not leave the session owning
-	// live workers it no longer tracks.
 	if (vibeEnabled && vibeScope) {
-		await VibeSessionRegistry.global().suspendScope(vibeScope, session.asyncJobManager);
+		vibeSuspension = await VibeSessionRegistry.global().suspendScopeReversibly(vibeScope, session.asyncJobManager);
 	}
 	try {
 		if (vibeEnabled) {
@@ -1034,7 +1033,18 @@ export async function clearRpcTransientModeState(session: AgentSession): Promise
 			await session.setActiveToolsByName(restoreTools);
 		}
 		if (restoreModel) await restorePlanModel(session, restoreModel);
-	} finally {
-		disposeRpcWorkModes(session);
+	} catch (error) {
+		await vibeSuspension?.rollback();
+		throw error;
 	}
+
+	session.setPlanModeState(undefined);
+	session.setGoalModeState(undefined);
+	session.setVibeModeState(undefined);
+	disposeRpcWorkModes(session);
+	if (vibeSuspension && !options?.reversibleVibeSuspension) {
+		await vibeSuspension.commit();
+		return undefined;
+	}
+	return vibeSuspension;
 }

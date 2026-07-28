@@ -279,6 +279,12 @@ export interface SessionTransitionOptions {
 	 * the transition's outcome.
 	 */
 	beforeCommit?: () => Promise<void>;
+	/**
+	 * Runs exactly once after the transition can no longer restore the outgoing
+	 * session. It is independent of the operation's return so callers still
+	 * observe a commit when later initialization or hooks throw.
+	 */
+	onCommitted?: () => void;
 }
 
 /** Result from cycleModel(). */

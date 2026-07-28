@@ -6007,7 +6007,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions & SessionTransitionOptions): Promise<boolean> {
-		const { beforeCommit, ...newSessionOptions } = options ?? {};
+		const { beforeCommit, onCommitted, ...newSessionOptions } = options ?? {};
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -6022,45 +6022,44 @@ export class AgentSession {
 			}
 		}
 
+		// Complete fallible persistence work before aborting or clearing anything
+		// owned by the outgoing session.
+		await this.#bash.flushPending();
+		await this.sessionManager.flush();
+
 		await beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 
 		this.#disconnectFromAgent();
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
-		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: newSessionOptions.drop !== true });
 		let sessionTransitioned = false;
 		try {
-			this.agent.reset();
-			if (newSessionOptions.drop && previousSessionFile) {
-				// Detach the advisor recorder feed and drain its writer BEFORE deleting the
-				// old artifacts dir: `await this.abort()` only stops the primary, so a still-
-				// running advisor turn could otherwise finish, emit `message_end`, and recreate
-				// `<old>/__advisor.jsonl`. #resetAdvisorSessionState (after newSession) re-primes
-				// the advisor and re-attaches the feed at the new session's path.
-				await this.#advisors.detachAndCloseRecorders();
-				try {
-					await this.sessionManager.dropSession(previousSessionFile);
-				} catch (err) {
-					logger.error("Failed to delete session during /drop", { err });
-				}
-			} else {
-				await this.sessionManager.flush();
-			}
 			await this.sessionManager.newSession({
 				...newSessionOptions,
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
+			sessionTransitioned = true;
+			onCommitted?.();
 			this.#bash.markSessionTransition(bashTransition);
 			// The new session owns the transcript from here, so the previous
 			// conversation's advisor spend is retired with it. Clearing at the commit
 			// point keeps the status line honest even if a later step below throws.
 			this.#advisors.clearCost();
-			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+		}
+		this.#cancelOwnAsyncJobs();
+		this.#closeAllProviderSessions("new session");
+		this.agent.reset();
+		if (newSessionOptions.drop && previousSessionFile) {
+			// Stop the old recorder before deleting its transcript and artifacts.
+			await this.#advisors.detachAndCloseRecorders();
+			try {
+				await this.sessionManager.dropSession(previousSessionFile);
+			} catch (err) {
+				logger.error("Failed to delete session during /drop", { err });
+			}
 		}
 
 		this.#clearSessionScopedToolState();
@@ -6127,19 +6126,21 @@ export class AgentSession {
 			}
 		}
 
+		await this.#bash.flushPending();
+		// Flush current session to ensure all entries are written before reversible
+		// runtime preparation or the session manager changes identity.
+		await this.sessionManager.flush();
 		await options?.beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("fork the session");
-
-		await this.#bash.flushPending();
-		// Flush current session to ensure all entries are written
-		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
 
 		// Fork the session (creates new session file with same entries)
+		const previousSessionState = this.sessionManager.captureState();
 		let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 		try {
 			forkResult = await this.sessionManager.fork();
 		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
 			this.#bash.finishSessionTransition(bashTransition, false);
 			throw error;
 		}
@@ -6147,8 +6148,12 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			return false;
 		}
-		this.#bash.markSessionTransition(bashTransition);
-		this.#bash.finishSessionTransition(bashTransition, true);
+		try {
+			options?.onCommitted?.();
+			this.#bash.markSessionTransition(bashTransition);
+		} finally {
+			this.#bash.finishSessionTransition(bashTransition, true);
+		}
 
 		// Copy artifacts directory if it exists
 		const oldArtifactDir = forkResult.oldSessionFile.slice(0, -6);
@@ -7032,17 +7037,11 @@ export class AgentSession {
 			}
 		}
 
-		await options?.beforeCommit?.();
-
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
-
+		// Flush before disconnecting or aborting so a persistence failure leaves the
+		// outgoing agent and all of its queues untouched.
 		await this.#bash.flushPending();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
 		const previousSessionState = this.sessionManager.captureState();
-		const bashTransition = this.#bash.beginSessionTransition();
 		// Only same-session reloads compare against the prior context to detect
 		// rollback edits (`#didSessionMessagesChange` below). Building it for a
 		// different-session switch is a pure waste — and on huge pre-fix sessions
@@ -7052,14 +7051,19 @@ export class AgentSession {
 		// error-recovery path rebuilds the context on demand from the restored
 		// state instead.
 		const previousSessionContext = switchingToDifferentSession ? undefined : this.buildDisplaySessionContext();
-		// switchSession replaces these arrays wholesale during load/rollback, so retaining
-		// the existing message objects is sufficient and avoids structured-clone failures for
-		// extension/custom metadata that is valid to persist but not cloneable.
+		// Snapshot messages and queues before aborting so a failed switch restores
+		// the exact runnable outgoing agent rather than its interrupted state.
 		const previousAgentMessages = [...this.agent.state.messages];
 		const previousSteeringMessages = [...this.agent.peekSteeringQueue()];
 		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+
+		await options?.beforeCommit?.();
+
+		// Work-mode preparation intentionally restores the base tools/model. Capture
+		// that base so RPC reconciliation can re-enter the recorded outgoing mode
+		// without treating its transient tool set as the next base on rollback.
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -7080,12 +7084,15 @@ export class AgentSession {
 		const previousPendingRewindReport = this.#pendingRewindReport;
 		const previousLastCompletedRewind = this.#lastCompletedRewind;
 		const previousRewoundToolResultIds = new Set(this.#rewoundToolResultIds);
-
-		this.agent.clearAllQueues();
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+		const bashTransition = this.#bash.beginSessionTransition();
 
 		try {
+			this.#disconnectFromAgent();
+			await this.abort({ goalReason: "internal" });
+			await this.#sessionBeforeSwitchReconciler?.();
+			this.agent.clearAllQueues();
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.#bash.markSessionTransition(bashTransition);
 			if (switchingToDifferentSession) {
@@ -7225,7 +7232,6 @@ export class AgentSession {
 			// an earlier clear would be lost work if any step above rolled the switch back.
 			if (switchingToDifferentSession) this.#advisors.clearCost();
 			this.#bash.finishSessionTransition(bashTransition, true);
-			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
@@ -7263,6 +7269,8 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			throw error;
 		}
+		options?.onCommitted?.();
+		return true;
 	}
 
 	/**
@@ -7308,19 +7316,13 @@ export class AgentSession {
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
 
-		await options?.beforeCommit?.();
-
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-
 		await this.#bash.flushPending();
-		// Flush pending writes before branching
+		// All persistence and background-drain work must finish before pending
+		// input or jobs from the outgoing branch are discarded.
 		await this.sessionManager.flush();
-		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
+		await options?.beforeCommit?.();
+		const bashTransition = this.#bash.beginSessionTransition();
 
 		let sessionTransitioned = false;
 		try {
@@ -7329,12 +7331,17 @@ export class AgentSession {
 			} else {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
+			sessionTransitioned = true;
+			options?.onCommitted?.();
 			this.#bash.markSessionTransition(bashTransition);
 			this.#advisors.clearCost();
-			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#cancelOwnAsyncJobs();
+		this.#abortAutolearnCapture();
 		this.#clearSessionScopedToolState();
 		this.#rehydrateCheckpointRewindState();
 		this.#todo.syncFromBranch();

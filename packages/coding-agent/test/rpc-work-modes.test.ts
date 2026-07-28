@@ -60,6 +60,8 @@ function createPlanSession() {
 	const planModel = { id: "plan-model", provider: "test" } as unknown as Model;
 	let activeTools = ["read", "bash"];
 	let activeModel = baseModel;
+	let nextToolRestoreError: Error | undefined;
+	let nextModelRestoreError: Error | undefined;
 	let planModeState: PlanModeState | undefined;
 	const session = {
 		sessionManager,
@@ -83,6 +85,9 @@ function createPlanSession() {
 		hasBuiltInTool: (name: string) => name === "write",
 		getEnabledToolNames: () => [...activeTools],
 		setActiveToolsByName: async (names: string[]) => {
+			const error = nextToolRestoreError;
+			nextToolRestoreError = undefined;
+			if (error) throw error;
 			activeTools = [...names];
 		},
 		configuredThinkingLevel: () => undefined,
@@ -92,6 +97,9 @@ function createPlanSession() {
 			explicitThinkingLevel: false,
 		}),
 		setModelTemporary: async (model: Model) => {
+			const error = nextModelRestoreError;
+			nextModelRestoreError = undefined;
+			if (error) throw error;
 			activeModel = model;
 		},
 		setThinkingLevel: () => {},
@@ -101,6 +109,12 @@ function createPlanSession() {
 		sessionManager,
 		activeTools: () => [...activeTools],
 		activeModelId: () => activeModel.id,
+		failNextToolRestore: (error: Error) => {
+			nextToolRestoreError = error;
+		},
+		failNextModelRestore: (error: Error) => {
+			nextModelRestoreError = error;
+		},
 	};
 }
 
@@ -217,7 +231,11 @@ describe("RPC transient mode state", () => {
 		const vibe = createVibeSession(sessionManager, undefined);
 		const registry = VibeSessionRegistry.global();
 		const killAll = vi.spyOn(registry, "killAll").mockResolvedValue(0);
-		const suspendScope = vi.spyOn(registry, "suspendScope").mockResolvedValue(0);
+		const commit = vi.fn(async () => {});
+		const rollback = vi.fn(async () => {});
+		const suspendScope = vi
+			.spyOn(registry, "suspendScopeReversibly")
+			.mockResolvedValue({ count: 0, commit, rollback });
 
 		await enterRpcVibeMode(vibe.session);
 		expect(vibe.activeTools()).toEqual(["read", VIBE_EPHEMERAL_TOOL]);
@@ -227,9 +245,30 @@ describe("RPC transient mode state", () => {
 
 		expect(suspendScope).toHaveBeenCalledTimes(1);
 		expect(killAll).not.toHaveBeenCalled();
+		expect(commit).toHaveBeenCalledTimes(1);
+		expect(rollback).not.toHaveBeenCalled();
 		expect(vibe.session.getVibeModeState()).toBeUndefined();
 		expect(vibe.activeTools()).toEqual(["read", "bash"]);
 		expect(sessionManager.buildSessionContext().mode).toBe("vibe");
 		expect(sessionManager.getEntries()).toHaveLength(entriesAfterEntry);
+	});
+
+	test("retains plan snapshots when tool or model restoration fails and retries from the original base", async () => {
+		for (const target of ["tools", "model"] as const) {
+			const plan = createPlanSession();
+			await enterRpcPlanMode(plan.session);
+			const failure = new Error(`${target} restore failed`);
+			if (target === "tools") plan.failNextToolRestore(failure);
+			else plan.failNextModelRestore(failure);
+
+			await expect(clearRpcTransientModeState(plan.session)).rejects.toBe(failure);
+			expect(plan.session.getPlanModeState()?.enabled).toBe(true);
+			expect(plan.activeModelId()).toBe("plan-model");
+
+			await clearRpcTransientModeState(plan.session);
+			expect(plan.session.getPlanModeState()).toBeUndefined();
+			expect(plan.activeTools()).toEqual(["read", "bash"]);
+			expect(plan.activeModelId()).toBe("base-model");
+		}
 	});
 });
