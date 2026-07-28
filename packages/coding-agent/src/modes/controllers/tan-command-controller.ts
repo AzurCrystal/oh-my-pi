@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Settings } from "../../config/settings";
+import type { MCPManager } from "../../mcp/manager";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -11,7 +13,15 @@ import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { SessionManager } from "../../session/session-manager";
 import { createMCPProxyTools, createSubagentSettings } from "../../task/executor";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
-import type { InteractiveModeContext } from "../types";
+export interface TanCommandContext {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	settings: Settings;
+	mcpManager?: MCPManager;
+	showStatus(message: string): void;
+	showError(message: string): void;
+	rebuildChatFromMessages(): void;
+}
 
 const TAN_LABEL_PREVIEW_LENGTH = 80;
 
@@ -38,7 +48,7 @@ async function removeCloneSession(cloneFile: string): Promise<void> {
 }
 
 export class TanCommandController {
-	constructor(private readonly ctx: InteractiveModeContext) {}
+	constructor(private readonly ctx: TanCommandContext) {}
 
 	async start(work: string): Promise<void> {
 		const trimmedWork = work.trim();
@@ -149,7 +159,7 @@ export class TanCommandController {
 						clone.setTodoPhases([]);
 						cloneManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
 						const injectContextSwitch = () => {
-							clone?.agent.appendMessage({
+							clone?.appendContextMessage({
 								role: "developer",
 								content: tanContextSwitchPrompt,
 								attribution: "agent",
