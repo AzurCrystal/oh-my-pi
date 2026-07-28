@@ -79,6 +79,11 @@ export interface MentalModelSeed {
 	trigger?: MentalModelTrigger;
 }
 
+export interface EnsureMentalModelsResult {
+	seedIds: string[];
+	failures: Array<{ id: string; error: string }>;
+}
+
 /**
  * Resolve the seed list that applies to the active bank scope. Per-project
  * seeds are skipped in `global` mode (where there is no project axis) and
@@ -144,20 +149,26 @@ export async function ensureMentalModels(
 	bankId: string,
 	seeds: MentalModelSeed[],
 	debug: boolean,
-): Promise<void> {
-	if (seeds.length === 0) return;
+): Promise<EnsureMentalModelsResult> {
+	if (seeds.length === 0) return { seedIds: [], failures: [] };
 
 	let existing: MentalModelSummary[];
 	try {
 		const list = await client.listMentalModels(bankId, { detail: "metadata" });
 		existing = list.items ?? [];
 	} catch (err) {
-		logger.debug("Hindsight: ensureMentalModels list failed", { bankId, error: String(err) });
-		return;
+		const error = err instanceof Error ? err.message : String(err);
+		logger.debug("Hindsight: ensureMentalModels list failed", { bankId, error });
+		return { seedIds: [], failures: seeds.map(seed => ({ id: seed.id, error })) };
 	}
 
+	const seedIds: string[] = [];
+	const failures: Array<{ id: string; error: string }> = [];
 	for (const seed of seeds) {
-		if (seedAlreadyExists(seed, existing)) continue;
+		if (seedAlreadyExists(seed, existing)) {
+			seedIds.push(seed.id);
+			continue;
+		}
 		try {
 			await client.createMentalModel(bankId, seed.name, seed.sourceQuery, {
 				id: seed.id,
@@ -165,13 +176,17 @@ export async function ensureMentalModels(
 				maxTokens: seed.maxTokens,
 				trigger: seed.trigger,
 			});
+			seedIds.push(seed.id);
 			if (debug) {
 				logger.debug("Hindsight: seeded mental model", { bankId, id: seed.id, tags: seed.tags });
 			}
 		} catch (err) {
-			logger.debug("Hindsight: createMentalModel failed", { bankId, id: seed.id, error: String(err) });
+			const error = err instanceof Error ? err.message : String(err);
+			logger.debug("Hindsight: createMentalModel failed", { bankId, id: seed.id, error });
+			failures.push({ id: seed.id, error });
 		}
 	}
+	return { seedIds, failures };
 }
 
 /** Return whether a seed is already represented by current bank metadata. */
