@@ -1512,7 +1512,7 @@ export class ProcessTerminal implements Terminal {
 		}
 
 		if (process.platform === "win32") {
-			void postmortem.quit(129);
+			void postmortem.quit(129, { drainStdout: false });
 			return;
 		}
 		try {

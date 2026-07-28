@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `postmortem.quit` option for shutdown paths where terminal output has already disconnected and cannot drain.
+
 ## [17.1.8] - 2026-07-28
 
 ### Added

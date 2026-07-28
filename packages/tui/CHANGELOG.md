@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed native Windows terminal panes freezing their host during forced closure by skipping the impossible stdout-drain wait after ConPTY disconnects ([#6917](https://github.com/can1357/oh-my-pi/issues/6917)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
