@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- RPC `logout` now requires a positive `credentialId` and removes only that stored account. Requests that omit it fail with `credential_id_required`; clients that intentionally need a provider-wide credential wipe must use the explicitly destructive `remove_provider_credentials` command.
+
+### Added
+
+- `omp --mode rpc` expanded from 49 to 185 commands, allowing a third-party UI to drive the harness over JSONL stdio without launching the terminal app. The schema-backed settings panel, cwd-aware session listing and deletion, redacted extension catalog, and streaming Python execution are now first-class protocol operations; `bash` also accepts `excludeFromContext`, `useUserShell`, and opt-in `followCwd` so clients can reproduce shell behavior and follow successful directory changes.
+- RPC gained two push frames: `exec_output` streams `bash` and Python output while the command runs (previously only the final `BashResult` was sent, so a UI could not render live shell output), and `settings_update` fires on any effective settings change — including ones made by slash commands such as `/browser` — so an open settings panel cannot go stale.
+- Credentials are redacted on every new RPC surface: `get_settings`, the `set_setting` echo, and `settings_update` report `value: null` with `secret: true` for paths marked as credentials, and `get_extensions` strips the raw capability payload that carries MCP `env` and client secrets.
+- RPC clients can now reconstruct the TUI's presentation and session chrome instead of approximating it: `get_theme` exposes every resolved semantic color and symbol plus contrast luminance hints, `get_keybindings` exposes the effective action-to-key map with display labels, and `get_session_view` reports session-owned modes, auto-thinking/fast/advisor/subscription state, cwd, active repository, and worktree identity.
+- RPC gained the remaining editor and workspace data sources needed by a standalone UI: prompt-history search is server-side and cwd-aware, repository status covers Git/Jujutsu change counts with opt-in pull-request lookup, and provider quota reports are available without scraping the terminal status line.
+- RPC autocomplete is now a two-step server-owned contract: `complete` returns the live candidates and match text for highlighting, while `apply_completion` performs the provider-specific buffer edit and rejects candidates that went stale between calls. Hosts no longer need to guess replacement spans, which are not equivalent to the displayed prefix for indented slash commands and other completion forms.
+- RPC now exposes plan review and execution, autonomous and guided goals, and vibe mode. Clients can edit a proposed plan before approval, choose fresh-session, retained-context, or compacted-context execution, select the execution model, and observe complete mode snapshots.
+- RPC clients can list persisted and live subagents, revive, stop, or prompt a specific agent, and launch background `/tan` work. Headless runtime control now includes loop scheduling and limits, process-wide pause/resume, session-tree snapshots, ephemeral `/btw` questions with streaming and branch promotion, and collaboration host/join/leave/status operations.
+- Advisor rosters, TTSR rules, task-agent definitions, and Hindsight mental models can now be read and authored over RPC. The model-backed `/omfg` flow streams draft deltas, while mental-model bulk operations report per-item failures.
+- RPC diagnostics now cover CPU, heap, work, and support profiles, recent logs, raw SSE snapshots and subscriptions, the inspector, system/startup information, artifact cleanup, and mid-flight MCP authentication challenges. Realtime voice, harness-side speech-to-text, and speech playback/settings are also controllable without a terminal.
+- RPC gained asynchronous frames for raw SSE updates, MCP authentication challenges, voice activity, `/btw` text, idle recaps, and TTSR generation. Idle compaction, idle recap, and subagent-driven todo completion now run in headless sessions under the same settings as interactive mode.
+- Session and state control now includes fork/retry, queue inspection and mutation, session-tree navigation and ask re-answer continuation, logout, temporary model selection and role-model cycling, explicit and automatic title generation, cwd arguments on session/extension listings, and live retry/bash/abort/handoff and startup-warning state. Hosts can publish the current editor draft for synchronous extension reads; rich ask dialogs, extension input hooks, and extension autocomplete providers also participate in the RPC UI path.
+- RPC now exposes live MCP administration, proactive OAuth, Smithery login/search/deploy, per-account credential removal, and scoped model roles with provenance. Plan mode can be paused and resumed with the persisted state exposed as `paused`, while `switch_session` accepts session-id/filename prefixes and partial titles in addition to absolute paths.
+- Headless clients now receive `context_message_added` for model-visible context injections that are not normal history messages, including TTSR rule-violation reminders. Privileged provider-request observation is opt-in and redacted, exposing final `context` and `before_provider_request` rewrites correlated by request id without leaking them into message history.
+- RPC emits `extension_ui_cancel` when the server abandons or times out a dialog, forwards extension working-message updates, and the TypeScript client can now register host URI handlers that complete and cancel virtual-file operations without raw frame plumbing.
+
+### Changed
+
+- `handleCommand`'s dispatch in RPC mode is now exhaustively typed: adding an `RpcCommand` member without a handler is a compile error instead of a runtime `Unknown command`, and that fallback no longer drops the request `id`, so an unknown command can finally be correlated by the client.
+- Settings side effects that are not TUI-specific (session queue modes, thinking level, sampling parameters, advisor, memory backend, provider ordering, MCP notifications) moved out of the interactive settings selector into a shared helper, so writing a setting over RPC applies to the live session instead of only landing on disk.
+- Autocomplete-provider assembly moved out of interactive mode into a shared builder, so TUI and RPC completions come from one command catalog and application implementation; the theme symbol-key list is likewise derived from the same runtime symbol map that defines its type, preventing protocol snapshots and theme typings from drifting.
+- Session changes in RPC now reconcile the live cwd and cwd-dependent runtime state to the destination session, and long-running MCP, voice-start, and collaboration-start operations use background dispatch so their cancellation/control commands remain responsive.
+
+### Fixed
+
+- `Settings.flush()` never rejected: a failed write was logged and swallowed, so the four call sites that already wrapped it in `try`/`catch` to report a save failure — `/move`, the session picker, the compact command, and interactive shutdown — were dead code, and callers acknowledged writes that never reached disk. Save failures now propagate; background debounced saves stay quiet as before.
+- RPC mode exited without draining its stdout queue, so responses and streamed output still queued at shutdown were dropped instead of delivered.
+- Fixed collaboration guests applying `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` to their local replica instead of routing them to the authoritative host.
+- Fixed deleting the active session over RPC removing its file while leaving the live session attached to that path; active deletion now uses the canonical drop path and starts a valid replacement session.
+- Fixed cancellation commands such as `abort`, `abort_retry`, `cancel_guided_goal`, and `kill_agent` waiting behind the long-running operation they were intended to interrupt.
+- Fixed `seed_mental_models` reporting a fully successful result when one or more built-in seeds failed; failures are now returned per seed.
+- Fixed RPC login rejecting providers that request manual input before returning an authorization URL.
+- Fixed killed subagents becoming revivable after a process restart, MCP reload reporting success without refreshing the live manager, and goal/loop schedulers racing to submit overlapping turns.
+
 ## [17.1.4] - 2026-07-26
 
 ### Added
