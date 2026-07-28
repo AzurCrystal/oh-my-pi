@@ -993,3 +993,48 @@ export function disposeRpcWorkModes(session: AgentSession): void {
 	session.setPlanProposalHandler(null);
 	runtimes.delete(session);
 }
+
+/**
+ * Releases the transient work-mode runtime a session holds, without persisting a
+ * `mode_change`: plan and goal hand their pre-mode tool set back (plus the
+ * pre-plan model), vibe detaches its workers by suspending the owner scope
+ * instead of killing them, and the in-memory plan/goal/vibe state is dropped
+ * along with every subscription.
+ *
+ * The transcript stays the only owner of the recorded mode, so this is safe to
+ * run before a session transition that may still be cancelled or fail: the
+ * outgoing session rehydrates verbatim from its own entries. It is equally safe
+ * during a normal shutdown, which must not append anything.
+ */
+export async function clearRpcTransientModeState(session: AgentSession): Promise<void> {
+	const runtime = runtimes.get(session);
+	const restoreTools = runtime?.planPreviousTools ?? runtime?.goalPreviousTools;
+	const restoreModel = runtime?.planPreviousModel;
+	const vibeEnabled = session.getVibeModeState()?.enabled === true;
+	const vibeScope = runtime?.vibeOwnerScope;
+	const vibeTools = runtime?.vibePreviousTools;
+
+	session.setPlanModeState(undefined);
+	session.setGoalModeState(undefined);
+	session.setVibeModeState(undefined);
+	// Detach the workers before touching tools: suspending is reversible through
+	// `rehydrate`, and a failure further down must not leave the session owning
+	// live workers it no longer tracks.
+	if (vibeEnabled && vibeScope) {
+		await VibeSessionRegistry.global().suspendScope(vibeScope, session.asyncJobManager);
+	}
+	try {
+		if (vibeEnabled) {
+			// A vibe snapshot taken by this session is the correct base to return to;
+			// without one (a session that already swapped) keep the active set and
+			// strip only the ephemeral vibe tools.
+			if (vibeTools) await session.deactivateVibeTools(vibeTools);
+			else await session.removeVibeToolsPreservingActive();
+		} else if (restoreTools) {
+			await session.setActiveToolsByName(restoreTools);
+		}
+		if (restoreModel) await restorePlanModel(session, restoreModel);
+	} finally {
+		disposeRpcWorkModes(session);
+	}
+}

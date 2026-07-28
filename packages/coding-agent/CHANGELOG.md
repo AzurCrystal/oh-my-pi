@@ -42,6 +42,7 @@
 - Fixed `seed_mental_models` reporting a fully successful result when one or more built-in seeds failed; failures are now returned per seed.
 - Fixed RPC login rejecting providers that request manual input before returning an authorization URL.
 - Fixed killed subagents becoming revivable after a process restart, MCP reload reporting success without refreshing the live manager, and goal/loop schedulers racing to submit overlapping turns.
+- Fixed an RPC session change tearing the outgoing session down before it could still fail or be reported as cancelled: a fork whose copy never materializes, or a switch that rolls back, no longer strands the session with its work mode gone, vibe workers killed, plan tools and model left applied, collaboration hosting dropped, and the microphone released. Work-mode teardown is now non-persistent and reversible, vibe workers are suspended instead of killed, hosting and voice are released only once the change commits, and the destination session hydrates from a clean base so a mode-less target no longer inherits the `write` tool, the plan model, or the `goal` tool. A teardown that fails halfway also leaves exactly one idle-behavior handle installed instead of stacking a second one.
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes

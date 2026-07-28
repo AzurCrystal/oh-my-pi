@@ -266,7 +266,18 @@ export interface SessionHandoffOptions {
 	onSwitchCancelled?: () => void;
 }
 
+/** Hooks for the cancellable session transitions: new, switch, branch, and fork. */
 export interface SessionTransitionOptions {
+	/**
+	 * Runs once every cancellation check has passed and before the outgoing
+	 * session is mutated, so a caller can release runtime state the transition
+	 * would otherwise strand. A transition cancelled by a hook never calls it.
+	 *
+	 * Work done here MUST be reversible: the steps that follow can still throw,
+	 * and `switchSession` can roll back entirely, leaving the outgoing session
+	 * live. Teardown that cannot be undone belongs to the caller's own handling of
+	 * the transition's outcome.
+	 */
 	beforeCommit?: () => Promise<void>;
 }
 

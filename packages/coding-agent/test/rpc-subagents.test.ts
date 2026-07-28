@@ -13,6 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import type { SessionTransitionOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import {
 	type AgentProgress,
 	type SubagentEventPayload,
@@ -73,28 +74,37 @@ type SessionChangeStubOptions = {
 	newSession?: boolean;
 	switchSession?: boolean;
 	branch?: { selectedText: string; selectedImages: ImageContent[]; cancelled: boolean };
+	fork?: boolean;
+	/** Thrown after `beforeCommit` ran, standing in for a failed flush or fork. */
+	failAfterCommit?: Error;
 };
 
 function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessionChangeSession {
+	const commit = async (sessionOptions: SessionTransitionOptions | undefined): Promise<void> => {
+		await sessionOptions?.beforeCommit?.();
+		if (options.failAfterCommit) throw options.failAfterCommit;
+	};
 	return {
 		newSession: async sessionOptions => {
 			const changed = options.newSession ?? true;
-			if (changed) await sessionOptions?.beforeCommit?.();
+			if (changed) await commit(sessionOptions);
 			return changed;
 		},
 		switchSession: async (_sessionPath, sessionOptions) => {
 			const changed = options.switchSession ?? true;
-			if (changed) await sessionOptions?.beforeCommit?.();
+			if (changed) await commit(sessionOptions);
 			return changed;
 		},
 		branch: async (_entryId, sessionOptions) => {
 			const result = options.branch ?? { selectedText: "branched text", selectedImages: [], cancelled: false };
-			if (!result.cancelled) await sessionOptions?.beforeCommit?.();
+			if (!result.cancelled) await commit(sessionOptions);
 			return result;
 		},
 		fork: async sessionOptions => {
-			await sessionOptions?.beforeCommit?.();
-			return true;
+			// A fork whose session copy never materializes reports "cancelled" after
+			// the commit hook already ran.
+			await commit(sessionOptions);
+			return options.fork ?? true;
 		},
 	};
 }
@@ -286,40 +296,107 @@ describe("RPC subagent registry", () => {
 		}
 	});
 
-	test("runs work-mode teardown only for committed RPC session transitions", async () => {
-		for (const activeMode of ["plan", "goal", "vibe"] as const) {
-			const modeState = {
-				plan: activeMode === "plan",
-				goal: activeMode === "goal",
-				vibe: activeMode === "vibe",
+	test("keeps RPC session-transition teardown atomic across cancellation and failure", async () => {
+		type IdleHandle = { disposed: boolean };
+		type TransitionRuntime = {
+			prepare: () => Promise<void>;
+			reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>;
+		};
+
+		const createRuntime = (options: { modeTeardownError?: Error } = {}) => {
+			const idleHandles: IdleHandle[] = [{ disposed: false }];
+			const state = { modeLive: true, attachmentsReleased: 0, prepared: 0, reconciled: 0 };
+			return {
+				state,
+				liveIdleHandles: () => idleHandles.filter(handle => !handle.disposed).length,
+				prepare: async () => {
+					state.prepared++;
+					// Reversible teardown that can still fail before the idle handle is released.
+					if (options.modeTeardownError) throw options.modeTeardownError;
+					state.modeLive = false;
+					for (const handle of idleHandles) handle.disposed = true;
+				},
+				reconcile: async ({ committed }: { committed: boolean; honorPlanDefault: boolean }) => {
+					state.reconciled++;
+					if (committed) state.attachmentsReleased++;
+					state.modeLive = true;
+					for (const handle of idleHandles) handle.disposed = true;
+					idleHandles.push({ disposed: false });
+				},
 			};
-			const transition = (committed: boolean) =>
-				runRpcSessionTransitionAtCommit(
-					async transitionOptions => {
-						const result = await handleRpcSessionChange(
-							createSessionChangeSession({ newSession: committed }),
-							{ type: "new_session" },
-							undefined,
-							transitionOptions,
-						);
-						return { result, honorPlanDefault: false };
-					},
-					async () => {
-						modeState.plan = false;
-						modeState.goal = false;
-						modeState.vibe = false;
-					},
-					async () => {},
-				);
+		};
 
-			const cancelled = await transition(false);
-			expect(cancelled.data.cancelled).toBe(true);
-			expect(modeState[activeMode]).toBe(true);
+		const runTransition = (
+			runtime: TransitionRuntime,
+			session: RpcSessionChangeSession,
+			command: RpcSessionChangeCommand,
+		): Promise<RpcSessionChangeResult> =>
+			runRpcSessionTransitionAtCommit(
+				async transitionOptions => {
+					const result = await handleRpcSessionChange(session, command, undefined, transitionOptions);
+					return { result, committed: !result.data.cancelled, honorPlanDefault: false };
+				},
+				runtime.prepare,
+				runtime.reconcile,
+			);
 
-			const changed = await transition(true);
-			expect(changed.data.cancelled).toBe(false);
-			expect(modeState).toEqual({ plan: false, goal: false, vibe: false });
-		}
+		// A hook that cancels the change never reaches teardown at all.
+		const hookCancelled = createRuntime();
+		const cancelledResult = await runTransition(hookCancelled, createSessionChangeSession({ newSession: false }), {
+			type: "new_session",
+		});
+		expect(cancelledResult.data.cancelled).toBe(true);
+		expect(hookCancelled.state).toMatchObject({ modeLive: true, prepared: 0, reconciled: 0, attachmentsReleased: 0 });
+		expect(hookCancelled.liveIdleHandles()).toBe(1);
+
+		// A fork that aborts after the commit hook keeps the outgoing session's
+		// collaboration and voice attachments, and restores its runtime behaviors.
+		const abortedFork = createRuntime();
+		const forkResult = await runTransition(abortedFork, createSessionChangeSession({ fork: false }), {
+			type: "fork",
+		});
+		expect(forkResult.data.cancelled).toBe(true);
+		expect(abortedFork.state).toMatchObject({
+			modeLive: true,
+			prepared: 1,
+			reconciled: 1,
+			attachmentsReleased: 0,
+		});
+		expect(abortedFork.liveIdleHandles()).toBe(1);
+
+		// The same holds when the transition throws past the commit point.
+		const failedSwitch = createRuntime();
+		await expect(
+			runTransition(failedSwitch, createSessionChangeSession({ failAfterCommit: new Error("flush failed") }), {
+				type: "switch_session",
+				sessionPath: "/tmp/target.jsonl",
+			}),
+		).rejects.toThrow("flush failed");
+		expect(failedSwitch.state).toMatchObject({ modeLive: true, prepared: 1, reconciled: 1, attachmentsReleased: 0 });
+		expect(failedSwitch.liveIdleHandles()).toBe(1);
+
+		// Teardown that fails halfway still reconciles, and leaves exactly one idle
+		// handle instead of stacking a second one on top of the live one.
+		const failedTeardown = createRuntime({ modeTeardownError: new Error("vibe teardown failed") });
+		await expect(
+			runTransition(failedTeardown, createSessionChangeSession({}), { type: "new_session" }),
+		).rejects.toThrow("vibe teardown failed");
+		expect(failedTeardown.state).toMatchObject({
+			modeLive: true,
+			prepared: 1,
+			reconciled: 1,
+			attachmentsReleased: 0,
+		});
+		expect(failedTeardown.liveIdleHandles()).toBe(1);
+
+		// Only a committed transition releases the irreversible attachments.
+		const committed = createRuntime();
+		const committedResult = await runTransition(committed, createSessionChangeSession({}), {
+			type: "new_session",
+		});
+		expect(committedResult.data.cancelled).toBe(false);
+		expect(committed.state).toMatchObject({ modeLive: true, prepared: 1, reconciled: 1, attachmentsReleased: 1 });
+		expect(committed.liveIdleHandles()).toBe(1);
 	});
 
 	test("prunes terminal lifecycle snapshots while retaining transcript selectors", () => {

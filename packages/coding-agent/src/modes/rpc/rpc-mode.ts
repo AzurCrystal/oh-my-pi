@@ -166,10 +166,31 @@ export type RpcSessionChangeResult =
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
+/** What a session-change transition reports back to the RPC reconciliation cycle. */
+export interface RpcSessionTransitionOutcome<T> {
+	result: T;
+	/** True once the runtime owns the incoming session, false for a cancelled transition. */
+	committed: boolean;
+	/** True when the incoming session may adopt the plan-on-startup default. */
+	honorPlanDefault: boolean;
+}
+
+/**
+ * Runs a cancellable session change surrounded by one RPC reconciliation cycle.
+ *
+ * `prepare` runs at the transition's commit point, while the outgoing session is
+ * still live, and MUST stay reversible: it may only release runtime state that
+ * `reconcile` can rebuild from whichever session ends up current. Teardown that
+ * cannot be undone belongs in `reconcile`, which learns whether the transition
+ * committed — a hook that cancels the change never reaches `prepare` at all.
+ *
+ * `reconcile` also runs when `prepare` itself fails, so it owns re-establishing
+ * the runtime behaviors `prepare` may have already released.
+ */
 export async function runRpcSessionTransitionAtCommit<T>(
-	transition: (options: SessionTransitionOptions) => Promise<{ result: T; honorPlanDefault: boolean }>,
+	transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
 	prepare: () => Promise<void>,
-	reconcile: (honorPlanDefault: boolean) => Promise<void>,
+	reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>,
 ): Promise<T> {
 	let prepared = false;
 	const beforeCommit = async (): Promise<void> => {
@@ -177,13 +198,15 @@ export async function runRpcSessionTransitionAtCommit<T>(
 		prepared = true;
 		await prepare();
 	};
+	let committed = false;
 	let honorPlanDefault = false;
 	try {
 		const outcome = await transition({ beforeCommit });
+		committed = outcome.committed;
 		honorPlanDefault = outcome.honorPlanDefault;
 		return outcome.result;
 	} finally {
-		if (prepared) await reconcile(honorPlanDefault);
+		if (prepared) await reconcile({ committed, honorPlanDefault });
 	}
 }
 
@@ -1082,10 +1105,28 @@ export async function runRpcMode(
 		}
 	};
 
-	let disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
-	let idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
+	const emitIdleRecap: rpcIdle.RpcIdleRecapSink = recap => {
 		output({ type: "idle_recap", recap });
-	});
+	};
+	let disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+	let idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, emitIdleRecap);
+
+	/** Releases the runtime-control and idle handles the current session owns. */
+	const disposeRpcRuntimeBehaviors = (): void => {
+		disposeRuntimeControl();
+		idleBehavior.dispose();
+	};
+
+	/**
+	 * Rebinds both runtime behaviors to the current session. Releasing first keeps
+	 * exactly one idle handle alive: unlike runtime control, idle behavior is not
+	 * idempotent, and a teardown that failed halfway may still hold a live handle.
+	 */
+	const installRpcRuntimeBehaviors = (): void => {
+		disposeRpcRuntimeBehaviors();
+		disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+		idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, emitIdleRecap);
+	};
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1554,18 +1595,20 @@ export async function runRpcMode(
 
 	const reconcileRpcWorkModes = async (honorPlanDefault: boolean): Promise<void> => {
 		const sessionContext = session.sessionManager.buildSessionContext();
-		rpcWorkModes.disposeRpcWorkModes(session);
-		session.setPlanModeState(undefined);
-		session.setGoalModeState(undefined);
-		session.setVibeModeState(undefined);
+		// Always hydrate from a clean base: whatever transient runtime the previous
+		// session left behind hands its tools and model back before the recorded
+		// mode below re-enters and takes its own snapshot.
+		await rpcWorkModes.clearRpcTransientModeState(session);
 
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			if (!session.settings.get("goal.enabled")) {
+				session.goalRuntime.clearAccounting();
 				session.sessionManager.appendModeChange("none");
 				return;
 			}
 			const goal = readRpcPersistedGoal(sessionContext.modeData);
 			if (!goal) {
+				session.goalRuntime.clearAccounting();
 				session.sessionManager.appendModeChange("none");
 				return;
 			}
@@ -1579,6 +1622,7 @@ export async function runRpcMode(
 			return;
 		}
 
+		session.goalRuntime.clearAccounting();
 		if (sessionContext.mode === "vibe") {
 			await rpcWorkModes.enterRpcVibeMode(session);
 			return;
@@ -1615,43 +1659,47 @@ export async function runRpcMode(
 		}
 	};
 
+	/** Releases the collaboration relay and captured audio the current session owns. */
+	const releaseRpcSessionAttachments = async (): Promise<void> => {
+		try {
+			await rpcCollab.disposeRpcCollab(session);
+		} catch (collabError) {
+			logger.error("RPC collaboration teardown failed", { error: String(collabError) });
+		}
+		await releaseVoice();
+	};
+
 	const runReconciledRpcSessionTransition = async <T>(
-		freshSession: boolean,
-		transition: (options: SessionTransitionOptions) => Promise<{ result: T; honorPlanDefault: boolean }>,
+		transition: (options: SessionTransitionOptions) => Promise<RpcSessionTransitionOutcome<T>>,
 	): Promise<T> => {
 		const previousCwd = session.sessionManager.getCwd();
 		return runRpcSessionTransitionAtCommit(
 			transition,
 			async () => {
-				if (freshSession) {
-					const current = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
-					if (current.plan.enabled) await rpcWorkModes.exitRpcPlanMode(session);
-					else if (current.goal.goal) await rpcWorkModes.clearRpcGoal(session);
-					else if (current.vibe.enabled) await rpcWorkModes.exitRpcVibeMode(session);
-				} else if (session.getVibeModeState()?.enabled) {
-					await rpcWorkModes.exitRpcVibeMode(session);
-				}
-
-				await rpcCollab.disposeRpcCollab(session);
-				await releaseVoice();
-				disposeRuntimeControl();
-				idleBehavior.dispose();
-				rpcWorkModes.disposeRpcWorkModes(session);
-				session.setPlanModeState(undefined);
-				session.setGoalModeState(undefined);
-				session.setVibeModeState(undefined);
+				// Reversible: nothing here is persisted, so a cancelled or failed
+				// transition rebuilds the outgoing session's mode from its own entries
+				// when the reconciler below runs. It also has to precede the guest
+				// unwind, whose own session restore rejects an active vibe mode.
+				await rpcWorkModes.clearRpcTransientModeState(session);
+				// A guest replica owns the session's contents, and leaving restores the
+				// local session, so it has to unwind before the requested change starts:
+				// deferring it would silently switch away from the client's destination.
+				// Hosting is left alone here — it survives a transition that fails.
+				if (rpcCollab.isRpcCollabGuest(session)) await rpcCollab.disposeRpcCollab(session);
+				disposeRpcRuntimeBehaviors();
 			},
-			async honorPlanDefault => {
+			async ({ committed, honorPlanDefault }) => {
+				// A relay the client hosts and a live microphone belong to the
+				// conversation that owned them: only a committed transition releases
+				// them, so a failed one leaves the still-current session operational.
+				if (committed) await releaseRpcSessionAttachments();
 				try {
 					await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
 				} finally {
 					try {
 						await reconcileRpcWorkModes(honorPlanDefault);
 					} finally {
-						disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
-						idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
-							output({ type: "idle_recap", recap });
-						});
+						installRpcRuntimeBehaviors();
 					}
 				}
 			},
@@ -1869,21 +1917,19 @@ export async function runRpcMode(
 					}
 					resolvedCommand = { ...command, sessionPath };
 				}
-				const result = await runReconciledRpcSessionTransition(
-					command.type === "new_session",
-					async transitionOptions => {
-						const changed = await handleRpcSessionChange(
-							session,
-							resolvedCommand,
-							subagentRegistry,
-							transitionOptions,
-						);
-						return {
-							result: changed,
-							honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
-						};
-					},
-				);
+				const result = await runReconciledRpcSessionTransition(async transitionOptions => {
+					const changed = await handleRpcSessionChange(
+						session,
+						resolvedCommand,
+						subagentRegistry,
+						transitionOptions,
+					);
+					return {
+						result: changed,
+						committed: !changed.data.cancelled,
+						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
+					};
+				});
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}
@@ -2608,10 +2654,10 @@ export async function runRpcMode(
 							session.abortCompaction();
 							while (session.isCompacting) await Bun.sleep(10);
 						}
-						const deleted = await runReconciledRpcSessionTransition(true, async transitionOptions => {
+						const deleted = await runReconciledRpcSessionTransition(async transitionOptions => {
 							const created = await session.newSession({ drop: true, ...transitionOptions });
 							if (created) subagentRegistry?.clear();
-							return { result: created, honorPlanDefault: created };
+							return { result: created, committed: created, honorPlanDefault: created };
 						});
 						if (!deleted) {
 							return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
@@ -3080,11 +3126,9 @@ export async function runRpcMode(
 			unsubscribeSettings();
 			unsubscribeRawSse?.();
 			unsubscribeProviderRequestObservations?.();
-			disposeRuntimeControl();
-			idleBehavior.dispose();
+			disposeRpcRuntimeBehaviors();
 			rpcWorkModes.disposeRpcWorkModes(session);
-			await rpcCollab.disposeRpcCollab(session);
-			await releaseVoice();
+			await releaseRpcSessionAttachments();
 			await session.dispose();
 			// See the EOF path: queued frames must reach stdout before the process dies.
 			await stdoutQueue;
@@ -3140,11 +3184,9 @@ export async function runRpcMode(
 	unsubscribeSettings();
 	unsubscribeRawSse?.();
 	unsubscribeProviderRequestObservations?.();
-	disposeRuntimeControl();
-	idleBehavior.dispose();
+	disposeRpcRuntimeBehaviors();
 	rpcWorkModes.disposeRpcWorkModes(session);
-	await rpcCollab.disposeRpcCollab(session);
-	await releaseVoice();
+	await releaseRpcSessionAttachments();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
