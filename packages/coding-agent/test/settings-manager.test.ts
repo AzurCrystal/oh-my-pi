@@ -142,6 +142,59 @@ describe("Settings", () => {
 			await settings.flush();
 			expect((await readSettings()).setupVersion).toBe(1);
 		});
+		it("continues background saves after a rejected save without hiding the original flush failure", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const saveError = new Error("simulated first save failure");
+			const firstSaveEntered = Promise.withResolvers<void>();
+			const releaseFirstSave = Promise.withResolvers<void>();
+			const secondSaveFinished = Promise.withResolvers<void>();
+			const withFileLock = fileLock.withFileLock;
+			let saveCount = 0;
+			vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+				saveCount += 1;
+				if (saveCount === 1) {
+					firstSaveEntered.resolve();
+					await releaseFirstSave.promise;
+					throw saveError;
+				}
+				const result = await withFileLock(filePath, fn, options);
+				secondSaveFinished.resolve();
+				return result;
+			});
+
+			settings.set("setupVersion", 1);
+			await firstSaveEntered.promise;
+
+			const firstFlush = settings.flush();
+			const observedFailure = firstFlush.then(
+				() => undefined,
+				error => error,
+			);
+			try {
+				vi.useFakeTimers();
+				try {
+					settings.set("theme.dark", "titanium");
+					vi.advanceTimersByTime(100);
+				} finally {
+					vi.useRealTimers();
+				}
+
+				releaseFirstSave.resolve();
+				expect(await observedFailure).toBe(saveError);
+				await secondSaveFinished.promise;
+
+				expect(saveCount).toBe(2);
+				expect(await readSettings()).toMatchObject({
+					setupVersion: 1,
+					theme: { dark: "titanium" },
+				});
+			} finally {
+				vi.useRealTimers();
+				releaseFirstSave.resolve();
+				settings.cancelPendingSaves();
+				await observedFailure;
+			}
+		});
 	});
 
 	describe("shell configuration errors", () => {

@@ -1938,7 +1938,7 @@ export class Settings {
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
 			const previousSave = this.#savePromise;
-			const savePromise = previousSave ? previousSave.then(() => this.#saveNow()) : this.#saveNow();
+			const savePromise = previousSave ? previousSave.catch(() => {}).then(() => this.#saveNow()) : this.#saveNow();
 			this.#savePromise = savePromise;
 			savePromise
 				.catch(err => {
