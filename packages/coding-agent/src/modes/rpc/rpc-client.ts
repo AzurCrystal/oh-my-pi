@@ -56,7 +56,7 @@ import type {
 	RpcExtensionUIResponse,
 	RpcGenerateTitleResult,
 	RpcGoalModeSnapshot,
-	RpcGuidedGoalSnapshot,
+	RpcGuidedGoalKickoffResult,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -1313,32 +1313,8 @@ export class RpcClient {
 	}
 
 	/** Start the guided goal-definition flow. */
-	async beginGuidedGoal(initialObjective: string): Promise<RpcGuidedGoalSnapshot> {
+	async beginGuidedGoal(initialObjective?: string): Promise<RpcGuidedGoalKickoffResult> {
 		const response = await this.#send({ type: "begin_guided_goal", initialObjective }, 600_000);
-		return this.#getData(response);
-	}
-
-	/** Answer the current guided-goal question. */
-	async answerGuidedGoal(answer: string): Promise<RpcGuidedGoalSnapshot> {
-		const response = await this.#send({ type: "answer_guided_goal", answer }, 600_000);
-		return this.#getData(response);
-	}
-
-	/** Accept the reviewed guided objective and create its goal. */
-	async acceptGuidedGoal(objective: string): Promise<RpcGoalModeSnapshot> {
-		const response = await this.#send({ type: "accept_guided_goal", objective });
-		return this.#getData(response);
-	}
-
-	/** Cancel the guided goal-definition flow. */
-	async cancelGuidedGoal(): Promise<RpcGuidedGoalSnapshot> {
-		const response = await this.#send({ type: "cancel_guided_goal" });
-		return this.#getData(response);
-	}
-
-	/** Read guided-goal state. */
-	async getGuidedGoalState(): Promise<RpcGuidedGoalSnapshot> {
-		const response = await this.#send({ type: "get_guided_goal_state" });
 		return this.#getData(response);
 	}
 

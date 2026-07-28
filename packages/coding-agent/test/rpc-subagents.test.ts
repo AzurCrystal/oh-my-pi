@@ -9,6 +9,7 @@ import {
 	type RpcSessionChangeCommand,
 	type RpcSessionChangeResult,
 	type RpcSessionChangeSession,
+	runRpcSessionTransitionAtCommit,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -76,11 +77,25 @@ type SessionChangeStubOptions = {
 
 function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessionChangeSession {
 	return {
-		newSession: async (_options?: unknown) => options.newSession ?? true,
-		switchSession: async (_sessionPath: string) => options.switchSession ?? true,
-		branch: async (_entryId: string) =>
-			options.branch ?? { selectedText: "branched text", selectedImages: [], cancelled: false },
-		fork: async () => true,
+		newSession: async sessionOptions => {
+			const changed = options.newSession ?? true;
+			if (changed) await sessionOptions?.beforeCommit?.();
+			return changed;
+		},
+		switchSession: async (_sessionPath, sessionOptions) => {
+			const changed = options.switchSession ?? true;
+			if (changed) await sessionOptions?.beforeCommit?.();
+			return changed;
+		},
+		branch: async (_entryId, sessionOptions) => {
+			const result = options.branch ?? { selectedText: "branched text", selectedImages: [], cancelled: false };
+			if (!result.cancelled) await sessionOptions?.beforeCommit?.();
+			return result;
+		},
+		fork: async sessionOptions => {
+			await sessionOptions?.beforeCommit?.();
+			return true;
+		},
 	};
 }
 
@@ -268,6 +283,42 @@ describe("RPC subagent registry", () => {
 			} finally {
 				registry.dispose();
 			}
+		}
+	});
+
+	test("runs work-mode teardown only for committed RPC session transitions", async () => {
+		for (const activeMode of ["plan", "goal", "vibe"] as const) {
+			const modeState = {
+				plan: activeMode === "plan",
+				goal: activeMode === "goal",
+				vibe: activeMode === "vibe",
+			};
+			const transition = (committed: boolean) =>
+				runRpcSessionTransitionAtCommit(
+					async transitionOptions => {
+						const result = await handleRpcSessionChange(
+							createSessionChangeSession({ newSession: committed }),
+							{ type: "new_session" },
+							undefined,
+							transitionOptions,
+						);
+						return { result, honorPlanDefault: false };
+					},
+					async () => {
+						modeState.plan = false;
+						modeState.goal = false;
+						modeState.vibe = false;
+					},
+					async () => {},
+				);
+
+			const cancelled = await transition(false);
+			expect(cancelled.data.cancelled).toBe(true);
+			expect(modeState[activeMode]).toBe(true);
+
+			const changed = await transition(true);
+			expect(changed.data.cancelled).toBe(false);
+			expect(modeState).toEqual({ plan: false, goal: false, vibe: false });
 		}
 	});
 

@@ -1196,22 +1196,12 @@ class RpcClient:
     def get_goal_state(self) -> JsonObject:
         return self._request("get_goal_state")
 
-    def begin_guided_goal(self, initial_objective: str) -> JsonObject:
+    def begin_guided_goal(
+        self, initial_objective: str | None = None
+    ) -> JsonObject:
         return self._request(
             "begin_guided_goal", initialObjective=initial_objective
         )
-
-    def answer_guided_goal(self, answer: str) -> JsonObject:
-        return self._request("answer_guided_goal", answer=answer)
-
-    def accept_guided_goal(self, objective: str) -> JsonObject:
-        return self._request("accept_guided_goal", objective=objective)
-
-    def cancel_guided_goal(self) -> JsonObject:
-        return self._request("cancel_guided_goal")
-
-    def get_guided_goal_state(self) -> JsonObject:
-        return self._request("get_guided_goal_state")
 
     def enter_vibe_mode(self) -> JsonObject:
         return self._request("enter_vibe_mode")

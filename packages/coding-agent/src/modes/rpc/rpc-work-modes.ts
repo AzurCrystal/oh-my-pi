@@ -1,17 +1,18 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { CompactionCancelledError, type CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { formatModelString } from "../../config/model-resolver";
-import { type GuidedGoalMessage, newGuidedGoalSessionId, runGuidedGoalTurn } from "../../goals/guided-setup";
 import { remainingTokens } from "../../goals/runtime";
 import type { Goal, GoalStatus } from "../../goals/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../../plan-mode/model-transition";
 import { readPlanFile } from "../../plan-mode/plan-files";
+import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -26,7 +27,6 @@ import { type VibeOwnerScope, type VibeParentSession, VibeSessionRegistry } from
 import { readRpcLoopState } from "./rpc-runtime-control";
 
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
-const GUIDED_GOAL_MAX_TURNS = 6;
 
 export interface RpcPlanProposalSnapshot {
 	planFilePath: string;
@@ -80,13 +80,8 @@ export interface RpcGoalModeSnapshot {
 	budget: RpcGoalBudgetSnapshot | null;
 }
 
-export interface RpcGuidedGoalSnapshot {
-	active: boolean;
-	status: "question" | "review" | null;
-	question: string | null;
-	objective: string | null;
-	turn: number;
-	maxTurns: number;
+export interface RpcGuidedGoalKickoffResult {
+	queued: boolean;
 }
 
 export interface RpcVibeWorkerSnapshot {
@@ -119,22 +114,12 @@ export interface RpcWorkModeSnapshot {
 	proposalPending: boolean;
 	plan: RpcPlanModeSnapshot;
 	goal: RpcGoalModeSnapshot;
-	guidedGoal: RpcGuidedGoalSnapshot;
 	vibe: RpcVibeModeSnapshot;
 }
 
 interface PlanModelState {
 	model: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
-}
-
-interface GuidedGoalRuntime {
-	messages: GuidedGoalMessage[];
-	sideSessionId: string;
-	turn: number;
-	latestDraftObjective?: string;
-	question?: string;
-	objective?: string;
 }
 
 interface WorkModeRuntime {
@@ -151,7 +136,6 @@ interface WorkModeRuntime {
 	goalSuppressNextContinuation?: boolean;
 	vibePreviousTools?: string[];
 	vibeOwnerScope?: VibeOwnerScope;
-	guidedGoal?: GuidedGoalRuntime;
 }
 
 const runtimes = new WeakMap<AgentSession, WorkModeRuntime>();
@@ -236,7 +220,10 @@ function vibeToolSession(session: AgentSession): ToolSession {
 }
 
 function assertModeAvailable(session: AgentSession, requested: "plan" | "goal" | "vibe"): void {
-	if (requested !== "plan" && session.getPlanModeState()?.enabled) {
+	if (
+		requested !== "plan" &&
+		(session.getPlanModeState()?.enabled || session.sessionManager.buildSessionContext().mode === "plan_paused")
+	) {
 		throw new Error("Exit plan mode first.");
 	}
 	const goal = session.getGoalModeState();
@@ -508,56 +495,6 @@ function startRpcGoalTurn(session: AgentSession, objective: string): void {
 			error: error instanceof Error ? error.message : String(error),
 		});
 	});
-}
-
-function cloneGuidedGoalSnapshot(runtime: WorkModeRuntime): RpcGuidedGoalSnapshot {
-	const guided = runtime.guidedGoal;
-	if (!guided) {
-		return {
-			active: false,
-			status: null,
-			question: null,
-			objective: null,
-			turn: 0,
-			maxTurns: GUIDED_GOAL_MAX_TURNS,
-		};
-	}
-	return {
-		active: true,
-		status: guided.question ? "question" : "review",
-		question: guided.question ?? null,
-		objective: guided.objective ?? guided.latestDraftObjective ?? null,
-		turn: guided.turn,
-		maxTurns: GUIDED_GOAL_MAX_TURNS,
-	};
-}
-
-async function advanceGuidedGoal(session: AgentSession, runtime: WorkModeRuntime): Promise<RpcGuidedGoalSnapshot> {
-	const guided = runtime.guidedGoal;
-	if (!guided) throw new Error("No guided goal interview is active.");
-	const result = await runGuidedGoalTurn(session, {
-		messages: guided.messages,
-		sideSessionId: guided.sideSessionId,
-	});
-	guided.turn++;
-	if (result.objective?.trim()) guided.latestDraftObjective = result.objective.trim();
-	if (result.kind === "ready") {
-		guided.question = undefined;
-		guided.objective = result.objective.trim();
-		return cloneGuidedGoalSnapshot(runtime);
-	}
-	if (guided.turn < GUIDED_GOAL_MAX_TURNS) {
-		guided.question = result.question;
-		guided.messages.push({ role: "assistant", content: result.question });
-		return cloneGuidedGoalSnapshot(runtime);
-	}
-	guided.question = undefined;
-	guided.objective = guided.latestDraftObjective;
-	if (!guided.objective) {
-		runtime.guidedGoal = undefined;
-		throw new Error("Guided goal setup needs more detail. Start again with a narrower objective.");
-	}
-	return cloneGuidedGoalSnapshot(runtime);
 }
 
 export async function enterRpcPlanMode(
@@ -937,68 +874,41 @@ export async function readRpcGoalState(session: AgentSession): Promise<RpcGoalMo
 
 export async function beginRpcGuidedGoal(
 	session: AgentSession,
-	initialObjective: string,
-): Promise<RpcGuidedGoalSnapshot> {
+	initialObjective?: string,
+): Promise<RpcGuidedGoalKickoffResult> {
 	assertModeAvailable(session, "goal");
 	if (!session.settings.get("goal.enabled")) {
-		throw new Error("Goal mode is disabled. Enable goal.enabled first.");
+		throw new Error("Goal mode is disabled. Enable it in settings (goal.enabled).");
 	}
-	if (session.getGoalModeState()?.goal) {
-		throw new Error("Resume or clear the current goal before starting a guided goal.");
+	const goalState = session.getGoalModeState();
+	if (goalState?.enabled) {
+		throw new Error("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
 	}
-	const initial = initialObjective.trim();
-	if (!initial) throw new Error("A rough goal objective is required.");
+	if (goalState?.goal.status === "paused") {
+		throw new Error("Resume the current goal first, or drop it before setting a new objective.");
+	}
+
 	const runtime = runtimeFor(session);
-	runtime.guidedGoal = {
-		messages: [{ role: "user", content: initial }],
-		sideSessionId: newGuidedGoalSessionId(session),
-		turn: 0,
-	};
+	const enabledTools = session.getEnabledToolNames();
+	runtime.goalPreviousTools = enabledTools.filter(name => name !== "goal");
+	if (!enabledTools.includes("goal")) {
+		await session.setActiveToolsByName([...enabledTools, "goal"]);
+	}
+	installRpcGoalScheduler(session);
+
+	const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: initialObjective?.trim() || undefined });
+	if (session.isStreaming) {
+		await session.followUp(kickoff, undefined, { synthetic: true });
+		return { queued: true };
+	}
 	try {
-		return await advanceGuidedGoal(session, runtime);
+		await session.prompt(kickoff, { synthetic: true });
+		return { queued: false };
 	} catch (error) {
-		runtime.guidedGoal = undefined;
-		throw error;
+		if (!(error instanceof AgentBusyError)) throw error;
+		await session.followUp(kickoff, undefined, { synthetic: true });
+		return { queued: true };
 	}
-}
-
-export async function answerRpcGuidedGoal(session: AgentSession, answer: string): Promise<RpcGuidedGoalSnapshot> {
-	const runtime = runtimeFor(session);
-	const guided = runtime.guidedGoal;
-	if (!guided?.question) throw new Error("The guided goal is not awaiting an answer.");
-	const normalizedAnswer = answer.trim();
-	if (!normalizedAnswer) throw new Error("A guided goal answer is required.");
-	const question = guided.question;
-	guided.messages.push({ role: "user", content: normalizedAnswer });
-	guided.question = undefined;
-	try {
-		return await advanceGuidedGoal(session, runtime);
-	} catch (error) {
-		guided.messages.pop();
-		guided.question = question;
-		throw error;
-	}
-}
-
-export async function acceptRpcGuidedGoal(session: AgentSession, objective: string): Promise<RpcGoalModeSnapshot> {
-	const runtime = runtimeFor(session);
-	const guided = runtime.guidedGoal;
-	if (!guided || guided.question) throw new Error("The guided goal is not ready for review.");
-	const finalObjective = objective.trim();
-	if (!finalObjective) throw new Error("A final goal objective is required.");
-	const result = await createRpcGoal(session, finalObjective);
-	runtime.guidedGoal = undefined;
-	return result;
-}
-
-export async function cancelRpcGuidedGoal(session: AgentSession): Promise<RpcGuidedGoalSnapshot> {
-	const runtime = runtimeFor(session);
-	runtime.guidedGoal = undefined;
-	return cloneGuidedGoalSnapshot(runtime);
-}
-
-export async function readRpcGuidedGoalState(session: AgentSession): Promise<RpcGuidedGoalSnapshot> {
-	return cloneGuidedGoalSnapshot(runtimeFor(session));
 }
 
 export async function enterRpcVibeMode(session: AgentSession): Promise<RpcVibeModeSnapshot> {
@@ -1025,6 +935,7 @@ export async function exitRpcVibeMode(session: AgentSession): Promise<RpcVibeMod
 	const runtime = runtimeFor(session);
 	await VibeSessionRegistry.global().killAll(vibeParentSession(session), runtime.vibeOwnerScope);
 	await session.deactivateVibeTools(runtime.vibePreviousTools ?? []);
+	session.sessionManager.appendModeChange("none");
 	session.setVibeModeState(undefined);
 	runtime.vibePreviousTools = undefined;
 	runtime.vibeOwnerScope = undefined;
@@ -1062,14 +973,12 @@ export async function readRpcVibeModeState(session: AgentSession): Promise<RpcVi
 export async function buildRpcWorkModeSnapshot(session: AgentSession): Promise<RpcWorkModeSnapshot> {
 	const plan = clonePlanSnapshot(session);
 	const goal = cloneGoalSnapshot(session);
-	const guidedGoal = cloneGuidedGoalSnapshot(runtimeFor(session));
 	const vibe = await readRpcVibeModeState(session);
 	return {
 		activeMode: plan.enabled ? "plan" : goal.enabled || goal.paused ? "goal" : vibe.enabled ? "vibe" : null,
 		proposalPending: plan.proposal !== null,
 		plan,
 		goal,
-		guidedGoal,
 		vibe,
 	};
 }

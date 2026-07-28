@@ -143,7 +143,7 @@ Important edge behavior from runtime:
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 185 command discriminants; referenced TypeScript types are exported from the same module.
+`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 181 command discriminants; referenced TypeScript types are exported from the same module.
 
 ### Protocol
 
@@ -231,13 +231,9 @@ Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPl
 - `{ id?, type: "clear_goal" }`
 - `{ id?, type: "set_goal_budget", tokenBudget: number | null }`
 - `{ id?, type: "get_goal_state" }`
-- `{ id?, type: "begin_guided_goal", initialObjective: string }`
-- `{ id?, type: "answer_guided_goal", answer: string }`
-- `{ id?, type: "accept_guided_goal", objective: string }`
-- `{ id?, type: "cancel_guided_goal" }`
-- `{ id?, type: "get_guided_goal_state" }`
+- `{ id?, type: "begin_guided_goal", initialObjective?: string }` → `{ queued: boolean }`
 
-Goal mode is autonomous. Creating a goal while idle immediately starts its first agent turn; after each completed turn the RPC goal scheduler can submit the next continuation while the goal remains active. A streaming session receives goal context as steering instead. Guided goal runs a bounded question/review flow and `accept_guided_goal` converts the reviewed objective into the same autonomous goal mode.
+Goal mode is autonomous. Creating a goal while idle immediately starts its first agent turn; after each completed turn the RPC goal scheduler can submit the next continuation while the goal remains active. A streaming session receives goal context as steering instead. `begin_guided_goal` mirrors the TUI command: it validates preconditions, exposes the `goal` tool, and injects a synthetic kickoff prompt. `queued: true` means that kickoff is a follow-up behind an active turn; `false` means direct submission. The guided interview is normal conversation: clients send answers with `prompt`, and the agent completes it with `goal create`.
 
 #### Vibe and aggregate state
 
@@ -246,7 +242,7 @@ Goal mode is autonomous. Creating a goal while idle immediately starts its first
 - `{ id?, type: "get_vibe_mode_state" }`
 - `{ id?, type: "get_work_mode_state" }`
 
-Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_state` returns the active mode plus plan, goal, guided-goal, and vibe snapshots.
+Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_state` returns the active mode plus plan, goal, and vibe snapshots.
 
 ### Runtime control
 
@@ -957,7 +953,6 @@ Most commands are processed in stdin order through one serialized queue. Operati
 - `approve_plan_proposal`
 - `reject_plan_proposal`
 - `begin_guided_goal`
-- `answer_guided_goal`
 - `prompt_agent`
 - `generate_ttsr_rule`
 - `start_live`
@@ -977,7 +972,7 @@ Most commands are processed in stdin order through one serialized queue. Operati
 - `mcp_search_registry`
 - `mcp_deploy_registry_result`
 
-Responses from those commands can interleave with later ordered responses; clients MUST correlate by `id`. This lets `abort`, `abort_retry`, `cancel_guided_goal`, `cancel_btw`, `abort_bash`, `abort_python`, and `kill_agent` run while their target operation is pending, and lets voice, STT, collaboration, and MCP control commands overtake the corresponding network startup. `extension_ui_response`, host-tool updates/results, and host-URI results bypass the ordered queue as control frames.
+Responses from those commands can interleave with later ordered responses; clients MUST correlate by `id`. This lets `abort`, `abort_retry`, `cancel_btw`, `abort_bash`, `abort_python`, and `kill_agent` run while their target operation is pending, and lets voice, STT, collaboration, and MCP control commands overtake the corresponding network startup. `extension_ui_response`, host-tool updates/results, and host-URI results bypass the ordered queue as control frames.
 
 ### Queue defaults
 

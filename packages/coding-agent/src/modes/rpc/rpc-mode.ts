@@ -40,6 +40,7 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import type { Goal } from "../../goals/state";
 import type { MCPManager } from "../../mcp/manager";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { SessionTransitionOptions } from "../../session/agent-session-types";
 import { HistoryStorage } from "../../session/history-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { resolveResumableSession } from "../../session/session-listing";
@@ -164,6 +165,27 @@ export type RpcSessionChangeResult =
 	| { type: "fork"; data: { cancelled: boolean } };
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
+
+export async function runRpcSessionTransitionAtCommit<T>(
+	transition: (options: SessionTransitionOptions) => Promise<{ result: T; honorPlanDefault: boolean }>,
+	prepare: () => Promise<void>,
+	reconcile: (honorPlanDefault: boolean) => Promise<void>,
+): Promise<T> {
+	let prepared = false;
+	const beforeCommit = async (): Promise<void> => {
+		if (prepared) return;
+		prepared = true;
+		await prepare();
+	};
+	let honorPlanDefault = false;
+	try {
+		const outcome = await transition({ beforeCommit });
+		honorPlanDefault = outcome.honorPlanDefault;
+		return outcome.result;
+	} finally {
+		if (prepared) await reconcile(honorPlanDefault);
+	}
+}
 
 export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
 export type RpcSkillCommandResult = { agentInvoked: true };
@@ -370,7 +392,6 @@ const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = 
 	approve_plan_proposal: true,
 	reject_plan_proposal: true,
 	begin_guided_goal: true,
-	answer_guided_goal: true,
 	prompt_agent: true,
 	generate_ttsr_rule: true,
 	mcp_add_server: true,
@@ -551,29 +572,32 @@ export async function handleRpcSessionChange(
 	session: RpcSessionChangeSession,
 	command: RpcSessionChangeCommand,
 	subagentRegistry?: RpcSubagentResetRegistry,
+	transitionOptions?: SessionTransitionOptions,
 ): Promise<RpcSessionChangeResult> {
 	switch (command.type) {
 		case "new_session": {
-			const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
+			const options = command.parentSession
+				? { parentSession: command.parentSession, ...transitionOptions }
+				: transitionOptions;
 			const cancelled = !(await session.newSession(options));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "new_session", data: { cancelled } };
 		}
 
 		case "switch_session": {
-			const cancelled = !(await session.switchSession(command.sessionPath));
+			const cancelled = !(await session.switchSession(command.sessionPath, transitionOptions));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}
 
 		case "branch": {
-			const result = await session.branch(command.entryId);
+			const result = await session.branch(command.entryId, transitionOptions);
 			if (!result.cancelled) subagentRegistry?.clear();
 			return { type: "branch", data: { text: result.selectedText, cancelled: result.cancelled } };
 		}
 
 		case "fork": {
-			const cancelled = !(await session.fork());
+			const cancelled = !(await session.fork(transitionOptions));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "fork", data: { cancelled } };
 		}
@@ -1593,46 +1617,45 @@ export async function runRpcMode(
 
 	const runReconciledRpcSessionTransition = async <T>(
 		freshSession: boolean,
-		transition: () => Promise<{ result: T; honorPlanDefault: boolean }>,
+		transition: (options: SessionTransitionOptions) => Promise<{ result: T; honorPlanDefault: boolean }>,
 	): Promise<T> => {
 		const previousCwd = session.sessionManager.getCwd();
-		if (freshSession) {
-			const current = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
-			if (current.plan.enabled) await rpcWorkModes.exitRpcPlanMode(session);
-			else if (current.goal.goal) await rpcWorkModes.clearRpcGoal(session);
-			else if (current.vibe.enabled) await rpcWorkModes.exitRpcVibeMode(session);
-		} else if (session.getVibeModeState()?.enabled) {
-			await rpcWorkModes.exitRpcVibeMode(session);
-		}
-
-		await rpcCollab.disposeRpcCollab(session);
-		await releaseVoice();
-		disposeRuntimeControl();
-		idleBehavior.dispose();
-		rpcWorkModes.disposeRpcWorkModes(session);
-		session.setPlanModeState(undefined);
-		session.setGoalModeState(undefined);
-		session.setVibeModeState(undefined);
-
-		let honorPlanDefault = false;
-		try {
-			const outcome = await transition();
-			honorPlanDefault = outcome.honorPlanDefault;
-			return outcome.result;
-		} finally {
-			try {
-				await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
-			} finally {
-				try {
-					await reconcileRpcWorkModes(honorPlanDefault);
-				} finally {
-					disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
-					idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
-						output({ type: "idle_recap", recap });
-					});
+		return runRpcSessionTransitionAtCommit(
+			transition,
+			async () => {
+				if (freshSession) {
+					const current = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
+					if (current.plan.enabled) await rpcWorkModes.exitRpcPlanMode(session);
+					else if (current.goal.goal) await rpcWorkModes.clearRpcGoal(session);
+					else if (current.vibe.enabled) await rpcWorkModes.exitRpcVibeMode(session);
+				} else if (session.getVibeModeState()?.enabled) {
+					await rpcWorkModes.exitRpcVibeMode(session);
 				}
-			}
-		}
+
+				await rpcCollab.disposeRpcCollab(session);
+				await releaseVoice();
+				disposeRuntimeControl();
+				idleBehavior.dispose();
+				rpcWorkModes.disposeRpcWorkModes(session);
+				session.setPlanModeState(undefined);
+				session.setGoalModeState(undefined);
+				session.setVibeModeState(undefined);
+			},
+			async honorPlanDefault => {
+				try {
+					await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
+				} finally {
+					try {
+						await reconcileRpcWorkModes(honorPlanDefault);
+					} finally {
+						disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+						idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
+							output({ type: "idle_recap", recap });
+						});
+					}
+				}
+			},
+		);
 	};
 
 	await reconcileRpcWorkModes(true);
@@ -1846,13 +1869,21 @@ export async function runRpcMode(
 					}
 					resolvedCommand = { ...command, sessionPath };
 				}
-				const result = await runReconciledRpcSessionTransition(command.type === "new_session", async () => {
-					const changed = await handleRpcSessionChange(session, resolvedCommand, subagentRegistry);
-					return {
-						result: changed,
-						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
-					};
-				});
+				const result = await runReconciledRpcSessionTransition(
+					command.type === "new_session",
+					async transitionOptions => {
+						const changed = await handleRpcSessionChange(
+							session,
+							resolvedCommand,
+							subagentRegistry,
+							transitionOptions,
+						);
+						return {
+							result: changed,
+							honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
+						};
+					},
+				);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}
@@ -2123,22 +2154,6 @@ export async function runRpcMode(
 				return moduleCommand(id, "begin_guided_goal", () =>
 					rpcWorkModes.beginRpcGuidedGoal(session, command.initialObjective),
 				);
-
-			case "answer_guided_goal":
-				return moduleCommand(id, "answer_guided_goal", () =>
-					rpcWorkModes.answerRpcGuidedGoal(session, command.answer),
-				);
-
-			case "accept_guided_goal":
-				return moduleCommand(id, "accept_guided_goal", () =>
-					rpcWorkModes.acceptRpcGuidedGoal(session, command.objective),
-				);
-
-			case "cancel_guided_goal":
-				return moduleCommand(id, "cancel_guided_goal", () => rpcWorkModes.cancelRpcGuidedGoal(session));
-
-			case "get_guided_goal_state":
-				return moduleCommand(id, "get_guided_goal_state", () => rpcWorkModes.readRpcGuidedGoalState(session));
 
 			case "enter_vibe_mode":
 				return moduleCommand(id, "enter_vibe_mode", () => rpcWorkModes.enterRpcVibeMode(session));
@@ -2593,8 +2608,8 @@ export async function runRpcMode(
 							session.abortCompaction();
 							while (session.isCompacting) await Bun.sleep(10);
 						}
-						const deleted = await runReconciledRpcSessionTransition(true, async () => {
-							const created = await session.newSession({ drop: true });
+						const deleted = await runReconciledRpcSessionTransition(true, async transitionOptions => {
+							const created = await session.newSession({ drop: true, ...transitionOptions });
 							if (created) subagentRegistry?.clear();
 							return { result: created, honorPlanDefault: created };
 						});

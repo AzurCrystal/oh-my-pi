@@ -98,7 +98,7 @@ import type { RpcThemeSnapshot } from "./rpc-theme";
 import type { RpcLiveStatus, RpcSpeechMode, RpcSpeechStatus, RpcSttStatus, RpcVoiceEvent } from "./rpc-voice";
 import type {
 	RpcGoalModeSnapshot,
-	RpcGuidedGoalSnapshot,
+	RpcGuidedGoalKickoffResult,
 	RpcPlanDecisionResult as RpcPlanDecisionResultBase,
 	RpcPlanFinalizationStrategy,
 	RpcPlanModeSnapshot as RpcPlanModeSnapshotBase,
@@ -205,7 +205,7 @@ export type {
 	RpcGoalBudgetSnapshot,
 	RpcGoalDescriptor,
 	RpcGoalModeSnapshot,
-	RpcGuidedGoalSnapshot,
+	RpcGuidedGoalKickoffResult,
 	RpcPlanFinalizationStrategy,
 	RpcPlanProposalSnapshot,
 	RpcVibeModeSnapshot,
@@ -294,11 +294,7 @@ export type RpcCommand =
 	| { id?: string; type: "clear_goal" }
 	| { id?: string; type: "set_goal_budget"; tokenBudget: number | null }
 	| { id?: string; type: "get_goal_state" }
-	| { id?: string; type: "begin_guided_goal"; initialObjective: string }
-	| { id?: string; type: "answer_guided_goal"; answer: string }
-	| { id?: string; type: "accept_guided_goal"; objective: string }
-	| { id?: string; type: "cancel_guided_goal" }
-	| { id?: string; type: "get_guided_goal_state" }
+	| { id?: string; type: "begin_guided_goal"; initialObjective?: string }
 	| { id?: string; type: "enter_vibe_mode" }
 	| { id?: string; type: "exit_vibe_mode" }
 	| { id?: string; type: "get_vibe_mode_state" }
@@ -897,29 +893,7 @@ export type RpcResponse =
 			type: "response";
 			command: "begin_guided_goal";
 			success: true;
-			data: RpcGuidedGoalSnapshot;
-	  }
-	| {
-			id?: string;
-			type: "response";
-			command: "answer_guided_goal";
-			success: true;
-			data: RpcGuidedGoalSnapshot;
-	  }
-	| { id?: string; type: "response"; command: "accept_guided_goal"; success: true; data: RpcGoalModeSnapshot }
-	| {
-			id?: string;
-			type: "response";
-			command: "cancel_guided_goal";
-			success: true;
-			data: RpcGuidedGoalSnapshot;
-	  }
-	| {
-			id?: string;
-			type: "response";
-			command: "get_guided_goal_state";
-			success: true;
-			data: RpcGuidedGoalSnapshot;
+			data: RpcGuidedGoalKickoffResult;
 	  }
 	| { id?: string; type: "response"; command: "enter_vibe_mode"; success: true; data: RpcVibeModeSnapshot }
 	| { id?: string; type: "response"; command: "exit_vibe_mode"; success: true; data: RpcVibeModeSnapshot }

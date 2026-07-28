@@ -922,12 +922,15 @@ DELTA_COMMANDS_SERVER = textwrap.dedent(
         command = json.loads(raw_line)
         if command["type"] == "publish_editor_text":
             published_text = command["text"]
+        data = {"received": command, "publishedText": published_text}
+        if command["type"] == "begin_guided_goal":
+            data["queued"] = False
         print(json.dumps({
             "id": command["id"],
             "type": "response",
             "command": command["type"],
             "success": True,
-            "data": {"received": command, "publishedText": published_text},
+            "data": data,
         }), flush=True)
     """
 )
@@ -1309,6 +1312,18 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(smithery_logged_out["received"]["type"], "mcp_logout_smithery")
         self.assertEqual(registry["received"]["semantic"], True)
         self.assertEqual(deployed["received"]["values"]["token"], "secret")
+
+    def test_begin_guided_goal_omits_missing_initial_objective(self) -> None:
+        with self.make_client(server=DELTA_COMMANDS_SERVER) as client:
+            without_objective = client.begin_guided_goal()
+            with_objective = client.begin_guided_goal("Ship the release")
+
+        self.assertIs(without_objective["queued"], False)
+        self.assertEqual(without_objective["received"]["type"], "begin_guided_goal")
+        self.assertNotIn("initialObjective", without_objective["received"])
+        self.assertEqual(
+            with_objective["received"]["initialObjective"], "Ship the release"
+        )
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:
