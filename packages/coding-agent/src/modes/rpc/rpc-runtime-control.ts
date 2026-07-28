@@ -305,7 +305,7 @@ export async function pauseRpcAgents(session: AgentSession): Promise<RpcPauseRes
 	if (session.isDisposed) throw new Error("Cannot pause agents from a disposed session.");
 	const runtime = runtimeFor(session);
 	const changed = agentPauseGate.pause();
-	runtime.ownsPause = changed;
+	runtime.ownsPause ||= changed;
 	return { ...pauseSnapshot(), changed, heldMs: null };
 }
 
