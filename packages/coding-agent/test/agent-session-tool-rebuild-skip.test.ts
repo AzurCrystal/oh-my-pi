@@ -928,21 +928,45 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(notices[0]).not.toContain("No longer mounted");
 	});
 
-	it("does not re-announce devices a resumed session already announced in history", async () => {
+	it.each([
+		{
+			priorNotice: {
+				role: "custom",
+				customType: "xdev-mount-notice",
+				content: "The xd:// device inventory changed.\n\nxd://mcp__nucleus_search became available.",
+				details: { added: ["mcp__nucleus_search"], removed: [] },
+				attribution: "agent",
+				display: false,
+				timestamp: 1,
+			} satisfies AgentMessage,
+		},
+		{
+			priorNotice: {
+				role: "custom",
+				customType: "xdev-mount-notice",
+				content: `<system-notice>
+The xd:// device inventory changed.
+These tools became available:
+- xd://mcp__nucleus_search — Search nucleus
+- xd://mcp__retired — Retired device
+Read \`xd://<tool>\` for docs + JSON schema before first use; write the JSON args object to \`xd://<tool>\` to execute.
+No longer mounted (writes to these devices will fail):
+- xd://mcp__retired
+Configured inline device docs:
+These tools became available:
+- xd://mcp__nucleus_fetch — This is inline documentation, not an inventory entry.
+</system-notice>`,
+				attribution: "agent",
+				display: false,
+				timestamp: 1,
+			} satisfies AgentMessage,
+		},
+	])("does not re-announce devices a resumed session already announced in history", async ({ priorNotice }) => {
 		// Model a process resume / host reconnect: persisted history already carries
 		// a mount notice for mcp__nucleus_search, but the fresh in-memory mount set
 		// starts empty. When the device reconnects, the notice must NOT re-splice a
 		// redundant developer message — doing so busts the provider prompt-cache
 		// prefix and re-bills the whole suffix on metered providers.
-		const priorNotice: AgentMessage = {
-			role: "custom",
-			customType: "xdev-mount-notice",
-			content: "The xd:// device inventory changed.\n\nxd://mcp__nucleus_search became available.",
-			details: { added: ["mcp__nucleus_search"], removed: [] },
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now() - 1000,
-		};
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
 			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }, { content: ["ok"] }],

@@ -1,6 +1,6 @@
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
@@ -705,10 +705,45 @@ export class SessionTools {
 		this.#announcedMountsSeeded = true;
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== XDEV_MOUNT_NOTICE_MESSAGE_TYPE) continue;
-			const details = message.details as XdevMountNoticeDetails | undefined;
-			if (!details) continue;
-			for (const name of details.added ?? []) this.#announcedMounts.add(name);
-			for (const name of details.removed ?? []) this.#announcedMounts.delete(name);
+			const details = message.details;
+			if (
+				isRecord(details) &&
+				Array.isArray(details.added) &&
+				details.added.every(name => typeof name === "string") &&
+				Array.isArray(details.removed) &&
+				details.removed.every(name => typeof name === "string")
+			) {
+				for (const name of details.added) this.#announcedMounts.add(name);
+				for (const name of details.removed) this.#announcedMounts.delete(name);
+				continue;
+			}
+
+			// Releases before structured notice details persisted only the rendered
+			// prompt. Replay its two stable inventory sections so the first resume
+			// after upgrading does not re-announce every dynamic device once.
+			if (typeof message.content !== "string") continue;
+			let section: "added" | "removed" | undefined;
+			for (const line of message.content.split("\n")) {
+				if (line === "These tools became available:") {
+					section = "added";
+					continue;
+				}
+				if (line.startsWith("No longer mounted")) {
+					section = "removed";
+					continue;
+				}
+				if (line === "Configured inline device docs:" || line === "</system-notice>") break;
+				if (line.startsWith("Read `xd://<tool>`")) {
+					section = undefined;
+					continue;
+				}
+				if (!section) continue;
+				const match = /^- xd:\/\/(\S+?)(?:\s+—|$)/.exec(line);
+				const name = match?.[1];
+				if (!name) continue;
+				if (section === "added") this.#announcedMounts.add(name);
+				else this.#announcedMounts.delete(name);
+			}
 		}
 	}
 
