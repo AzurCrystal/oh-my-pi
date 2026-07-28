@@ -419,13 +419,23 @@ class _PendingRequest:
     response_queue: queue.Queue[JsonObject | BaseException]
 
 @dataclass(slots=True)
+class _AgentRunReservation:
+    prompt_count: int = 0
+    started: bool = False
+    hold_for_start: bool = False
+    completed: bool = False
+
+
+@dataclass(slots=True)
 class _PendingPromptOutcome:
     start_event_index: int
     retain_result: bool
+    streaming_behavior: StreamingBehavior | None
     result: bool | None = None
     error: BaseException | None = None
     acknowledged: bool = False
-    scheduled: bool = False
+    terminal_received: bool = False
+    reservation: _AgentRunReservation | None = None
     completed: bool = False
 
 
@@ -553,10 +563,11 @@ class RpcClient:
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._listener_dispatch_thread: threading.Thread | None = None
-        self._ready = threading.Event()
+        self._listener_dispatch_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._event_condition = threading.Condition()
+        self._ready = threading.Event()
         self._pending: dict[str, _PendingRequest] = {}
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
         self._host_tool_dispatch_names: dict[str, str] = {}
@@ -571,6 +582,7 @@ class RpcClient:
         self._last_schedule_async_error_index = 0
         self._pending_prompt_outcomes: dict[str, _PendingPromptOutcome] = {}
         self._active_agent_runs = 0
+        self._agent_run_reservations: list[_AgentRunReservation] = []
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
@@ -587,9 +599,10 @@ class RpcClient:
             _DEFAULT_ERROR_HISTORY_LIMIT
         )
         self._prompt_lifecycle = _PromptLifecycleCoordinator()
-        self._listener_dispatch_queue: queue.Queue[Callable[[], None] | None] = (
-            queue.Queue()
-        )
+        self._listener_dispatch_queue: queue.Queue[
+            Callable[[], None] | None
+        ] | None = None
+        self._listener_dispatch_cancel: threading.Event | None = None
 
         self._notification_listeners: list[NotificationListener] = []
         self._event_listeners: list[AgentEventListener] = []
@@ -647,6 +660,13 @@ class RpcClient:
     def start(self) -> RpcClient:
         if self._process is not None:
             raise RpcError("RPC client is already started")
+        with self._listener_dispatch_lock:
+            dispatcher = self._listener_dispatch_thread
+            if dispatcher is not None and dispatcher.is_alive():
+                raise RpcError("Previous listener dispatcher is still stopping")
+            self._listener_dispatch_thread = None
+            self._listener_dispatch_queue = None
+            self._listener_dispatch_cancel = None
 
         self._ready.clear()
         self._stopping = False
@@ -663,7 +683,7 @@ class RpcClient:
         self._last_schedule_async_error_index = 0
         self._pending_prompt_outcomes.clear()
         self._active_agent_runs = 0
-        self._listener_dispatch_queue = queue.Queue()
+        self._agent_run_reservations.clear()
         self._ui_requests = queue.Queue()
         with self._state_lock:
             self._stderr_chunks.clear()
@@ -690,18 +710,27 @@ class RpcClient:
         self._process = process
         self._pgid = _process_group_id(process)
 
-        self._listener_dispatch_thread = threading.Thread(
+        listener_dispatch_queue: queue.Queue[Callable[[], None] | None] = (
+            queue.Queue()
+        )
+        listener_dispatch_cancel = threading.Event()
+        listener_dispatch_thread = threading.Thread(
             target=self._read_listener_dispatch_loop,
+            args=(listener_dispatch_queue, listener_dispatch_cancel),
             name="omp-rpc-listeners",
             daemon=True,
         )
+        with self._listener_dispatch_lock:
+            self._listener_dispatch_queue = listener_dispatch_queue
+            self._listener_dispatch_cancel = listener_dispatch_cancel
+            self._listener_dispatch_thread = listener_dispatch_thread
         self._stdout_thread = threading.Thread(
             target=self._read_stdout_loop, name="omp-rpc-stdout", daemon=True
         )
         self._stderr_thread = threading.Thread(
             target=self._read_stderr_loop, name="omp-rpc-stderr", daemon=True
         )
-        self._listener_dispatch_thread.start()
+        listener_dispatch_thread.start()
         self._stdout_thread.start()
         self._stderr_thread.start()
 
@@ -753,6 +782,7 @@ class RpcClient:
     def stop(self) -> None:
         process = self._process
         if process is None:
+            self._stop_listener_dispatcher()
             return
 
         self._stopping = True
@@ -2159,14 +2189,14 @@ class RpcClient:
             request_id = acknowledgement.request_id
             agent_invoked = acknowledgement.agent_invoked
             deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
-            if agent_invoked is None:
+            if agent_invoked is not False:
                 agent_invoked = self._wait_for_prompt_result(
                     request_id,
                     start_index,
                     start_async_error_index,
                     deadline=deadline,
                 )
-            if not agent_invoked:
+            if not agent_invoked or not self._prompt_has_agent_lifecycle(request_id):
                 return self._build_prompt_turn(())
             events = self._wait_for_agent_end(
                 start_index,
@@ -2236,6 +2266,7 @@ class RpcClient:
             outcome = _PendingPromptOutcome(
                 start_event_index=start_event_index,
                 retain_result=retain_result,
+                streaming_behavior=streaming_behavior,
             )
             self._pending_prompt_outcomes[request_id] = outcome
             self._schedule_prompt_outcome(outcome)
@@ -2288,7 +2319,7 @@ class RpcClient:
             resolved = outcome.result
             if resolved is False:
                 self._complete_prompt_outcome(outcome)
-            if resolved is not None and not outcome.retain_result:
+            if outcome.completed and not outcome.retain_result:
                 self._pending_prompt_outcomes.pop(request_id, None)
             self._event_condition.notify_all()
 
@@ -2317,8 +2348,15 @@ class RpcClient:
                 if outcome.error is not None:
                     self._pending_prompt_outcomes.pop(request_id, None)
                     raise outcome.error
-                if outcome.result is not None:
-                    self._pending_prompt_outcomes.pop(request_id, None)
+                reservation = outcome.reservation
+                if outcome.result is not None and (
+                    outcome.terminal_received
+                    or (
+                        outcome.result
+                        and reservation is not None
+                        and reservation.started
+                    )
+                ):
                     return outcome.result
                 if self._closed_error is not None:
                     raise RpcProcessExitError(str(self._closed_error))
@@ -2355,34 +2393,96 @@ class RpcClient:
                 return
             outcome.retain_result = False
             if outcome.result is not None or outcome.error is not None:
+                self._complete_prompt_outcome(outcome)
                 self._pending_prompt_outcomes.pop(request_id, None)
 
     def _schedule_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
-        if outcome.scheduled:
+        if outcome.reservation is not None:
             return
-        outcome.scheduled = True
-        self._scheduled_agent_runs += 1
-        self._last_schedule_async_error_index = self._async_errors.current_index()
+        reservation: _AgentRunReservation | None = None
+        if outcome.streaming_behavior == "steer":
+            reservation = next(
+                (
+                    candidate
+                    for candidate in self._agent_run_reservations
+                    if candidate.started and not candidate.completed
+                ),
+                None,
+            )
+            if reservation is None:
+                reservation = next(
+                    (
+                        candidate
+                        for candidate in self._agent_run_reservations
+                        if not candidate.completed
+                    ),
+                    None,
+                )
+        if reservation is None:
+            reservation = _AgentRunReservation()
+            self._agent_run_reservations.append(reservation)
+            self._scheduled_agent_runs += 1
+            self._last_schedule_async_error_index = (
+                self._async_errors.current_index()
+            )
+        reservation.prompt_count += 1
+        outcome.reservation = reservation
 
     def _complete_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
         if outcome.completed:
             return
         outcome.completed = True
+        reservation = outcome.reservation
+        if reservation is not None:
+            reservation.prompt_count -= 1
+            if (
+                reservation.prompt_count == 0
+                and not reservation.started
+                and not reservation.hold_for_start
+            ):
+                self._complete_agent_run_reservation(reservation)
+        self._event_condition.notify_all()
+
+    def _complete_agent_run_reservation(
+        self, reservation: _AgentRunReservation
+    ) -> None:
+        if reservation.completed:
+            return
+        reservation.completed = True
+        for index, candidate in enumerate(self._agent_run_reservations):
+            if candidate is reservation:
+                del self._agent_run_reservations[index]
+                break
         if self._completed_agent_runs < self._scheduled_agent_runs:
             self._completed_agent_runs += 1
-        self._event_condition.notify_all()
+
+    def _prompt_has_agent_lifecycle(self, request_id: str) -> bool:
+        with self._event_condition:
+            outcome = self._pending_prompt_outcomes.get(request_id)
+            reservation = outcome.reservation if outcome is not None else None
+            return reservation is not None and (
+                reservation.started or reservation.hold_for_start
+            )
 
     def _handle_prompt_agent_lifecycle(self, event_type: str) -> None:
         with self._event_condition:
             if event_type == "agent_start":
-                if (
-                    self._scheduled_agent_runs - self._completed_agent_runs
-                    <= self._active_agent_runs
-                ):
+                reservation = next(
+                    (
+                        candidate
+                        for candidate in self._agent_run_reservations
+                        if not candidate.started and not candidate.completed
+                    ),
+                    None,
+                )
+                if reservation is None:
+                    reservation = _AgentRunReservation()
+                    self._agent_run_reservations.append(reservation)
                     self._scheduled_agent_runs += 1
                     self._last_schedule_async_error_index = (
                         self._async_errors.current_index()
                     )
+                reservation.started = True
                 self._active_agent_runs += 1
             elif self._active_agent_runs > 0:
                 self._active_agent_runs -= 1
@@ -2390,14 +2490,38 @@ class RpcClient:
 
     def _mark_agent_run_scheduled(self) -> None:
         with self._event_condition:
+            self._agent_run_reservations.append(
+                _AgentRunReservation(hold_for_start=True)
+            )
             self._scheduled_agent_runs += 1
-            self._last_schedule_async_error_index = self._async_errors.current_index()
+            self._last_schedule_async_error_index = (
+                self._async_errors.current_index()
+            )
 
     def _mark_agent_run_completed(self) -> None:
         with self._event_condition:
-            if self._completed_agent_runs == self._scheduled_agent_runs:
+            reservation = next(
+                (
+                    candidate
+                    for candidate in self._agent_run_reservations
+                    if candidate.started and not candidate.completed
+                ),
+                None,
+            )
+            if reservation is None:
+                reservation = next(
+                    (
+                        candidate
+                        for candidate in self._agent_run_reservations
+                        if not candidate.completed
+                    ),
+                    None,
+                )
+            if reservation is None:
+                reservation = _AgentRunReservation(started=True)
+                self._agent_run_reservations.append(reservation)
                 self._scheduled_agent_runs += 1
-            self._completed_agent_runs += 1
+            self._complete_agent_run_reservation(reservation)
             self._event_condition.notify_all()
 
     def _is_agent_idle(self) -> bool:
@@ -2556,11 +2680,17 @@ class RpcClient:
             return
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(event.id)
-            if outcome is None or outcome.error is not None or outcome.result is not None:
+            if outcome is None or outcome.error is not None or outcome.terminal_received:
                 return
             outcome.result = event.agent_invoked
-            if not event.agent_invoked:
-                self._complete_prompt_outcome(outcome)
+            outcome.terminal_received = True
+            if (
+                event.agent_invoked
+                and outcome.streaming_behavior == "followUp"
+                and outcome.reservation is not None
+            ):
+                outcome.reservation.hold_for_start = True
+            self._complete_prompt_outcome(outcome)
             if outcome.acknowledged and not outcome.retain_result:
                 self._pending_prompt_outcomes.pop(event.id, None)
             self._event_condition.notify_all()
@@ -3368,6 +3498,8 @@ class RpcClient:
             self._event_condition.notify_all()
         self._ready.set()
         self._fail_pending(error)
+        if not self._stopping:
+            self._stop_listener_dispatcher(discard_pending=True, wait=False)
 
     def _fail_pending(self, error: BaseException) -> None:
         with self._state_lock:
@@ -3489,21 +3621,51 @@ class RpcClient:
             except Exception:
                 continue
 
-    def _read_listener_dispatch_loop(self) -> None:
-        while True:
-            dispatch = self._listener_dispatch_queue.get()
-            if dispatch is None:
-                return
-            dispatch()
+    def _read_listener_dispatch_loop(
+        self,
+        dispatch_queue: queue.Queue[Callable[[], None] | None],
+        cancel_pending: threading.Event,
+    ) -> None:
+        try:
+            while True:
+                dispatch = dispatch_queue.get()
+                if dispatch is None:
+                    return
+                with self._listener_dispatch_lock:
+                    if cancel_pending.is_set():
+                        continue
+                dispatch()
+        finally:
+            current_thread = threading.current_thread()
+            with self._listener_dispatch_lock:
+                if self._listener_dispatch_thread is current_thread:
+                    self._listener_dispatch_thread = None
+                if self._listener_dispatch_queue is dispatch_queue:
+                    self._listener_dispatch_queue = None
+                    self._listener_dispatch_cancel = None
 
-    def _stop_listener_dispatcher(self) -> None:
-        thread = self._listener_dispatch_thread
-        if thread is None:
-            return
-        self._listener_dispatch_queue.put(None)
-        if thread is not threading.current_thread():
+    def _stop_listener_dispatcher(
+        self, *, discard_pending: bool = False, wait: bool = True
+    ) -> None:
+        with self._listener_dispatch_lock:
+            thread = self._listener_dispatch_thread
+            if thread is None:
+                return
+            dispatch_queue = self._listener_dispatch_queue
+            cancel_pending = self._listener_dispatch_cancel
+            if dispatch_queue is not None:
+                self._listener_dispatch_queue = None
+                self._listener_dispatch_cancel = None
+                if discard_pending and cancel_pending is not None:
+                    cancel_pending.set()
+                    while True:
+                        try:
+                            dispatch_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                dispatch_queue.put(None)
+        if wait and thread is not threading.current_thread():
             thread.join()
-        self._listener_dispatch_thread = None
 
     def _dispatch_listeners(
         self,
@@ -3530,7 +3692,16 @@ class RpcClient:
                         )
                     )
 
-        self._listener_dispatch_queue.put(dispatch)
+        with self._listener_dispatch_lock:
+            dispatch_queue = self._listener_dispatch_queue
+            cancel_pending = self._listener_dispatch_cancel
+            if (
+                dispatch_queue is None
+                or cancel_pending is None
+                or cancel_pending.is_set()
+            ):
+                return
+            dispatch_queue.put(dispatch)
 
     @staticmethod
     def _validate_history_limit(name: str, limit: int | None) -> int | None:

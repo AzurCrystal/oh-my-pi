@@ -222,13 +222,14 @@ acknowledgement = client.prompt_with_result("Run /custom-command")
 print(acknowledgement.request_id, acknowledgement.agent_invoked)
 ```
 
-`agent_invoked` is `True` when the outcome was already known to invoke agent
-work, `False` when it was already known to complete locally, and `None` while
-the outcome is still resolving. The server then emits exactly one
-`PromptResultEvent` with the same request id and either value. `prompt_and_wait()`
-waits for that correlated result instead of assigning unrelated agent lifecycle
-events to prompts by arrival order. Local-only prompts return an empty
-`PromptTurn`; agent-invoking prompts additionally wait for `agent_end`.
+`agent_invoked` is `True` when the agent-facing input path accepted the prompt,
+`False` when it completed locally, and `None` while the outcome is still
+resolving. The server then emits exactly one `PromptResultEvent` with the same
+request id and either value. A `True` outcome does not by itself promise a new
+agent lifecycle: an active `streaming_behavior="steer"` prompt joins the current
+run, while `followUp` reserves a separate run. `prompt_and_wait()` uses the
+correlated outcome plus wire lifecycle bookkeeping; accepted guest-relay input
+without a local `agent_start` returns an empty `PromptTurn`.
 
 ## Error Handling and Retained History
 
@@ -244,9 +245,12 @@ allows:
 - listener exceptions no longer kill the stdout reader thread; they are exposed
   through `client.listener_errors` and `client.on_listener_error(...)`
 
-User callbacks run on one ordered dispatcher thread after reader-side
-bookkeeping. A callback may call `wait_for_idle()` without blocking stdout
-processing; listener exceptions retain the same `listener_errors` policy.
+User callbacks run on one ordered dispatcher generation after reader-side
+bookkeeping. Normal `stop()` drains that generation before joining it.
+Unexpected EOF or invalid JSON cancels callbacks that have not started, while a
+callback already running may finish. Reentrant `stop()` does not self-join, and
+the client rejects restart until that dispatcher generation exits. Listener
+exceptions retain the same `listener_errors` policy.
 
 For long-lived hosts, retained event and stderr history is bounded by default:
 

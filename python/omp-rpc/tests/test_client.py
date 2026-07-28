@@ -106,9 +106,19 @@ FAKE_SERVER = textwrap.dedent(
         delay: float = 0.0,
         include_extra_events: bool = False,
         compact_terminal: bool = False,
+        prompt_request_id: str | None = None,
     ):
         global last_assistant_text, messages
         print(json.dumps({"type": "agent_start"}), flush=True)
+        if prompt_request_id is not None:
+            print(
+                json.dumps({
+                    "type": "prompt_result",
+                    "id": prompt_request_id,
+                    "agentInvoked": True,
+                }),
+                flush=True,
+            )
         print(json.dumps({"type": "turn_start"}), flush=True)
         partial = assistant_message("")
         print(json.dumps({"type": "message_start", "message": partial}), flush=True)
@@ -393,7 +403,7 @@ FAKE_SERVER = textwrap.dedent(
             respond(
                 request_id,
                 command_type,
-                {} if command_type == "prompt" else {"agentInvoked": True},
+                {"agentInvoked": True},
             )
             message = command["message"]
             if message == "needs ui":
@@ -458,6 +468,7 @@ FAKE_SERVER = textwrap.dedent(
                 delay=0.3 if message == "slow" else 0.0,
                 include_extra_events=message == "all events",
                 compact_terminal=message == "compacted turn",
+                prompt_request_id=request_id if command_type == "prompt" else None,
             )
         elif command_type == "host_tool_update":
             print(
@@ -967,6 +978,8 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
         if data is not None:
             response["data"] = data
         emit(response)
+        if message == "immediate-true":
+            emit({"type": "agent_start"})
 
         if message in {"async-after", "listener-after", "interleave-local"}:
             emit_later(0.05, {
@@ -996,7 +1009,8 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
             "normal",
             "ordered",
         }:
-            emit({"type": "agent_start"})
+            if message != "immediate-true":
+                emit({"type": "agent_start"})
             emit({"type": "agent_end", "messages": []})
             if message == "normal":
                 emit({
@@ -1004,6 +1018,95 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
                     "id": request_id,
                     "agentInvoked": True,
                 })
+    """
+)
+
+PROMPT_ACCOUNTING_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    def respond(request_id, data=None):
+        payload = {
+            "id": request_id,
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+        }
+        if data is not None:
+            payload["data"] = data
+        emit(payload)
+
+    def outcome(request_id):
+        emit({
+            "type": "prompt_result",
+            "id": request_id,
+            "agentInvoked": True,
+        })
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command["id"]
+        message = command["message"]
+
+        if message == "guest":
+            outcome(request_id)
+            respond(request_id, {"agentInvoked": True})
+        elif message in {"active", "followup-base"}:
+            respond(request_id)
+            emit({"type": "agent_start"})
+            outcome(request_id)
+        elif message == "active-steer":
+            respond(request_id)
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+        elif message == "idle-steer":
+            respond(request_id)
+            emit({"type": "agent_start"})
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+        elif message == "queued-followup":
+            respond(request_id)
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+    """
+)
+
+DISPATCHER_CONTROL_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        emit({
+            "id": command["id"],
+            "type": "response",
+            "command": command_type,
+            "success": True,
+        })
+        if command_type == "emit_one":
+            emit({"type": "agent_start"})
+        elif command_type == "emit_pair":
+            emit({"type": "agent_start"})
+            emit({"type": "turn_start"})
+        elif command_type == "invalid":
+            emit({"type": "turn_start"})
+            print("{invalid", flush=True)
+        elif command_type == "eof":
+            emit({"type": "turn_start"})
+            break
     """
 )
 
@@ -1619,6 +1722,164 @@ class RpcClientTests(unittest.TestCase):
             self.assertTrue(finished.wait(1.0))
 
         self.assertEqual(observed, ["prompt_result", "agent_start", "agent_end"])
+
+    def test_active_steer_shares_the_wire_lifecycle_reservation(self) -> None:
+        start_listener_entered = threading.Event()
+        release_start_listener = threading.Event()
+
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            def block_agent_start(_event: object) -> None:
+                start_listener_entered.set()
+                release_start_listener.wait(1.0)
+
+            client.on_agent_start(block_agent_start)
+            try:
+                client.prompt_with_result("active")
+                client.prompt_with_result(
+                    "active-steer", streaming_behavior="steer"
+                )
+                self.assertTrue(start_listener_entered.wait(1.0))
+                client.wait_for_idle(timeout=0.5)
+                self.assertEqual(client._scheduled_agent_runs, 1)
+                self.assertEqual(client._completed_agent_runs, 1)
+                self.assertEqual(client._pending_prompt_outcomes, {})
+            finally:
+                release_start_listener.set()
+
+    def test_guest_prompt_true_finishes_without_an_agent_lifecycle(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            turn = client.prompt_and_wait("guest", timeout=0.5)
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(turn.events, ())
+            self.assertEqual(client._pending_prompt_outcomes, {})
+            self.assertEqual(client._scheduled_agent_runs, 1)
+            self.assertEqual(client._completed_agent_runs, 1)
+
+    def test_idle_steer_opens_one_lifecycle_reservation(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            client.prompt_with_result(
+                "idle-steer", streaming_behavior="steer"
+            )
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._scheduled_agent_runs, 1)
+            self.assertEqual(client._completed_agent_runs, 1)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_followup_keeps_a_separate_lifecycle_reservation(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            client.prompt_with_result("followup-base")
+            client.prompt_with_result(
+                "queued-followup", streaming_behavior="followUp"
+            )
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._scheduled_agent_runs, 2)
+            self.assertEqual(client._completed_agent_runs, 2)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_unexpected_close_discards_pending_listener_callbacks(self) -> None:
+        for close_command in ("invalid", "eof"):
+            with self.subTest(close_command=close_command):
+                callback_entered = threading.Event()
+                release_callback = threading.Event()
+                observed: list[str] = []
+                client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+                client.start()
+                dispatcher = client._listener_dispatch_thread
+                self.assertIsNotNone(dispatcher)
+                assert dispatcher is not None
+
+                def block_first_callback(event: object) -> None:
+                    event_type = getattr(event, "type", "")
+                    observed.append(event_type)
+                    if event_type == "agent_start":
+                        callback_entered.set()
+                        release_callback.wait(1.0)
+
+                client.on_notification(block_first_callback)
+                try:
+                    client.request_raw("emit_one")
+                    self.assertTrue(callback_entered.wait(1.0))
+                    client.request_raw(close_command)
+                    with self.assertRaises(RpcProcessExitError):
+                        client.wait_for_idle(timeout=0.5)
+                    release_callback.set()
+                    dispatcher.join(1.0)
+                    self.assertFalse(dispatcher.is_alive())
+                    self.assertIsNone(client._listener_dispatch_thread)
+                    self.assertEqual(observed, ["agent_start"])
+                finally:
+                    release_callback.set()
+                    client.stop()
+
+    def test_normal_stop_drains_listener_callbacks_before_join(self) -> None:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        observed: list[str] = []
+        client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+        client.start()
+
+        def block_first_callback(event: object) -> None:
+            event_type = getattr(event, "type", "")
+            observed.append(event_type)
+            if event_type == "agent_start":
+                callback_entered.set()
+                release_callback.wait(1.0)
+
+        client.on_notification(block_first_callback)
+        stop_thread = threading.Thread(target=client.stop)
+        try:
+            client.request_raw("emit_pair")
+            client.request_raw("barrier")
+            self.assertTrue(callback_entered.wait(1.0))
+            stop_thread.start()
+            release_callback.set()
+            stop_thread.join(1.0)
+
+            self.assertFalse(stop_thread.is_alive())
+            self.assertEqual(observed, ["agent_start", "turn_start"])
+            self.assertIsNone(client._listener_dispatch_thread)
+        finally:
+            release_callback.set()
+            if stop_thread.is_alive():
+                stop_thread.join(1.0)
+            client.stop()
+
+    def test_reentrant_stop_blocks_restart_until_dispatcher_exits(self) -> None:
+        callback_finished = threading.Event()
+        restart_errors: list[BaseException] = []
+        client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+        client.start()
+        first_dispatcher = client._listener_dispatch_thread
+        self.assertIsNotNone(first_dispatcher)
+        assert first_dispatcher is not None
+
+        def stop_and_restart(_event: object) -> None:
+            client.stop()
+            try:
+                client.start()
+            except BaseException as exc:
+                restart_errors.append(exc)
+            finally:
+                callback_finished.set()
+
+        client.on_agent_start(stop_and_restart)
+        try:
+            client.request_raw("emit_one")
+            self.assertTrue(callback_finished.wait(2.0))
+            first_dispatcher.join(1.0)
+            self.assertFalse(first_dispatcher.is_alive())
+            self.assertEqual(len(restart_errors), 1)
+            self.assertIsInstance(restart_errors[0], RpcError)
+
+            client.start()
+            second_dispatcher = client._listener_dispatch_thread
+            self.assertIsNotNone(second_dispatcher)
+            self.assertIsNot(second_dispatcher, first_dispatcher)
+        finally:
+            client.stop()
 
     def test_stop_joins_listener_dispatcher(self) -> None:
         client = self.make_client(server=PROMPT_RESULTS_SERVER)
