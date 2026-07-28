@@ -2,22 +2,35 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
+import type {
+	ExtensionCommandContextActions,
+	ExtensionRunner,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { askRpcBtw, branchRpcBtw, cancelRpcBtw } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-btw";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import * as rpcCollab from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-collab";
 import {
-	getRpcSessionTransitionGuestBlock,
 	handleRpcSessionChange,
 	isSameRpcSessionReload,
 	type RpcSessionChangeCommand,
 	type RpcSessionChangeResult,
 	type RpcSessionChangeSession,
+	runRpcMode,
 	runRpcSessionTransitionAtCommit,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
-import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import type { RpcCommand, RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { SessionTransitionOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type {
+	SessionTransitionCoordinator,
+	SessionTransitionLease,
+	SessionTransitionOptions,
+	SessionTransitionRunner,
+	SessionTransitionRunOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import {
 	type AgentProgress,
 	type SubagentEventPayload,
@@ -31,9 +44,12 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 const tempPaths: string[] = [];
+const originalNotifications = process.env.PI_NOTIFICATIONS;
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	if (originalNotifications === undefined) delete process.env.PI_NOTIFICATIONS;
+	else process.env.PI_NOTIFICATIONS = originalNotifications;
 	for (const tempPath of tempPaths.splice(0)) {
 		removeSyncWithRetries(tempPath);
 	}
@@ -127,20 +143,438 @@ function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessi
 	};
 }
 
-describe("RPC subagent registry", () => {
-	test("blocks guest session changes without leaving the collaboration", () => {
-		const session = {} as AgentSession;
-		vi.spyOn(rpcCollab, "isRpcCollabGuest").mockReturnValue(true);
-		const leave = vi.spyOn(rpcCollab, "leaveRpcCollabSession");
+type ObservedRpcFrame = Record<string, unknown>;
 
-		expect(getRpcSessionTransitionGuestBlock(session)).toEqual({
-			message:
-				"Session changes are unavailable while joined as a collaboration guest. Run leave_collab_session first.",
-			code: "operation_failed",
-		});
-		expect(leave).not.toHaveBeenCalled();
+function captureRpcFrames(onFrame?: (frame: ObservedRpcFrame) => void): ObservedRpcFrame[] {
+	const frames: ObservedRpcFrame[] = [];
+	const decoder = new TextDecoder();
+	vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		const text = typeof chunk === "string" ? chunk : decoder.decode(chunk);
+		for (const line of text.split("\n")) {
+			if (!line) continue;
+			const parsed = JSON.parse(line) as ObservedRpcFrame;
+			frames.push(parsed);
+			onFrame?.(parsed);
+		}
+		return true;
+	}) as typeof process.stdout.write);
+	vi.spyOn(process, "exit").mockImplementation((() => undefined as never) as typeof process.exit);
+	return frames;
+}
+
+function rpcInput(commands: readonly RpcCommand[]): ReadableStream<Uint8Array> {
+	const body = `${commands.map(command => JSON.stringify(command)).join("\n")}\n`;
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode(body));
+			controller.close();
+		},
+	});
+}
+
+function observedResponse(frames: readonly ObservedRpcFrame[], id: string): ObservedRpcFrame {
+	const response = frames.find(frame => frame.type === "response" && frame.id === id);
+	if (!response) throw new Error(`Missing RPC response for ${id}`);
+	return response;
+}
+
+function createRpcModeSession() {
+	const transitionMetrics = { runs: 0 };
+	let transitionCoordinator: SessionTransitionCoordinator | undefined;
+	const fallbackRunner: SessionTransitionRunner = async transition => (await transition({})).result;
+	const runSessionTransition: SessionTransitionRunner = (transition, options) => {
+		transitionMetrics.runs++;
+		return (transitionCoordinator?.run ?? fallbackRunner)(transition, options);
+	};
+	const acquireSessionTransition = (): SessionTransitionLease =>
+		transitionCoordinator?.acquire() ?? { run: fallbackRunner, release: () => {} };
+	const setSessionTransitionCoordinator = (coordinator: SessionTransitionCoordinator | null): void => {
+		transitionCoordinator = coordinator ?? undefined;
+	};
+	const prompt = vi.fn(async (_message: string) => false);
+	const newSession = vi.fn(async (_options?: SessionTransitionOptions & { parentSession?: string }) => true);
+	const switchSession = vi.fn(async (_sessionPath: string, _options?: SessionTransitionOptions) => true);
+	const navigateTree = vi.fn(
+		async (_targetId: string, _options?: unknown, _transitionOptions?: SessionTransitionOptions) => ({
+			cancelled: false,
+		}),
+	);
+	const createGoal = vi.fn(async (_options: { objective: string; tokenBudget?: number }) => {
+		throw new Error("local goal creation must not run");
+	});
+	const replaceGoal = vi.fn(async (_options: { objective: string; tokenBudget?: number }) => {
+		throw new Error("local goal replacement must not run");
+	});
+	const sessionManager = {
+		onEntryAppended: undefined,
+		getCwd: () => import.meta.dir,
+		getSessionDir: () => import.meta.dir,
+		getSessionFile: () => undefined,
+		getSessionName: () => undefined,
+		getLeafId: () => "leaf",
+		getEntries: () => [],
+		buildSessionContext: () => ({ mode: "none", modeData: undefined, messages: [] }),
+	};
+	const session = {
+		sessionManager,
+		settings: {
+			get: (_path: string) => false,
+			getGroup: (_path: string) => ({}),
+		},
+		goalRuntime: {
+			clearAccounting: () => {},
+			onTaskAborted: async () => {},
+			createGoal,
+			replaceGoal,
+		},
+		agent: { waitForIdle: async () => {} },
+		customCommands: [],
+		skills: [],
+		messages: [],
+		model: undefined,
+		sessionId: "rpc-transition-test",
+		sessionFile: undefined,
+		isDisposed: false,
+		isStreaming: false,
+		isCompacting: false,
+		hasPostPromptWork: false,
+		extensionRunner: undefined,
+		prompt,
+		newSession,
+		switchSession,
+		navigateTree,
+		runSessionTransition,
+		acquireSessionTransition,
+		setSessionTransitionCoordinator,
+		subscribe: () => () => {},
+		subscribeCommandMetadataChanged: () => () => {},
+		setSlashCommands: () => {},
+		getPlanModeState: () => undefined,
+		getGoalModeState: () => undefined,
+		getVibeModeState: () => undefined,
+		getEnabledToolNames: () => [],
+		setActiveToolsByName: async () => {},
+		peekPlanProposalHandler: () => undefined,
+		setPlanModeState: () => {},
+		setGoalModeState: () => {},
+		setVibeModeState: () => {},
+		setPlanProposalHandler: () => {},
+		emitNotice: () => {},
+		dispose: async () => {},
+	} as unknown as AgentSession;
+	return {
+		session,
+		prompt,
+		newSession,
+		switchSession,
+		navigateTree,
+		createGoal,
+		replaceGoal,
+		transitionMetrics,
+	};
+}
+
+function btwAssistant(): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "Inspect the transition." }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 1,
+	};
+}
+
+describe("RPC session transition boundaries", () => {
+	test("isolates a joined guest while preserving read and relayed prompt commands", async () => {
+		const fixture = createRpcModeSession();
+		const relayPrompt = vi.spyOn(rpcCollab, "sendRpcCollabGuestPrompt").mockImplementation(() => {});
+		vi.spyOn(rpcCollab, "isRpcCollabGuest").mockReturnValue(true);
+		const frames = captureRpcFrames();
+		const commands = [
+			{ id: "begin", type: "begin_guided_goal", initialObjective: "Ship safely" },
+			{ id: "create", type: "create_goal", objective: "Ship safely" },
+			{ id: "switch-goal", type: "switch_goal", objective: "Ship more safely" },
+			{ id: "loop", type: "enable_loop", prompt: "Continue", action: "reset" },
+			{ id: "plan", type: "approve_plan_proposal", strategy: "execute" },
+			{ id: "navigate", type: "navigate_tree", targetId: "other-leaf" },
+			{ id: "status", type: "get_collab_status" },
+			{ id: "prompt", type: "prompt", message: "Relay this" },
+		] satisfies RpcCommand[];
+
+		await runRpcMode(fixture.session, undefined, undefined, rpcInput(commands));
+
+		for (const id of ["begin", "create", "switch-goal", "loop", "plan", "navigate"]) {
+			expect(observedResponse(frames, id)).toMatchObject({
+				success: false,
+				code: "operation_failed",
+			});
+		}
+		expect(observedResponse(frames, "status")).toMatchObject({ success: true });
+		expect(observedResponse(frames, "prompt")).toMatchObject({ success: true });
+		expect(relayPrompt).toHaveBeenCalledWith(fixture.session, "Relay this", undefined);
+		expect(fixture.prompt).not.toHaveBeenCalled();
+		expect(fixture.newSession).not.toHaveBeenCalled();
+		expect(fixture.switchSession).not.toHaveBeenCalled();
+		expect(fixture.navigateTree).not.toHaveBeenCalled();
+		expect(fixture.createGoal).not.toHaveBeenCalled();
+		expect(fixture.replaceGoal).not.toHaveBeenCalled();
 	});
 
+	test("routes navigate_tree through the installed coordinator once with command options intact", async () => {
+		const fixture = createRpcModeSession();
+		fixture.navigateTree.mockResolvedValueOnce({ cancelled: true });
+		const frames = captureRpcFrames();
+		const command = {
+			id: "navigate-cancelled",
+			type: "navigate_tree",
+			targetId: "target-leaf",
+			summarize: true,
+			customInstructions: "Keep the branch concise.",
+			allowAskReopen: true,
+		} satisfies RpcCommand;
+
+		await runRpcMode(fixture.session, undefined, undefined, rpcInput([command]));
+
+		expect(observedResponse(frames, command.id)).toMatchObject({
+			success: true,
+			data: { cancelled: true },
+		});
+		expect(fixture.transitionMetrics.runs).toBe(1);
+		expect(fixture.navigateTree).toHaveBeenCalledTimes(1);
+		const navigationCall = fixture.navigateTree.mock.calls[0];
+		expect(navigationCall?.[0]).toBe("target-leaf");
+		expect(navigationCall?.[1]).toEqual({
+			summarize: true,
+			customInstructions: "Keep the branch concise.",
+			allowAskReopen: true,
+			reanswerAskResult: undefined,
+		});
+	});
+
+	test("reserves join before relay startup so every concurrent transition reports session_busy", async () => {
+		const startupGate = Promise.withResolvers<void>();
+		const commandsDispatched = Promise.withResolvers<void>();
+		const fixture = createRpcModeSession();
+		fixture.newSession.mockResolvedValueOnce(false);
+		fixture.switchSession.mockResolvedValueOnce(false);
+		vi.spyOn(CollabGuestLink.prototype, "join").mockImplementation(async () => {
+			await startupGate.promise;
+		});
+		const frames = captureRpcFrames(frame => {
+			if (frame.type === "response" && frame.id === "after-transitions") commandsDispatched.resolve();
+		});
+		const commands = [
+			{ id: "join-first", type: "join_collab_session", link: "wss://relay.invalid/first" },
+			{ id: "join-second", type: "join_collab_session", link: "wss://relay.invalid/second" },
+			{ id: "new", type: "new_session" },
+			{ id: "switch", type: "switch_session", sessionPath: "C:/tmp/next.jsonl" },
+			{ id: "after-transitions", type: "get_collab_status" },
+		] satisfies RpcCommand[];
+
+		const running = runRpcMode(fixture.session, undefined, undefined, rpcInput(commands));
+		await commandsDispatched.promise;
+		startupGate.resolve();
+		await running;
+
+		for (const id of ["join-second", "new", "switch"]) {
+			expect(observedResponse(frames, id)).toMatchObject({
+				success: false,
+				code: "session_busy",
+			});
+		}
+		expect(observedResponse(frames, "join-first")).toMatchObject({ success: true });
+		expect(fixture.newSession).not.toHaveBeenCalled();
+		expect(fixture.switchSession).not.toHaveBeenCalled();
+	});
+
+	test("releases a cancelled join lease and closes guest ownership before retry", async () => {
+		const firstFailed = Promise.withResolvers<void>();
+		const failure = new Error("Join cancelled before welcome");
+		const join = vi.spyOn(CollabGuestLink.prototype, "join").mockRejectedValueOnce(failure).mockResolvedValueOnce();
+		const leave = vi.spyOn(CollabGuestLink.prototype, "leave").mockResolvedValue();
+		const fixture = createRpcModeSession();
+		const frames = captureRpcFrames(frame => {
+			if (frame.type === "response" && frame.id === "join-cancelled") firstFailed.resolve();
+		});
+		const encoder = new TextEncoder();
+		let sentFirst = false;
+		let sentRetry = false;
+		const input = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (!sentFirst) {
+					sentFirst = true;
+					controller.enqueue(
+						encoder.encode(
+							`${JSON.stringify({
+								id: "join-cancelled",
+								type: "join_collab_session",
+								link: "wss://relay.invalid/cancelled",
+							})}\n`,
+						),
+					);
+					return;
+				}
+				if (!sentRetry) {
+					await firstFailed.promise;
+					sentRetry = true;
+					controller.enqueue(
+						encoder.encode(
+							`${JSON.stringify({
+								id: "join-retry",
+								type: "join_collab_session",
+								link: "wss://relay.invalid/retry",
+							})}\n`,
+						),
+					);
+				}
+				controller.close();
+			},
+		});
+
+		await runRpcMode(fixture.session, undefined, undefined, input);
+
+		expect(observedResponse(frames, "join-cancelled")).toMatchObject({
+			success: false,
+			code: "operation_failed",
+		});
+		expect(observedResponse(frames, "join-retry")).toMatchObject({ success: true });
+		expect(join).toHaveBeenCalledTimes(2);
+		expect(leave).toHaveBeenCalledTimes(1);
+		expect(leave).toHaveBeenCalledWith("join failed");
+	});
+
+	test("routes extension transitions through the canonical runner and rolls back cancelled source modes", async () => {
+		let commandActions: ExtensionCommandContextActions | undefined;
+		const extensionRunner = {
+			initialize: (...args: unknown[]) => {
+				commandActions = args[2] as ExtensionCommandContextActions;
+			},
+			onError: () => {},
+			emit: async () => {},
+		} as unknown as ExtensionRunner;
+		const transitionOptions: SessionTransitionOptions = { onCommitted: () => {} };
+		const runnerOptions: (SessionTransitionRunOptions | undefined)[] = [];
+		let sourceMode = "plan";
+		const runSessionTransition: SessionTransitionRunner = async (transition, options) => {
+			runnerOptions.push(options);
+			const previousMode = sourceMode;
+			sourceMode = "none";
+			const outcome = await transition(transitionOptions);
+			if (!outcome.committed) sourceMode = previousMode;
+			return outcome.result;
+		};
+		const setup = vi.fn(async () => {});
+		const newSession = vi.fn(async () => false);
+		const branch = vi.fn(async () => ({ cancelled: true }));
+		const navigateTree = vi.fn(async () => ({ cancelled: true }));
+		const switchSession = vi.fn(async () => false);
+		const sessionManager = { getLeafId: () => "source-leaf" };
+		const session = {
+			extensionRunner,
+			runSessionTransition,
+			newSession,
+			branch,
+			navigateTree,
+			switchSession,
+			sessionFile: "C:/tmp/source.jsonl",
+			sessionManager,
+			agent: { waitForIdle: async () => {} },
+		} as unknown as AgentSession;
+		await initializeExtensions(session, {
+			reportSendError: () => {},
+			reportRuntimeError: () => {},
+		});
+		const actions = commandActions;
+		if (!actions) throw new Error("Extension command actions were not installed");
+
+		const results = [
+			await actions.newSession({ parentSession: "C:/tmp/parent.jsonl", setup }),
+			await actions.branch("branch-entry"),
+			await actions.navigateTree("tree-target", { summarize: true }),
+			await actions.switchSession("C:/tmp/source.jsonl"),
+		];
+
+		expect(results).toEqual([{ cancelled: true }, { cancelled: true }, { cancelled: true }, { cancelled: true }]);
+		expect(runnerOptions).toEqual([
+			{ honorPlanDefaultOnCommit: true },
+			undefined,
+			undefined,
+			{ preserveCurrentSessionOnSuccess: true },
+		]);
+		expect(newSession).toHaveBeenCalledWith({
+			parentSession: "C:/tmp/parent.jsonl",
+			...transitionOptions,
+		});
+		expect(branch).toHaveBeenCalledWith("branch-entry", transitionOptions);
+		expect(navigateTree).toHaveBeenCalledWith("tree-target", { summarize: true }, transitionOptions);
+		expect(switchSession).toHaveBeenCalledWith("C:/tmp/source.jsonl", transitionOptions);
+		expect(setup).not.toHaveBeenCalled();
+		expect(sourceMode).toBe("plan");
+	});
+
+	test("routes branch_btw through the canonical runner and preserves the source mode on cancellation", async () => {
+		const transitionOptions: SessionTransitionOptions = { onCommitted: () => {} };
+		const runnerOptions: (SessionTransitionRunOptions | undefined)[] = [];
+		let sourceMode = "goal";
+		const runSessionTransition: SessionTransitionRunner = async (transition, options) => {
+			runnerOptions.push(options);
+			const previousMode = sourceMode;
+			sourceMode = "none";
+			const outcome = await transition(transitionOptions);
+			if (!outcome.committed) sourceMode = previousMode;
+			return outcome.result;
+		};
+		const assistantMessage = btwAssistant();
+		const runEphemeralTurn = vi.fn(
+			async (args: { promptText: string; onTextDelta?: (delta: string) => void; signal?: AbortSignal }) => {
+				args.onTextDelta?.("Side answer");
+				return { replyText: "Side answer", assistantMessage };
+			},
+		);
+		const branchFromBtw = vi.fn(async () => ({
+			cancelled: true,
+			sessionFile: "C:/tmp/source.jsonl",
+		}));
+		const session = {
+			model: {},
+			sessionManager: { getLeafId: () => "source-leaf" },
+			runEphemeralTurn,
+			runSessionTransition,
+			branchFromBtw,
+		} as unknown as AgentSession;
+
+		await askRpcBtw(session, "Why?", () => {});
+		const result = await branchRpcBtw(session);
+
+		expect(result).toEqual({
+			branched: false,
+			cancelled: true,
+			sessionFile: "C:/tmp/source.jsonl",
+		});
+		expect(runnerOptions).toEqual([undefined]);
+		expect(branchFromBtw).toHaveBeenCalledWith(
+			"Why?",
+			expect.objectContaining({
+				content: [{ type: "text", text: "Side answer" }],
+			}),
+			transitionOptions,
+		);
+		expect(sourceMode).toBe("goal");
+		await cancelRpcBtw(session);
+	});
+});
+
+describe("RPC subagent registry", () => {
 	test("defaults subagent frame emission to off while tracking snapshots", () => {
 		const eventBus = new EventBus();
 		const frames: RpcSubagentFrame[] = [];

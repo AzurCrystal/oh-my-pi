@@ -100,6 +100,8 @@ from .protocol import (
     _serialize_extension_ask_dialog_result,
 )
 
+_USE_DEFAULT_REQUEST_TIMEOUT = object()
+
 AgentEventListener = Callable[[RpcAgentEvent], None]
 NotificationListener = Callable[[RpcNotification], None]
 UiRequestListener = Callable[[ExtensionUiRequest], None]
@@ -420,11 +422,13 @@ class _PendingRequest:
     command: str
     response_queue: queue.Queue[JsonObject | BaseException]
 
+
 @dataclass(slots=True)
 class _AgentRunReservation:
     prompt_count: int = 0
     started: bool = False
     hold_for_start: bool = False
+    request_id: str | None = None
     completed: bool = False
 
 
@@ -439,7 +443,6 @@ class _PendingPromptOutcome:
     terminal_received: bool = False
     reservation: _AgentRunReservation | None = None
     completed: bool = False
-
 
 
 @dataclass(slots=True)
@@ -571,6 +574,7 @@ class RpcClient:
         self._event_condition = threading.Condition()
         self._ready = threading.Event()
         self._pending: dict[str, _PendingRequest] = {}
+        self._expired_request_ids: set[str] = set()
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
         self._host_tool_dispatch_names: dict[str, str] = {}
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
@@ -601,9 +605,9 @@ class RpcClient:
             _DEFAULT_ERROR_HISTORY_LIMIT
         )
         self._prompt_lifecycle = _PromptLifecycleCoordinator()
-        self._listener_dispatch_queue: queue.Queue[
-            Callable[[], None] | None
-        ] | None = None
+        self._listener_dispatch_queue: queue.Queue[Callable[[], None] | None] | None = (
+            None
+        )
         self._listener_dispatch_cancel: threading.Event | None = None
 
         self._notification_listeners: list[NotificationListener] = []
@@ -692,6 +696,7 @@ class RpcClient:
         with self._state_lock:
             self._protocol_errors.clear()
             self._listener_errors.clear()
+            self._expired_request_ids.clear()
 
         process = subprocess.Popen(
             list(self._build_command()),
@@ -712,9 +717,7 @@ class RpcClient:
         self._process = process
         self._pgid = _process_group_id(process)
 
-        listener_dispatch_queue: queue.Queue[Callable[[], None] | None] = (
-            queue.Queue()
-        )
+        listener_dispatch_queue: queue.Queue[Callable[[], None] | None] = queue.Queue()
         listener_dispatch_cancel = threading.Event()
         listener_dispatch_thread = threading.Thread(
             target=self._read_listener_dispatch_loop,
@@ -954,7 +957,9 @@ class RpcClient:
         self._idle_recap_listeners.append(listener)
         return lambda: self._remove_listener(self._idle_recap_listeners, listener)
 
-    def on_settings_update(self, listener: SettingsUpdateListener) -> Callable[[], None]:
+    def on_settings_update(
+        self, listener: SettingsUpdateListener
+    ) -> Callable[[], None]:
         self._settings_update_listeners.append(listener)
         return lambda: self._remove_listener(self._settings_update_listeners, listener)
 
@@ -975,7 +980,6 @@ class RpcClient:
     ) -> Callable[[], None]:
         self._ttsr_generation_listeners.append(listener)
         return lambda: self._remove_listener(self._ttsr_generation_listeners, listener)
-
 
     def on_mcp_auth_challenge(
         self, listener: McpAuthChallengeListener
@@ -1001,13 +1005,17 @@ class RpcClient:
         self, listener: SubagentLifecycleListener
     ) -> Callable[[], None]:
         self._subagent_lifecycle_listeners.append(listener)
-        return lambda: self._remove_listener(self._subagent_lifecycle_listeners, listener)
+        return lambda: self._remove_listener(
+            self._subagent_lifecycle_listeners, listener
+        )
 
     def on_subagent_progress(
         self, listener: SubagentProgressListener
     ) -> Callable[[], None]:
         self._subagent_progress_listeners.append(listener)
-        return lambda: self._remove_listener(self._subagent_progress_listeners, listener)
+        return lambda: self._remove_listener(
+            self._subagent_progress_listeners, listener
+        )
 
     def on_subagent_event(self, listener: SubagentEventListener) -> Callable[[], None]:
         self._subagent_event_listeners.append(listener)
@@ -1130,9 +1138,7 @@ class RpcClient:
     def negotiate_protocol(self, protocol_version: int) -> JsonObject:
         return self._request("negotiate_protocol", protocolVersion=protocol_version)
 
-    def complete(
-        self, lines: Sequence[str], cursor: Mapping[str, int]
-    ) -> JsonObject:
+    def complete(self, lines: Sequence[str], cursor: Mapping[str, int]) -> JsonObject:
         return self._request(
             "complete",
             lines=cast(JsonValue, list(lines)),
@@ -1277,12 +1283,8 @@ class RpcClient:
     def get_goal_state(self) -> JsonObject:
         return self._request("get_goal_state")
 
-    def begin_guided_goal(
-        self, initial_objective: str | None = None
-    ) -> JsonObject:
-        return self._request(
-            "begin_guided_goal", initialObjective=initial_objective
-        )
+    def begin_guided_goal(self, initial_objective: str | None = None) -> JsonObject:
+        return self._request("begin_guided_goal", initialObjective=initial_objective)
 
     def enter_vibe_mode(self) -> JsonObject:
         return self._request("enter_vibe_mode")
@@ -1453,9 +1455,7 @@ class RpcClient:
     def get_mental_models(self, detail: str) -> JsonObject:
         return self._request("get_mental_models", detail=detail)
 
-    def get_mental_model(
-        self, mental_model_id: str, detail: str
-    ) -> JsonObject | None:
+    def get_mental_model(self, mental_model_id: str, detail: str) -> JsonObject | None:
         return self._request_nullable(
             "get_mental_model", mentalModelId=mental_model_id, detail=detail
         )
@@ -1485,16 +1485,12 @@ class RpcClient:
         )
 
     def refresh_mental_model(self, mental_model_id: str) -> JsonObject:
-        return self._request(
-            "refresh_mental_model", mentalModelId=mental_model_id
-        )
+        return self._request("refresh_mental_model", mentalModelId=mental_model_id)
 
     def refresh_auto_mental_models(self) -> JsonObject:
         return self._request("refresh_auto_mental_models")
 
-    def get_mental_model_history(
-        self, mental_model_id: str
-    ) -> JsonObject | None:
+    def get_mental_model_history(self, mental_model_id: str) -> JsonObject | None:
         return self._request_nullable(
             "get_mental_model_history", mentalModelId=mental_model_id
         )
@@ -1503,9 +1499,7 @@ class RpcClient:
         return self._request("seed_mental_models")
 
     def delete_mental_model(self, mental_model_id: str) -> JsonObject:
-        return self._request(
-            "delete_mental_model", mentalModelId=mental_model_id
-        )
+        return self._request("delete_mental_model", mentalModelId=mental_model_id)
 
     def reload_mental_models(self) -> JsonObject:
         return self._request("reload_mental_models")
@@ -1546,9 +1540,7 @@ class RpcClient:
             ephemeral=ephemeral,
         )
 
-    def cycle_model(
-        self, direction: str | None = None
-    ) -> ModelCycleResult | None:
+    def cycle_model(self, direction: str | None = None) -> ModelCycleResult | None:
         return parse_model_cycle_result(
             self._request("cycle_model", direction=direction)
         )
@@ -1571,9 +1563,7 @@ class RpcClient:
         return self._request("get_model_roles")
 
     def set_model_role(self, role: str, model: str, scope: str) -> JsonObject:
-        return self._request(
-            "set_model_role", role=role, model=model, scope=scope
-        )
+        return self._request("set_model_role", role=role, model=model, scope=scope)
 
     def clear_model_role(self, role: str, scope: str) -> JsonObject:
         return self._request("clear_model_role", role=role, scope=scope)
@@ -1625,9 +1615,12 @@ class RpcClient:
         exclude_from_context: bool | None = None,
         use_user_shell: bool | None = None,
         follow_cwd: bool | None = None,
+        response_timeout: float | None = None,
     ) -> BashResult:
+        """Execute bash, waiting up to response_timeout seconds when provided."""
         payload = self._request(
             "bash",
+            _client_response_timeout=response_timeout,
             command=command,
             excludeFromContext=exclude_from_context,
             useUserShell=use_user_shell,
@@ -1639,11 +1632,19 @@ class RpcClient:
         self._request("abort_bash")
 
     def python(
-        self, code: str, *, exclude_from_context: bool | None = None
+        self,
+        code: str,
+        *,
+        exclude_from_context: bool | None = None,
+        response_timeout: float | None = None,
     ) -> PythonResult:
+        """Execute Python, waiting up to response_timeout seconds when provided."""
         return parse_python_result(
             self._request(
-                "python", code=code, excludeFromContext=exclude_from_context
+                "python",
+                _client_response_timeout=response_timeout,
+                code=code,
+                excludeFromContext=exclude_from_context,
             )
         )
 
@@ -1688,7 +1689,6 @@ class RpcClient:
 
     def get_todos(self) -> tuple[TodoPhase, ...]:
         return self.get_state().todo_phases
-
 
     def get_sessions(
         self,
@@ -1753,9 +1753,7 @@ class RpcClient:
         return self._request("generate_title", text=text)
 
     def handoff(self, custom_instructions: str | None = None) -> JsonObject | None:
-        return self._request_nullable(
-            "handoff", customInstructions=custom_instructions
-        )
+        return self._request_nullable("handoff", customInstructions=custom_instructions)
 
     def set_todos(
         self, todos: Sequence[TodoSeed | TodoPhaseSeed]
@@ -1795,9 +1793,7 @@ class RpcClient:
             "logout", providerId=provider_id, credentialId=credential_id
         )
 
-    def remove_login_account(
-        self, provider_id: str, credential_id: int
-    ) -> JsonObject:
+    def remove_login_account(self, provider_id: str, credential_id: int) -> JsonObject:
         return self._request(
             "remove_login_account", providerId=provider_id, credentialId=credential_id
         )
@@ -1806,9 +1802,7 @@ class RpcClient:
         """Destructively remove every stored credential for one provider."""
         return self._request("remove_provider_credentials", providerId=provider_id)
 
-    def mcp_add_server(
-        self, name: str, config: JsonObject, scope: str
-    ) -> JsonObject:
+    def mcp_add_server(self, name: str, config: JsonObject, scope: str) -> JsonObject:
         return self._request(
             "mcp_add_server", name=name, config=cast(JsonValue, config), scope=scope
         )
@@ -1875,7 +1869,6 @@ class RpcClient:
             name=name,
             values=cast(JsonValue, dict(values)),
         )
-
 
     def start_cpu_profile(self) -> None:
         self._request("start_cpu_profile")
@@ -2148,11 +2141,7 @@ class RpcClient:
     def follow_up(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "follow_up",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
+        self._request_agent_run("follow_up", message, images=images)
 
     def abort(self) -> None:
         self._request("abort")
@@ -2160,12 +2149,7 @@ class RpcClient:
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "abort_and_prompt",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
-        self._mark_agent_run_scheduled()
+        self._request_agent_run("abort_and_prompt", message, images=images)
 
     def ask_btw(self, question: str) -> JsonObject:
         return self._request("ask_btw", question=question)
@@ -2213,12 +2197,16 @@ class RpcClient:
                     start_async_error_index,
                     deadline=deadline,
                 )
-            if not agent_invoked or not self._prompt_has_agent_lifecycle(request_id):
+            if not agent_invoked:
+                return self._build_prompt_turn(())
+            reservation = self._prompt_agent_run_reservation(request_id)
+            if reservation is None:
                 return self._build_prompt_turn(())
             events = self._wait_for_agent_end(
                 start_index,
                 start_async_error_index,
                 timeout=max(0.0, deadline - time.monotonic()),
+                reservation=reservation,
             )
             return self._build_prompt_turn(events)
         finally:
@@ -2230,11 +2218,9 @@ class RpcClient:
         operation = "wait_for_idle"
         self._prompt_lifecycle.acquire(operation)
         try:
-            if self._is_agent_idle():
-                self._check_async_errors()
-                return
-            start_index = self._current_event_index()
-            start_async_error_index = self._current_async_error_index()
+            with self._event_condition:
+                start_index = self._events.current_index()
+                start_async_error_index = self._last_schedule_async_error_index
             self._wait_for_agent_end(
                 start_index,
                 start_async_error_index,
@@ -2286,7 +2272,7 @@ class RpcClient:
                 streaming_behavior=streaming_behavior,
             )
             self._pending_prompt_outcomes[request_id] = outcome
-            self._schedule_prompt_outcome(outcome)
+            self._schedule_prompt_outcome(request_id, outcome)
         try:
             data = self._request_payload(
                 "prompt",
@@ -2384,9 +2370,7 @@ class RpcClient:
                         "Increase max_event_history if your host needs to retain more background failures."
                     )
 
-                async_errors = self._async_errors.snapshot_from(
-                    start_async_error_index
-                )
+                async_errors = self._async_errors.snapshot_from(start_async_error_index)
                 if async_errors:
                     raise async_errors[0]
 
@@ -2413,7 +2397,9 @@ class RpcClient:
                 self._complete_prompt_outcome(outcome)
                 self._pending_prompt_outcomes.pop(request_id, None)
 
-    def _schedule_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
+    def _schedule_prompt_outcome(
+        self, request_id: str, outcome: _PendingPromptOutcome
+    ) -> None:
         if outcome.reservation is not None:
             return
         reservation: _AgentRunReservation | None = None
@@ -2436,12 +2422,7 @@ class RpcClient:
                     None,
                 )
         if reservation is None:
-            reservation = _AgentRunReservation()
-            self._agent_run_reservations.append(reservation)
-            self._scheduled_agent_runs += 1
-            self._last_schedule_async_error_index = (
-                self._async_errors.current_index()
-            )
+            reservation = self._reserve_agent_run_locked(request_id=request_id)
         reservation.prompt_count += 1
         outcome.reservation = reservation
 
@@ -2460,6 +2441,26 @@ class RpcClient:
                 self._complete_agent_run_reservation(reservation)
         self._event_condition.notify_all()
 
+    def _reserve_agent_run(
+        self, *, request_id: str | None = None, hold_for_start: bool = False
+    ) -> _AgentRunReservation:
+        with self._event_condition:
+            reservation = self._reserve_agent_run_locked(
+                request_id=request_id, hold_for_start=hold_for_start
+            )
+            self._event_condition.notify_all()
+            return reservation
+
+    def _reserve_agent_run_locked(
+        self, *, request_id: str | None = None, hold_for_start: bool = False
+    ) -> _AgentRunReservation:
+        reservation = _AgentRunReservation(
+            hold_for_start=hold_for_start, request_id=request_id
+        )
+        self._agent_run_reservations.append(reservation)
+        self._scheduled_agent_runs += 1
+        return reservation
+
     def _complete_agent_run_reservation(
         self, reservation: _AgentRunReservation
     ) -> None:
@@ -2473,17 +2474,16 @@ class RpcClient:
         if self._completed_agent_runs < self._scheduled_agent_runs:
             self._completed_agent_runs += 1
 
-    def _prompt_has_agent_lifecycle(self, request_id: str) -> bool:
+    def _prompt_agent_run_reservation(
+        self, request_id: str
+    ) -> _AgentRunReservation | None:
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(request_id)
-            reservation = outcome.reservation if outcome is not None else None
-            return reservation is not None and (
-                reservation.started or reservation.hold_for_start
-            )
+            return outcome.reservation if outcome is not None else None
 
-    def _handle_prompt_agent_lifecycle(self, event_type: str) -> None:
+    def _handle_prompt_agent_lifecycle(self, event: RpcAgentEvent) -> None:
         with self._event_condition:
-            if event_type == "agent_start":
+            if isinstance(event, AgentStartEvent):
                 reservation = next(
                     (
                         candidate
@@ -2493,53 +2493,69 @@ class RpcClient:
                     None,
                 )
                 if reservation is None:
-                    reservation = _AgentRunReservation()
-                    self._agent_run_reservations.append(reservation)
-                    self._scheduled_agent_runs += 1
-                    self._last_schedule_async_error_index = (
-                        self._async_errors.current_index()
-                    )
+                    reservation = self._reserve_agent_run_locked()
                 reservation.started = True
+                reservation.hold_for_start = False
                 self._active_agent_runs += 1
-            elif self._active_agent_runs > 0:
-                self._active_agent_runs -= 1
-            self._event_condition.notify_all()
-
-    def _mark_agent_run_scheduled(self) -> None:
-        with self._event_condition:
-            self._agent_run_reservations.append(
-                _AgentRunReservation(hold_for_start=True)
-            )
-            self._scheduled_agent_runs += 1
-            self._last_schedule_async_error_index = (
-                self._async_errors.current_index()
-            )
-
-    def _mark_agent_run_completed(self) -> None:
-        with self._event_condition:
-            reservation = next(
-                (
-                    candidate
-                    for candidate in self._agent_run_reservations
-                    if candidate.started and not candidate.completed
-                ),
-                None,
-            )
-            if reservation is None:
+            elif isinstance(event, AgentEndEvent):
                 reservation = next(
                     (
                         candidate
                         for candidate in self._agent_run_reservations
-                        if not candidate.completed
+                        if candidate.started and not candidate.completed
                     ),
                     None,
                 )
-            if reservation is None:
-                reservation = _AgentRunReservation(started=True)
-                self._agent_run_reservations.append(reservation)
-                self._scheduled_agent_runs += 1
-            self._complete_agent_run_reservation(reservation)
+                if self._active_agent_runs > 0:
+                    self._active_agent_runs -= 1
+                if event.is_terminal is False:
+                    if reservation is not None:
+                        reservation.started = False
+                        reservation.hold_for_start = True
+                else:
+                    if reservation is None:
+                        reservation = next(
+                            (
+                                candidate
+                                for candidate in self._agent_run_reservations
+                                if not candidate.completed
+                            ),
+                            None,
+                        )
+                    if reservation is None:
+                        reservation = self._reserve_agent_run_locked()
+                    self._complete_agent_run_reservation(reservation)
             self._event_condition.notify_all()
+
+    def _request_agent_run(
+        self,
+        command_type: str,
+        message: str,
+        *,
+        images: Sequence[ImageContent] | None,
+    ) -> None:
+        request_id = self._next_request_id()
+        reservation = self._reserve_agent_run(
+            request_id=request_id, hold_for_start=True
+        )
+        try:
+            self._request_payload(
+                command_type,
+                {
+                    "message": message,
+                    **(
+                        {"images": cast(JsonValue, list(images))}
+                        if images is not None
+                        else {}
+                    ),
+                },
+                request_id=request_id,
+            )
+        except BaseException:
+            with self._event_condition:
+                self._complete_agent_run_reservation(reservation)
+                self._event_condition.notify_all()
+            raise
 
     def _is_agent_idle(self) -> bool:
         with self._event_condition:
@@ -2550,8 +2566,13 @@ class RpcClient:
             errors = self._async_errors.snapshot_from(
                 self._last_schedule_async_error_index
             )
-        if errors:
-            raise errors[0]
+            if errors:
+                self._last_schedule_async_error_index += 1
+                error = errors[0]
+            else:
+                error = None
+        if error is not None:
+            raise error
 
     def _build_prompt_turn(self, events: tuple[RpcAgentEvent, ...]) -> PromptTurn:
         final_messages: tuple[AgentMessage, ...] = ()
@@ -2622,6 +2643,7 @@ class RpcClient:
         timeout: float | None = None,
         *,
         stop_when_idle: bool = False,
+        reservation: _AgentRunReservation | None = None,
     ) -> tuple[RpcAgentEvent, ...]:
         deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
         with self._event_condition:
@@ -2643,23 +2665,33 @@ class RpcClient:
 
                 async_errors = self._async_errors.snapshot_from(start_async_error_index)
                 if async_errors:
+                    self._last_schedule_async_error_index = max(
+                        self._last_schedule_async_error_index,
+                        start_async_error_index + 1,
+                    )
                     raise async_errors[0]
 
                 event_payloads = self._events.snapshot_from(start_index)
+                parsed_events = tuple(
+                    cast(RpcAgentEvent, parse_notification(payload))
+                    for payload in event_payloads
+                )
+                if reservation is not None and reservation.completed:
+                    return parsed_events
                 if stop_when_idle and (
                     self._scheduled_agent_runs == self._completed_agent_runs
                 ):
-                    return tuple(
-                        cast(RpcAgentEvent, parse_notification(payload))
+                    return parsed_events
+                if (
+                    reservation is None
+                    and not stop_when_idle
+                    and any(
+                        payload.get("type") == "agent_end"
+                        and payload.get("isTerminal") is not False
                         for payload in event_payloads
                     )
-                if any(
-                    payload.get("type") == "agent_end" for payload in event_payloads
                 ):
-                    return tuple(
-                        cast(RpcAgentEvent, parse_notification(payload))
-                        for payload in event_payloads
-                    )
+                    return parsed_events
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2668,15 +2700,28 @@ class RpcClient:
                     )
                 self._event_condition.wait(remaining)
 
-    def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
-        response = self._request_payload(
-            command_type, {key: value for key, value in payload.items() if value is not None}
+    def _request(
+        self,
+        command_type: str,
+        *,
+        _client_response_timeout: float | None | object = _USE_DEFAULT_REQUEST_TIMEOUT,
+        **payload: JsonValue,
+    ) -> JsonObject:
+        request_payload = {
+            key: value for key, value in payload.items() if value is not None
+        }
+        response = (
+            self._request_payload(command_type, request_payload)
+            if _client_response_timeout is _USE_DEFAULT_REQUEST_TIMEOUT
+            else self._request_payload(
+                command_type,
+                request_payload,
+                client_response_timeout=_client_response_timeout,
+            )
         )
         return response if response is not None else {}
 
-    def _request_with_nulls(
-        self, command_type: str, payload: JsonObject
-    ) -> JsonObject:
+    def _request_with_nulls(self, command_type: str, payload: JsonObject) -> JsonObject:
         response = self._request_payload(command_type, payload)
         return response if response is not None else {}
 
@@ -2684,7 +2729,8 @@ class RpcClient:
         self, command_type: str, **payload: JsonValue
     ) -> JsonObject | None:
         return self._request_payload(
-            command_type, {key: value for key, value in payload.items() if value is not None}
+            command_type,
+            {key: value for key, value in payload.items() if value is not None},
         )
 
     def _request_nullable_with_nulls(
@@ -2697,7 +2743,11 @@ class RpcClient:
             return
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(event.id)
-            if outcome is None or outcome.error is not None or outcome.terminal_received:
+            if (
+                outcome is None
+                or outcome.error is not None
+                or outcome.terminal_received
+            ):
                 return
             outcome.result = event.agent_invoked
             outcome.terminal_received = True
@@ -2712,13 +2762,13 @@ class RpcClient:
                 self._pending_prompt_outcomes.pop(event.id, None)
             self._event_condition.notify_all()
 
-
     def _request_payload(
         self,
         command_type: str,
         payload: JsonObject,
         *,
         request_id: str | None = None,
+        client_response_timeout: float | None | object = _USE_DEFAULT_REQUEST_TIMEOUT,
     ) -> JsonObject | None:
         process = self._require_process()
         request_id = request_id or self._next_request_id()
@@ -2738,11 +2788,17 @@ class RpcClient:
                 self._pending.pop(request_id, None)
             raise
 
+        response_timeout = (
+            self._request_timeout
+            if client_response_timeout is _USE_DEFAULT_REQUEST_TIMEOUT
+            else cast(float | None, client_response_timeout)
+        )
         try:
-            response = response_queue.get(timeout=self._request_timeout)
+            response = response_queue.get(timeout=response_timeout)
         except queue.Empty as exc:
             with self._state_lock:
-                self._pending.pop(request_id, None)
+                if self._pending.pop(request_id, None) is not None:
+                    self._expired_request_ids.add(request_id)
             raise RpcTimeoutError(
                 f"Timed out waiting for response to {command_type}. Stderr: {self.stderr}"
             ) from exc
@@ -3277,10 +3333,8 @@ class RpcClient:
                 ):
                     listener_event = cast(RpcAgentEvent, notification)
                     self._append_event(payload)
-                    if listener_event.type in ("agent_start", "agent_end"):
-                        self._handle_prompt_agent_lifecycle(listener_event.type)
-                    if listener_event.type == "agent_end":
-                        self._mark_agent_run_completed()
+                    if isinstance(listener_event, (AgentStartEvent, AgentEndEvent)):
+                        self._handle_prompt_agent_lifecycle(listener_event)
 
                 listener_notification = notification
                 self._dispatch_listeners(
@@ -3522,6 +3576,7 @@ class RpcClient:
         with self._state_lock:
             pending = [pending.response_queue for pending in self._pending.values()]
             self._pending.clear()
+            self._expired_request_ids.clear()
         for response_queue in pending:
             response_queue.put(error)
 
@@ -3529,6 +3584,9 @@ class RpcClient:
         request_id = payload.get("id")
         if isinstance(request_id, str):
             with self._state_lock:
+                if request_id in self._expired_request_ids:
+                    self._expired_request_ids.remove(request_id)
+                    return
                 pending = self._pending.pop(request_id, None)
             if pending is not None:
                 pending.response_queue.put(payload)
@@ -3545,10 +3603,14 @@ class RpcClient:
             protocol_error.command in _ASYNC_COMMANDS
             and protocol_error.remote_error is not None
         ):
+            raw_code = payload.get("code")
             command_error = RpcCommandError(
-                protocol_error.command, protocol_error.remote_error
+                protocol_error.command,
+                protocol_error.remote_error,
+                raw_code if isinstance(raw_code, str) else None,
             )
-            consumed_by_prompt = False
+            handled = False
+            surface_async = False
             if (
                 protocol_error.command == "prompt"
                 and protocol_error.request_id is not None
@@ -3558,21 +3620,41 @@ class RpcClient:
                         protocol_error.request_id
                     )
                     if outcome is not None:
+                        handled = True
                         if outcome.error is None:
                             outcome.error = command_error
                             self._complete_prompt_outcome(outcome)
-                        consumed_by_prompt = (
-                            not outcome.acknowledged or outcome.retain_result
+                        surface_async = (
+                            outcome.acknowledged and not outcome.retain_result
                         )
-                        if outcome.acknowledged and not outcome.retain_result:
+                        if surface_async:
                             self._pending_prompt_outcomes.pop(
                                 protocol_error.request_id, None
                             )
                         self._event_condition.notify_all()
-            elif protocol_error.command == "abort_and_prompt":
-                self._mark_agent_run_completed()
-            if not consumed_by_prompt:
-                self._append_async_error(command_error)
+            elif (
+                protocol_error.command == "abort_and_prompt"
+                and protocol_error.request_id is not None
+            ):
+                with self._event_condition:
+                    reservation = next(
+                        (
+                            candidate
+                            for candidate in self._agent_run_reservations
+                            if candidate.request_id == protocol_error.request_id
+                            and not candidate.completed
+                        ),
+                        None,
+                    )
+                    if reservation is not None:
+                        handled = True
+                        surface_async = True
+                        self._complete_agent_run_reservation(reservation)
+                        self._event_condition.notify_all()
+            if handled:
+                if surface_async:
+                    self._append_async_error(command_error)
+                return
 
         self._record_protocol_error(protocol_error)
 

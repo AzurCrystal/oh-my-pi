@@ -12,9 +12,15 @@ const IDLE_RECAP_MAX_SECONDS = 3600;
 /** Receives an idle recap after it remains valid through the ephemeral turn. */
 export type RpcIdleRecapSink = (recap: string) => void;
 
+/** Reversible idle behavior pause used during session transition preparation. */
+export interface RpcIdleBehaviorSuspension {
+	commit(): void;
+	rollback(): void;
+}
 /** Stateful RPC idle behaviors. Call {@link dispose} during RPC teardown. */
 export interface RpcIdleBehavior {
 	handleSessionEvent(event: AgentSessionEvent): void;
+	suspend(): RpcIdleBehaviorSuspension;
 	dispose(): void;
 }
 
@@ -33,6 +39,7 @@ export function installRpcIdleBehavior(
 	onRecap: RpcIdleRecapSink,
 ): RpcIdleBehavior {
 	let disposed = false;
+	let suspended = false;
 	let idleCompactionTimer: NodeJS.Timeout | undefined;
 	let idleRecapTimer: NodeJS.Timeout | undefined;
 	let idleRecapAbort: AbortController | undefined;
@@ -56,7 +63,7 @@ export function installRpcIdleBehavior(
 	};
 
 	const idleConditionsHold = (): boolean =>
-		!disposed && !session.isDisposed && !session.isStreaming && !session.isCompacting;
+		!disposed && !suspended && !session.isDisposed && !session.isStreaming && !session.isCompacting;
 
 	const currentContextTokens = (): number => session.getContextUsage()?.tokens ?? 0;
 
@@ -92,7 +99,7 @@ export function installRpcIdleBehavior(
 
 	const scheduleIdleCompaction = (): void => {
 		cancelIdleCompaction();
-		if (disposed || session.isDisposed || session.isCompacting) return;
+		if (disposed || suspended || session.isDisposed || session.isCompacting) return;
 
 		const idleSettings = session.settings.getGroup("compaction");
 		if (!idleSettings.idleEnabled) return;
@@ -111,7 +118,7 @@ export function installRpcIdleBehavior(
 
 	const scheduleIdleRecap = (): void => {
 		cancelIdleRecap();
-		if (disposed || session.isDisposed || session.isCompacting) return;
+		if (disposed || suspended || session.isDisposed || session.isCompacting) return;
 
 		const recapSettings = session.settings.getGroup("recap");
 		if (!recapSettings.enabled) return;
@@ -160,7 +167,7 @@ export function installRpcIdleBehavior(
 
 	return {
 		handleSessionEvent(event: AgentSessionEvent): void {
-			if (disposed || session.isDisposed) return;
+			if (disposed || suspended || session.isDisposed) return;
 			switch (event.type) {
 				case "agent_start":
 					cancelIdleCompaction();
@@ -177,6 +184,27 @@ export function installRpcIdleBehavior(
 					cancelIdleRecap();
 					break;
 			}
+		},
+		suspend(): RpcIdleBehaviorSuspension {
+			if (suspended) throw new Error("RPC idle behavior is already suspended.");
+			const restoreCompactionTimer = idleCompactionTimer !== undefined;
+			const restoreRecapTimer = idleRecapTimer !== undefined || idleRecapAbort !== undefined;
+			suspended = true;
+			cancelIdleCompaction();
+			cancelIdleRecap();
+			let settled = false;
+			return {
+				commit: () => {
+					settled = true;
+				},
+				rollback: () => {
+					if (settled) return;
+					settled = true;
+					suspended = false;
+					if (restoreCompactionTimer) scheduleIdleCompaction();
+					if (restoreRecapTimer) scheduleIdleRecap();
+				},
+			};
 		},
 		dispose(): void {
 			if (disposed) return;

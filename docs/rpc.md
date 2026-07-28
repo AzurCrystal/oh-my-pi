@@ -77,7 +77,7 @@ The table below names the 18 asynchronous frames and event variants a standalone
 | `extension_ui_request` | An extension, login flow, collab host, or tool needs host UI. Requests that expect an answer are completed with `extension_ui_response`. | Automatic; use `RpcClient.onExtensionUiRequest`. |
 | `extension_error` | An extension event handler throws. | Automatic raw stdout frame; the TypeScript client has no dedicated listener. |
 | `available_commands_update` | Emitted once at startup and whenever slash-command metadata changes. | Automatic; use `RpcClient.onAvailableCommandsUpdate`. |
-| `prompt_result` | A successfully resolved `prompt` reports whether agent-facing input handled it (`true`) or it completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`; this is distinct from agent lifecycle completion. | Automatic; use `RpcClient.onPromptResult`, and also `onPromptError` when late scheduling failures must be terminally observed. Use `promptWithResult` when the outcome already known in the acknowledgement is also needed. |
+| `prompt_result` | A successfully resolved `prompt` reports whether agent-facing input handled it (`true`) or it completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`; this is distinct from agent lifecycle completion. | Automatic; use `RpcClient.onPromptResult`, and also `onPromptError` when late `prompt` or `abort_and_prompt` scheduling failures must be observed. Use `promptWithResult` or `abortAndPromptWithResult` to retain the acknowledgement request id. |
 | `subagent_lifecycle` | A subscribed subagent starts, stops, or changes lifecycle state. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentLifecycle`. |
 | `subagent_progress` | A subscribed subagent publishes progress. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentProgress`. |
 | `subagent_event` | A subscribed subagent emits its underlying session event. | Send `set_subagent_subscription` with `level: "events"`, then use `RpcClient.onSubagentEvent`. |
@@ -137,9 +137,9 @@ Important edge behavior from runtime:
 
 - Unknown command responses preserve the request `id` when one was provided.
 - Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
-- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails. The TypeScript client exposes late `prompt` failures through `onPromptError`; subscribe before calling `promptWithResult()` and correlate the listener response with its returned `requestId`.
+- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails. The TypeScript client exposes both through the typed `onPromptError` subscription. `RpcPromptErrorResponse.command` is `"prompt" | "abort_and_prompt"`; use the `requestId` returned by `promptWithResult()` or `abortAndPromptWithResult()` for correlation. Matched immediate failures remain normal command responses and are not also published to the listener.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally; `true` means agent-facing input handled it but does not guarantee a new agent lifecycle; omitted means the outcome is still resolving. Consumers that need every terminal prompt outcome should subscribe to both `onPromptResult` and `onPromptError`.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or raw same-id scheduling errors.
+- `abort_and_prompt` does not emit `data.agentInvoked` or `prompt_result`; its acknowledgement and possible late scheduling failure are correlated by request id. A late scheduling failure carries `code: "prompt_scheduling_failed"`; run completion remains an agent lifecycle event.
 
 ## Command Schema (canonical)
 
@@ -940,6 +940,9 @@ That means:
 - each prompt outcome arrives in the same-id `prompt_result`
 - `prompt_result.agentInvoked: true` means handled input, not necessarily a new lifecycle
 - local agent runs are tracked independently through `agent_start` and `agent_end`
+- `agent_end.isTerminal: false` marks an intermediate settle whose continuation is already scheduled; only an absent/true `isTerminal` completes the logical run
+- `RpcClient.waitForIdle()` returns immediately when no run is active or reserved, and otherwise spans queued follow-up gaps and non-terminal settles
+- `RpcClient.promptAndWait()` observes the correlated `prompt_result`; local-only prompts return with events observed through acknowledgement, while agent-invoking prompts wait for their own reservation rather than any earlier `agent_end`
 
 ### While streaming
 
@@ -948,7 +951,7 @@ That means:
 - `"steer"` => queued steering message (interrupt path)
 - `"followUp"` => queued follow-up message (post-turn path)
 
-If omitted during streaming, prompt fails.
+If omitted during streaming, prompt fails. The TypeScript helpers accept the same value as the final optional argument to `prompt()`, `promptWithResult()`, and `promptAndWait()`; using `"followUp"` lets the correlated waiter span the active-run/queued-run gap.
 
 ### Background vs ordered dispatch
 
@@ -1279,4 +1282,13 @@ stdin:
 
 The client spawns `bun <cliPath> --mode rpc`, negotiates protocol v2, correlates responses by generated `req_<n>` ids, exposes `onSessionEvent`/`onEvent` plus the frame-specific listeners named above, and handles registered host-tool calls through `setCustomTools()`. Provider observations require both `subscribeProviderRequestObservations()` and `onProviderRequestObservation()`; extension dialog cancellation uses `onExtensionUiCancel()`.
 
-Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error`, which has no dedicated listener method. For `prompt`, subscribe to both `onPromptResult()` and `onPromptError()` before calling `promptWithResult()` when the consumer requires every terminal outcome.
+Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error`, which has no dedicated listener method. For `prompt`, subscribe to both `onPromptResult()` and `onPromptError()` before calling `promptWithResult()` when every terminal outcome is required. For `abort_and_prompt`, `abortAndPromptWithResult()` returns `{ requestId }` and `onPromptError()` publishes a typed same-id `{ command: "abort_and_prompt", success: false, error, code? }` at most once.
+
+`bash()` and `python()` are the exception to the client's 30-second request deadline because server-side execution can legitimately run longer. They wait indefinitely by default; pass `timeoutMs` in the helper options to set a client-side response deadline in milliseconds:
+
+```ts
+await client.bash("make release", { timeoutMs: 120_000 });
+await client.python("train_model()", { timeoutMs: 120_000 });
+```
+
+`timeoutMs` controls only how long the TypeScript client waits. It is not serialized into the RPC command and does not limit server-side execution. Other request helpers keep the 30-second default.

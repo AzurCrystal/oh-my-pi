@@ -44,6 +44,7 @@ export class RpcCollabGuestRoutingError extends Error {
 type RpcCollabContext = CollabHostContext &
 	CollabGuestContext & {
 		collabHostStart?: Promise<CollabHost>;
+		collabGuestStart?: Promise<CollabGuestLink>;
 		disposed?: boolean;
 	};
 
@@ -108,6 +109,16 @@ async function ownedHost(context: RpcCollabContext | undefined): Promise<CollabH
 	}
 }
 
+async function ownedGuest(context: RpcCollabContext | undefined): Promise<CollabGuestLink | undefined> {
+	if (!context) return undefined;
+	if (context.collabGuest) return context.collabGuest;
+	try {
+		return await context.collabGuestStart;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Whether this session is currently a collaboration guest replica. */
 export function isRpcCollabGuest(session: AgentSession): boolean {
 	return contexts.get(session)?.collabGuest !== undefined;
@@ -134,7 +145,9 @@ export async function startRpcCollabHosting(
 ): Promise<RpcCollabLinks> {
 	const context = getContext(session, eventBus);
 	if (context.disposed) throw new Error("Collaboration session is shutting down");
-	if (context.collabGuest) throw new Error("Already in a collab session as a guest; leave first");
+	if (context.collabGuest || context.collabGuestStart) {
+		throw new Error("Already in a collab session as a guest; leave first");
+	}
 	if (context.collabHost) return links(context.collabHost);
 	if (context.collabHostStart) return links(await context.collabHostStart);
 
@@ -202,22 +215,53 @@ export async function joinRpcCollabSession(
 	onEvent?: (event: AgentSessionEvent) => void,
 	onUiRequest?: (request: CollabUiRequest, signal: AbortSignal) => Promise<CollabUiResponseValue>,
 ): Promise<RpcCollabStatus> {
+	if (session.getVibeModeState()?.enabled) {
+		throw new Error("Exit vibe mode before joining a collab session.");
+	}
+	const transitionLease = session.acquireSessionTransition();
 	const context = getContext(session, eventBus);
-	if (context.disposed) throw new Error("Collaboration session is shutting down");
-	if (context.collabHost || context.collabHostStart) throw new Error("Stop hosting before joining a collab session");
-	if (context.collabGuest) throw new Error("Already in a collab session; leave first");
+	if (context.disposed) {
+		transitionLease.release();
+		throw new Error("Collaboration session is shutting down");
+	}
+	if (context.collabHost || context.collabHostStart) {
+		transitionLease.release();
+		throw new Error("Stop hosting before joining a collab session");
+	}
+	if (context.collabGuest || context.collabGuestStart) {
+		transitionLease.release();
+		throw new Error("Already in a collab session; leave first");
+	}
 	context.handleEvent = onEvent;
 	context.handleUiRequest = onUiRequest;
+	context.runSessionTransition = transitionLease.run;
 	const guest = new CollabGuestLink(context);
-	await guest.join(link);
-	return getRpcCollabStatus(session);
+	const startup = (async () => {
+		try {
+			await guest.join(link);
+			return guest;
+		} catch (error) {
+			await guest.leave("join failed").catch(() => {});
+			throw error;
+		}
+	})();
+	context.collabGuestStart = startup;
+	try {
+		await startup;
+		return getRpcCollabStatus(session);
+	} finally {
+		if (context.collabGuestStart === startup) context.collabGuestStart = undefined;
+		context.runSessionTransition = (transition, options) => session.runSessionTransition(transition, options);
+		transitionLease.release();
+	}
 }
 
 /** Leave a guest session, or stop hosting when called by the current host. */
 export async function leaveRpcCollabSession(session: AgentSession): Promise<void> {
 	const context = contexts.get(session);
-	if (context?.collabGuest) {
-		await context.collabGuest.leave("left");
+	const guest = await ownedGuest(context);
+	if (guest) {
+		await guest.leave("left");
 		return;
 	}
 	await (await ownedHost(context))?.stop("host stopped");
@@ -228,7 +272,7 @@ export async function disposeRpcCollab(session: AgentSession): Promise<void> {
 	const context = contexts.get(session);
 	if (!context) return;
 	context.disposed = true;
-	const guest = context.collabGuest;
+	const guest = await ownedGuest(context);
 	try {
 		await guest?.leave("session ended");
 	} finally {

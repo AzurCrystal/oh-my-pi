@@ -260,6 +260,45 @@ run, while `followUp` reserves a separate run. `prompt_and_wait()` uses the
 correlated outcome plus wire lifecycle bookkeeping; accepted guest-relay input
 without a local `agent_start` returns an empty `PromptTurn`.
 
+`follow_up()` reserves a distinct future run before writing the request. A
+successful acknowledgement keeps that reservation across the previous run's
+`agent_end` / next `agent_start` gap; an immediate rejection rolls back that
+exact reservation. `wait_for_idle()` therefore waits through the gap. Wire
+`agent_end.isTerminal: false` is exposed as `AgentEndEvent.is_terminal is
+False` and does not complete the reservation; the final absent/true value does.
+
+## Long-Running Bash and Python Requests
+
+The execution helpers wait indefinitely for their response by default:
+
+```python
+bash_result = client.bash("make release")
+python_result = client.python("train_model()")
+```
+
+Set `response_timeout` to an optional client-side deadline in seconds:
+
+```python
+bash_result = client.bash("make release", response_timeout=120.0)
+python_result = client.python("train_model()", response_timeout=120.0)
+```
+
+The public signatures are:
+
+```python
+client.bash(
+    command,
+    *,
+    exclude_from_context=None,
+    use_user_shell=None,
+    follow_cwd=None,
+    response_timeout=None,
+)
+client.python(code, *, exclude_from_context=None, response_timeout=None)
+```
+
+`response_timeout` is local to the Python client and is never serialized into the RPC command, so it does not stop server-side execution. The client's `request_timeout` still applies to all other request methods.
+
 ## Error Handling and Retained History
 
 The client now surfaces more of the transport edge cases that the wire protocol
@@ -267,9 +306,11 @@ allows:
 
 - id-less `parse` and unknown-command failures are correlated back to the
   waiting request when they can be matched unambiguously
-- late `prompt` / `abort_and_prompt` scheduling failures cause
-  `prompt_and_wait()` and `wait_for_idle()` to raise instead of timing out
-- unmatched background error responses are exposed through
+- correlated late `prompt` / `abort_and_prompt` scheduling failures are treated
+  as command failures, not additional protocol errors
+- `prompt_and_wait()` or `wait_for_idle()` raises the correlated
+  `RpcCommandError` once; a later idle observation neither re-raises nor hangs
+- genuinely unmatched background error responses are exposed through
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed
   through `client.listener_errors` and `client.on_listener_error(...)`

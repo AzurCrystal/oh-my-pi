@@ -33,6 +33,7 @@ import type {
 	RpcAgentDefinition,
 	RpcAgentDefinitionDeleteResult,
 	RpcAgentDefinitionDocument,
+	RpcAsyncCommandSubmissionResult,
 	RpcAuthoringScope,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
@@ -278,7 +279,11 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 }
 
 function isRpcPromptErrorResponse(value: RpcResponse): value is RpcPromptErrorResponse {
-	return value.success === false && value.command === "prompt" && typeof value.id === "string";
+	return (
+		value.success === false &&
+		(value.command === "prompt" || value.command === "abort_and_prompt") &&
+		typeof value.id === "string"
+	);
 }
 
 function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
@@ -296,6 +301,10 @@ function isAgentEvent(value: unknown): value is AgentEvent {
 	const type = value.type;
 	if (typeof type !== "string") return false;
 	return agentEventTypes.has(type as AgentEvent["type"]);
+}
+
+function isTerminalAgentEnd(event: AgentEvent): boolean {
+	return event.type === "agent_end" && (!("isTerminal" in event) || event.isTerminal !== false);
 }
 
 function isAgentSessionEvent(value: unknown): value is AgentSessionEvent {
@@ -449,6 +458,14 @@ function isPageFallbackError(error: unknown): boolean {
 	return error.message === RPC_MESSAGES_PAGE_BUSY_ERROR || error.message === RPC_MESSAGES_PAGE_STALE_ERROR;
 }
 
+export type RpcPromptStreamingBehavior = "steer" | "followUp";
+
+interface RpcAgentRunReservation {
+	started: boolean;
+	holdForStart: boolean;
+	completed: boolean;
+}
+
 // ============================================================================
 // RPC Client
 // ============================================================================
@@ -474,6 +491,7 @@ export class RpcClient {
 	#voiceEventListeners = new Set<RpcVoiceEventListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
+	#expiredRequestIds = new Set<string>();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#pendingHostUriRequests = new Map<string, { controller: AbortController }>();
@@ -484,6 +502,11 @@ export class RpcClient {
 	#extensionUiCancelListeners = new Set<RpcExtensionUICancelListener>();
 	#providerRequestObservationListeners = new Set<RpcProviderRequestObservationListener>();
 	#abortController = new AbortController();
+	#agentRunReservations: RpcAgentRunReservation[] = [];
+	#promptReservations = new Map<string, RpcAgentRunReservation>();
+	#asyncCommandReservations = new Map<string, RpcAgentRunReservation>();
+	#reportedPromptErrorIds = new Set<string>();
+	#lifecycleChangedListeners = new Set<() => void>();
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
@@ -507,6 +530,11 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#agentRunReservations = [];
+		this.#promptReservations.clear();
+		this.#asyncCommandReservations.clear();
+		this.#reportedPromptErrorIds.clear();
+		this.#expiredRequestIds.clear();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -545,6 +573,7 @@ export class RpcClient {
 			this.#abortController.abort(error);
 			const pendingRequests = Array.from(this.#pendingRequests.values());
 			this.#pendingRequests.clear();
+			this.#expiredRequestIds.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
 			for (const pendingRequest of this.#pendingHostUriRequests.values()) pendingRequest.controller.abort(error);
@@ -672,6 +701,7 @@ export class RpcClient {
 		this.#process = null;
 		for (const request of this.#pendingRequests.values()) request.reject(error);
 		this.#pendingRequests.clear();
+		this.#expiredRequestIds.clear();
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
 			pendingCall.controller.abort(error);
 		}
@@ -876,16 +906,24 @@ export class RpcClient {
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.promptWithResult(message, images);
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: RpcPromptStreamingBehavior,
+	): Promise<void> {
+		await this.promptWithResult(message, images, streamingBehavior);
 	}
 
 	/**
 	 * Send a prompt and retain its request id plus any outcome known when the server acknowledges it.
 	 * An omitted `agentInvoked` means the prompt is still resolving asynchronously.
 	 */
-	async promptWithResult(message: string, images?: ImageContent[]): Promise<RpcPromptSubmissionResult> {
-		const response = await this.#send({ type: "prompt", message, images });
+	async promptWithResult(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: RpcPromptStreamingBehavior,
+	): Promise<RpcPromptSubmissionResult> {
+		const response = await this.#send({ type: "prompt", message, images, streamingBehavior });
 		return { ...this.#getData<RpcPromptAcknowledgement | undefined>(response), requestId: response.id! };
 	}
 
@@ -900,7 +938,8 @@ export class RpcClient {
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+		const response = await this.#send({ type: "follow_up", message, images });
+		this.#getData<undefined>(response);
 	}
 
 	/**
@@ -938,7 +977,14 @@ export class RpcClient {
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
 	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "abort_and_prompt", message, images });
+		await this.abortAndPromptWithResult(message, images);
+	}
+
+	/** Abort and schedule a replacement prompt, retaining the id used by late {@link onPromptError} failures. */
+	async abortAndPromptWithResult(message: string, images?: ImageContent[]): Promise<RpcAsyncCommandSubmissionResult> {
+		const response = await this.#send({ type: "abort_and_prompt", message, images });
+		this.#getData<undefined>(response);
+		return { requestId: response.id! };
 	}
 
 	/** Get completions for the current editor state. */
@@ -1671,15 +1717,24 @@ export class RpcClient {
 	 */
 	async bash(
 		command: string,
-		options?: { excludeFromContext?: boolean; useUserShell?: boolean; followCwd?: boolean },
+		options?: {
+			excludeFromContext?: boolean;
+			useUserShell?: boolean;
+			followCwd?: boolean;
+			/** Client-side response deadline in milliseconds. Omit to wait indefinitely. */
+			timeoutMs?: number;
+		},
 	): Promise<BashResult> {
-		const response = await this.#send({
-			type: "bash",
-			command,
-			...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
-			...(options?.useUserShell !== undefined ? { useUserShell: options.useUserShell } : {}),
-			...(options?.followCwd !== undefined ? { followCwd: options.followCwd } : {}),
-		});
+		const response = await this.#send(
+			{
+				type: "bash",
+				command,
+				...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
+				...(options?.useUserShell !== undefined ? { useUserShell: options.useUserShell } : {}),
+				...(options?.followCwd !== undefined ? { followCwd: options.followCwd } : {}),
+			},
+			options?.timeoutMs ?? null,
+		);
 		return this.#getData(response);
 	}
 
@@ -1693,12 +1748,22 @@ export class RpcClient {
 	/**
 	 * Execute Python code.
 	 */
-	async python(code: string, options?: { excludeFromContext?: boolean }): Promise<PythonResult> {
-		const response = await this.#send({
-			type: "python",
-			code,
-			...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
-		});
+	async python(
+		code: string,
+		options?: {
+			excludeFromContext?: boolean;
+			/** Client-side response deadline in milliseconds. Omit to wait indefinitely. */
+			timeoutMs?: number;
+		},
+	): Promise<PythonResult> {
+		const response = await this.#send(
+			{
+				type: "python",
+				code,
+				...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
+			},
+			options?.timeoutMs ?? null,
+		);
 		return this.#getData(response);
 	}
 
@@ -2326,45 +2391,30 @@ export class RpcClient {
 	// =========================================================================
 
 	/**
-	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Wait until every acknowledged agent run, including queued follow-ups, reaches a terminal agent_end.
+	 * Returns immediately when the client is already idle.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve();
-			}
-		});
-
-		const timeoutId = this.#startTimeout(timeout, () => {
-			if (settled) return;
-			settled = true;
-			unsubscribe();
-			reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`));
-		});
-		return promise;
+		if (this.#agentRunReservations.length === 0) return Promise.resolve();
+		return this.#waitForLifecycle(
+			() => this.#agentRunReservations.length === 0,
+			timeout,
+			`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+		);
 	}
 
-	/**
-	 * Collect events until agent becomes idle.
-	 */
+	/** Collect events through the next terminal agent_end. */
 	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
 		const unsubscribe = this.onEvent(event => {
 			events.push(event);
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve(events);
-			}
+			if (!isTerminalAgentEnd(event)) return;
+			settled = true;
+			unsubscribe();
+			clearTimeout(timeoutId);
+			resolve(events);
 		});
 
 		const timeoutId = this.#startTimeout(timeout, () => {
@@ -2377,22 +2427,203 @@ export class RpcClient {
 	}
 
 	/**
-	 * Send prompt and wait for completion, returning all events.
+	 * Send a prompt and wait for its correlated outcome. Local-only prompts return
+	 * immediately; agent-facing prompts wait for their own reserved run rather than
+	 * an unrelated earlier agent_end.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+	async promptAndWait(
+		message: string,
+		images?: ImageContent[],
+		timeout = 60000,
+		streamingBehavior?: RpcPromptStreamingBehavior,
+	): Promise<AgentEvent[]> {
+		const events: AgentEvent[] = [];
+		const results = new Map<string, boolean>();
+		const errors = new Map<string, RpcPromptErrorResponse>();
+		let changed = Promise.withResolvers<void>();
+		const unsubscribeEvent = this.onEvent(event => events.push(event));
+		const unsubscribeResult = this.onPromptResult(frame => {
+			if (frame.id) results.set(frame.id, frame.agentInvoked);
+			changed.resolve();
+		});
+		const unsubscribeError = this.onPromptError(response => {
+			if (response.command === "prompt") errors.set(response.id, response);
+			changed.resolve();
+		});
+		const deadline = Date.now() + timeout;
+
+		try {
+			const acknowledgement = await this.promptWithResult(message, images, streamingBehavior);
+			let agentInvoked = acknowledgement.agentInvoked;
+			while (agentInvoked === undefined) {
+				const promptError = errors.get(acknowledgement.requestId);
+				if (promptError) {
+					throw new RpcCommandError(promptError.error, promptError.command, promptError.code);
+				}
+				agentInvoked = results.get(acknowledgement.requestId);
+				if (agentInvoked !== undefined) break;
+
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) {
+					throw new Error(`Timeout waiting for prompt outcome. Stderr: ${this.#process?.peekStderr() ?? ""}`);
+				}
+				const timeoutSignal = Promise.withResolvers<void>();
+				const timeoutId = this.#startTimeout(remaining, () =>
+					timeoutSignal.reject(
+						new Error(`Timeout waiting for prompt outcome. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+					),
+				);
+				try {
+					await Promise.race([changed.promise, timeoutSignal.promise]);
+				} finally {
+					clearTimeout(timeoutId);
+				}
+				changed = Promise.withResolvers<void>();
+			}
+
+			if (!agentInvoked) return events;
+			const reservation = this.#promptReservations.get(acknowledgement.requestId);
+			if (reservation) {
+				const remaining = deadline - Date.now();
+				await this.#waitForLifecycle(
+					() => reservation.completed,
+					Math.max(0, remaining),
+					`Timeout waiting for correlated agent run. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+				);
+			}
+			const promptError = errors.get(acknowledgement.requestId);
+			if (promptError) {
+				throw new RpcCommandError(promptError.error, promptError.command, promptError.code);
+			}
+			return events;
+		} finally {
+			unsubscribeEvent();
+			unsubscribeResult();
+			unsubscribeError();
+		}
 	}
 
 	// =========================================================================
 	// Internal
 	// =========================================================================
 
+	#waitForLifecycle(condition: () => boolean, timeout: number, timeoutMessage: string): Promise<void> {
+		if (condition()) return Promise.resolve();
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		let settled = false;
+		let timeoutId: NodeJS.Timeout | undefined;
+		const finish = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			this.#lifecycleChangedListeners.delete(check);
+			if (timeoutId) clearTimeout(timeoutId);
+			if (error) reject(error);
+			else resolve();
+		};
+		const check = () => {
+			if (condition()) finish();
+		};
+		this.#lifecycleChangedListeners.add(check);
+		timeoutId = this.#startTimeout(timeout, () => finish(new Error(timeoutMessage)));
+		check();
+		return promise;
+	}
+
+	#notifyLifecycleChanged(): void {
+		for (const listener of this.#lifecycleChangedListeners) listener();
+	}
+
+	#reserveAgentRun(holdForStart = false): RpcAgentRunReservation {
+		const reservation = { started: false, holdForStart, completed: false };
+		this.#agentRunReservations.push(reservation);
+		this.#notifyLifecycleChanged();
+		return reservation;
+	}
+
+	#completeAgentRun(reservation: RpcAgentRunReservation): void {
+		if (reservation.completed) return;
+		reservation.completed = true;
+		const index = this.#agentRunReservations.indexOf(reservation);
+		if (index !== -1) this.#agentRunReservations.splice(index, 1);
+		for (const [id, candidate] of this.#promptReservations) {
+			if (candidate === reservation) this.#promptReservations.delete(id);
+		}
+		for (const [id, candidate] of this.#asyncCommandReservations) {
+			if (candidate === reservation) this.#asyncCommandReservations.delete(id);
+		}
+		this.#notifyLifecycleChanged();
+	}
+
+	#beginCommandLifecycle(id: string, command: RpcCommandBody): void {
+		if (command.type === "prompt") {
+			const reservation = this.#reserveAgentRun(command.streamingBehavior === "followUp");
+			this.#promptReservations.set(id, reservation);
+		} else if (command.type === "follow_up" || command.type === "abort_and_prompt") {
+			this.#asyncCommandReservations.set(id, this.#reserveAgentRun(true));
+		}
+	}
+
+	#rollbackCommandLifecycle(id: string): void {
+		const reservation = this.#promptReservations.get(id) ?? this.#asyncCommandReservations.get(id);
+		if (reservation) this.#completeAgentRun(reservation);
+		this.#promptReservations.delete(id);
+		this.#asyncCommandReservations.delete(id);
+	}
+
+	#handleCommandResponse(id: string, command: RpcCommandBody, response: RpcResponse): void {
+		if (!response.success) {
+			this.#rollbackCommandLifecycle(id);
+			return;
+		}
+		if (command.type !== "prompt" || response.command !== "prompt" || !isRecord(response.data)) return;
+		if (response.data.agentInvoked === false) this.#rollbackCommandLifecycle(id);
+	}
+
+	#handlePromptResult(frame: RpcPromptResultFrame): void {
+		if (!frame.id) return;
+		const reservation = this.#promptReservations.get(frame.id);
+		if (!reservation) return;
+		if (!frame.agentInvoked || (!reservation.started && !reservation.holdForStart)) {
+			this.#completeAgentRun(reservation);
+		}
+	}
+
+	#handleAgentLifecycle(event: AgentEvent): void {
+		if (event.type === "agent_start") {
+			const reservation =
+				this.#agentRunReservations.find(candidate => !candidate.started && !candidate.completed) ??
+				this.#reserveAgentRun();
+			reservation.started = true;
+			reservation.holdForStart = false;
+			this.#notifyLifecycleChanged();
+			return;
+		}
+		if (event.type !== "agent_end") return;
+		const reservation = this.#agentRunReservations.find(candidate => candidate.started && !candidate.completed);
+		if (!isTerminalAgentEnd(event)) {
+			if (reservation) {
+				reservation.started = false;
+				reservation.holdForStart = true;
+				this.#notifyLifecycleChanged();
+			}
+			return;
+		}
+		const terminalReservation = reservation ?? this.#agentRunReservations.find(candidate => !candidate.completed);
+		if (terminalReservation) this.#completeAgentRun(terminalReservation);
+	}
+
+	#handleLatePromptError(response: RpcPromptErrorResponse): void {
+		if (this.#reportedPromptErrorIds.has(response.id)) return;
+		this.#reportedPromptErrorIds.add(response.id);
+		this.#rollbackCommandLifecycle(response.id);
+		for (const listener of this.#promptErrorListeners) listener(response);
+	}
+
 	#handleLine(data: unknown): void {
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
 			const id = data.id;
+			if (id && this.#expiredRequestIds.delete(id)) return;
 			if (id && this.#pendingRequests.has(id)) {
 				const pending = this.#pendingRequests.get(id)!;
 				this.#pendingRequests.delete(id);
@@ -2400,9 +2631,7 @@ export class RpcClient {
 				return;
 			}
 			if (isRpcPromptErrorResponse(data)) {
-				for (const listener of this.#promptErrorListeners) {
-					listener(data);
-				}
+				this.#handleLatePromptError(data);
 				return;
 			}
 		}
@@ -2533,6 +2762,7 @@ export class RpcClient {
 		}
 
 		if (isRpcPromptResultFrame(data)) {
+			this.#handlePromptResult(data);
 			for (const listener of this.#promptResultListeners) {
 				listener(data);
 			}
@@ -2540,45 +2770,56 @@ export class RpcClient {
 		}
 
 		if (!isAgentSessionEvent(data)) return;
+		const agentEvent = isAgentEvent(data) ? data : undefined;
+		if (agentEvent) this.#handleAgentLifecycle(agentEvent);
 
 		for (const listener of this.#sessionEventListeners) {
 			listener(data);
 		}
 
-		if (!isAgentEvent(data)) return;
-
+		if (!agentEvent) return;
 		for (const listener of this.#eventListeners) {
-			listener(data);
+			listener(agentEvent);
 		}
 	}
 
-	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
+	#send(command: RpcCommandBody, timeoutMs: number | null = 30_000): Promise<RpcResponse> {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
 
 		const id = `req_${++this.#requestId}`;
 		const fullCommand = { ...command, id } as RpcCommand;
+		this.#beginCommandLifecycle(id, command);
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
-		const timeoutId = this.#startTimeout(timeoutMs, () => {
-			if (settled) return;
-			this.#pendingRequests.delete(id);
-			settled = true;
-			reject(
-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-			);
-		});
+		const timeoutId =
+			timeoutMs === null
+				? undefined
+				: this.#startTimeout(timeoutMs, () => {
+						if (settled) return;
+						this.#pendingRequests.delete(id);
+						this.#expiredRequestIds.add(id);
+						this.#rollbackCommandLifecycle(id);
+						settled = true;
+						reject(
+							new Error(
+								`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+							),
+						);
+					});
 
 		this.#pendingRequests.set(id, {
 			resolve: response => {
 				if (settled) return;
+				this.#handleCommandResponse(id, command, response);
 				settled = true;
 				clearTimeout(timeoutId);
 				resolve(response);
 			},
 			reject: error => {
 				if (settled) return;
+				this.#rollbackCommandLifecycle(id);
 				settled = true;
 				clearTimeout(timeoutId);
 				reject(error);
@@ -2588,6 +2829,7 @@ export class RpcClient {
 		this.#writeFrame(fullCommand, err => {
 			this.#pendingRequests.delete(id);
 			if (settled) return;
+			this.#rollbackCommandLifecycle(id);
 			settled = true;
 			clearTimeout(timeoutId);
 			reject(err);

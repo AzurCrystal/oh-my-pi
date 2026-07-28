@@ -7,11 +7,12 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { formatModelString } from "../../config/model-resolver";
 import { remainingTokens } from "../../goals/runtime";
-import type { Goal, GoalStatus } from "../../goals/state";
+import type { Goal, GoalModeState, GoalStatus } from "../../goals/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../../plan-mode/model-transition";
 import { readPlanFile } from "../../plan-mode/plan-files";
+import type { PlanModeState } from "../../plan-mode/state";
 import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
@@ -21,7 +22,7 @@ import type { AgentSession, AgentSessionEvent } from "../../session/agent-sessio
 import type { ConfiguredThinkingLevel } from "../../thinking";
 import type { ToolSession } from "../../tools";
 import { normalizeLocalScheme, resolveToCwd } from "../../tools/path-utils";
-import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
+import { type PlanProposalHandler, PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
 import { VIBE_TOOL_NAMES } from "../../tools/vibe";
 import {
 	type VibeOwnerScope,
@@ -29,6 +30,7 @@ import {
 	type VibeScopeSuspension,
 	VibeSessionRegistry,
 } from "../../vibe/runtime";
+import type { VibeModeState } from "../../vibe/state";
 import { readRpcLoopState } from "./rpc-runtime-control";
 import { assertRpcSessionTransitionAllowed } from "./rpc-session-guard";
 
@@ -140,8 +142,34 @@ interface WorkModeRuntime {
 	goalTurnHadToolCalls?: boolean;
 	goalContinuationTurnInFlight?: boolean;
 	goalSuppressNextContinuation?: boolean;
+	goalBeginInFlight?: Promise<RpcGuidedGoalKickoffResult>;
 	vibePreviousTools?: string[];
 	vibeOwnerScope?: VibeOwnerScope;
+}
+
+interface RpcTransientModeSnapshot {
+	planState: PlanModeState | undefined;
+	goalState: GoalModeState | undefined;
+	vibeState: VibeModeState | undefined;
+	activeTools: string[];
+	activeModel: PlanModelState | undefined;
+	planProposalHandler: PlanProposalHandler | undefined;
+	planPreviousTools: string[] | undefined;
+	planPreviousModel: PlanModelState | undefined;
+	planHasEntered: boolean | undefined;
+	planProposal: RpcPlanProposalSnapshot | undefined;
+	goalPreviousTools: string[] | undefined;
+	goalTurnHadToolCalls: boolean | undefined;
+	goalContinuationTurnInFlight: boolean | undefined;
+	goalSuppressNextContinuation: boolean | undefined;
+	vibePreviousTools: string[] | undefined;
+	vibeOwnerScope: VibeOwnerScope | undefined;
+}
+
+/** Reversible process-local mode teardown owned by the RPC transition boundary. */
+export interface RpcTransientModeSuspension {
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 const runtimes = new WeakMap<AgentSession, WorkModeRuntime>();
@@ -647,32 +675,40 @@ export async function approveRpcPlanProposal(
 	let compactError = "Unknown compaction error";
 	if (compactBeforeExecute) session.markPlanInternalAbortPending();
 	try {
-		await leaveRpcPlanMode(session, compactBeforeExecute);
 		if (strategy === "execute") {
 			const sourceRoot = resolveLocalUrlToPath("local://", localProtocolOptions(session));
-			if (!(await session.newSession())) {
-				throw new Error("Plan execution session creation was cancelled.");
-			}
+			const created = await session.runSessionTransition(async transitionOptions => {
+				const didCreate = await session.newSession(transitionOptions);
+				return {
+					result: didCreate,
+					committed: didCreate,
+					honorPlanDefault: false,
+				};
+			});
+			if (!created) throw new Error("Plan execution session creation was cancelled.");
 			const destinationRoot = resolveLocalUrlToPath("local://", localProtocolOptions(session));
 			await copyRpcLocalArtifacts(sourceRoot, destinationRoot);
 			await writeRpcPlanFile(session, proposal.planFilePath, planContent);
-		} else if (compactBeforeExecute) {
-			session.setPlanReferencePath(proposal.planFilePath);
-			const compactPrompt = prompt.render(planModeCompactInstructionsPrompt, {
-				planFilePath: proposal.planFilePath,
-			});
-			try {
-				await session.compact(undefined, { internalGuidance: compactPrompt });
-				compactOutcome = "ok";
-			} catch (error) {
-				if (error instanceof CompactionCancelledError) {
-					compactOutcome = "cancelled";
-				} else {
-					compactOutcome = "failed";
-					compactError = (error instanceof Error ? error.message : String(error)) || "Unknown compaction error";
-					logger.warn("Failed to compact context for RPC plan approval", {
-						error: error instanceof Error ? error.message : String(error),
-					});
+		} else {
+			await leaveRpcPlanMode(session, compactBeforeExecute);
+			if (compactBeforeExecute) {
+				session.setPlanReferencePath(proposal.planFilePath);
+				const compactPrompt = prompt.render(planModeCompactInstructionsPrompt, {
+					planFilePath: proposal.planFilePath,
+				});
+				try {
+					await session.compact(undefined, { internalGuidance: compactPrompt });
+					compactOutcome = "ok";
+				} catch (error) {
+					if (error instanceof CompactionCancelledError) {
+						compactOutcome = "cancelled";
+					} else {
+						compactOutcome = "failed";
+						compactError = (error instanceof Error ? error.message : String(error)) || "Unknown compaction error";
+						logger.warn("Failed to compact context for RPC plan approval", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 				}
 			}
 		}
@@ -784,9 +820,24 @@ export async function pauseRpcGoal(session: AgentSession): Promise<RpcGoalModeSn
 	const state = session.getGoalModeState();
 	if (!state?.enabled) throw new Error("No active goal to pause.");
 	const runtime = runtimeFor(session);
+	const previousTools = runtime.goalPreviousTools;
+	const previousTurnHadToolCalls = runtime.goalTurnHadToolCalls;
+	const previousContinuationInFlight = runtime.goalContinuationTurnInFlight;
+	const previousSuppressContinuation = runtime.goalSuppressNextContinuation;
 	cancelRpcGoalContinuation(runtime);
 	await session.goalRuntime.pauseGoal();
-	if (runtime.goalPreviousTools) await session.setActiveToolsByName(runtime.goalPreviousTools);
+	try {
+		if (previousTools) await session.setActiveToolsByName(previousTools);
+	} catch (error) {
+		const resumed = await session.goalRuntime.resumeGoal();
+		session.setGoalModeState(resumed);
+		runtime.goalPreviousTools = previousTools;
+		runtime.goalTurnHadToolCalls = previousTurnHadToolCalls;
+		runtime.goalContinuationTurnInFlight = previousContinuationInFlight;
+		runtime.goalSuppressNextContinuation = previousSuppressContinuation;
+		scheduleRpcGoalContinuation(session);
+		throw new Error(`Failed to pause goal mode: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	runtime.goalPreviousTools = undefined;
 	runtime.goalContinuationTurnInFlight = false;
 	return cloneGoalSnapshot(session);
@@ -896,25 +947,57 @@ export async function beginRpcGuidedGoal(
 	}
 
 	const runtime = runtimeFor(session);
+	if (runtime.goalBeginInFlight) throw new Error("Goal setup is already in progress.");
+	const previousRuntimeTools = runtime.goalPreviousTools;
+	const previousTurnHadToolCalls = runtime.goalTurnHadToolCalls;
+	const previousContinuationInFlight = runtime.goalContinuationTurnInFlight;
+	const previousSuppressContinuation = runtime.goalSuppressNextContinuation;
 	const enabledTools = session.getEnabledToolNames();
-	runtime.goalPreviousTools = enabledTools.filter(name => name !== "goal");
-	if (!enabledTools.includes("goal")) {
-		await session.setActiveToolsByName([...enabledTools, "goal"]);
-	}
-	installRpcGoalScheduler(session);
+	const kickoffTask = (async (): Promise<RpcGuidedGoalKickoffResult> => {
+		try {
+			runtime.goalPreviousTools = enabledTools.filter(name => name !== "goal");
+			if (!enabledTools.includes("goal")) {
+				await session.setActiveToolsByName([...enabledTools, "goal"]);
+			}
+			installRpcGoalScheduler(session);
 
-	const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: initialObjective?.trim() || undefined });
-	if (session.isStreaming) {
-		await session.followUp(kickoff, undefined, { synthetic: true });
-		return { queued: true };
-	}
+			const kickoff = prompt.render(guidedGoalInterviewPrompt, {
+				initial: initialObjective?.trim() || undefined,
+			});
+			if (session.isStreaming) {
+				await session.followUp(kickoff, undefined, { synthetic: true });
+				return { queued: true };
+			}
+			try {
+				await session.prompt(kickoff, { synthetic: true });
+				return { queued: false };
+			} catch (error) {
+				if (!(error instanceof AgentBusyError)) throw error;
+				await session.followUp(kickoff, undefined, { synthetic: true });
+				return { queued: true };
+			}
+		} catch (error) {
+			if (!session.getGoalModeState()?.goal) {
+				cancelRpcGoalContinuation(runtime);
+				runtime.goalUnsubscribe?.();
+				runtime.goalUnsubscribe = undefined;
+				try {
+					await session.setActiveToolsByName(enabledTools);
+				} finally {
+					runtime.goalPreviousTools = previousRuntimeTools;
+					runtime.goalTurnHadToolCalls = previousTurnHadToolCalls;
+					runtime.goalContinuationTurnInFlight = previousContinuationInFlight;
+					runtime.goalSuppressNextContinuation = previousSuppressContinuation;
+				}
+			}
+			throw error;
+		}
+	})();
+	runtime.goalBeginInFlight = kickoffTask;
 	try {
-		await session.prompt(kickoff, { synthetic: true });
-		return { queued: false };
-	} catch (error) {
-		if (!(error instanceof AgentBusyError)) throw error;
-		await session.followUp(kickoff, undefined, { synthetic: true });
-		return { queued: true };
+		return await kickoffTask;
+	} finally {
+		if (runtime.goalBeginInFlight === kickoffTask) runtime.goalBeginInFlight = undefined;
 	}
 }
 
@@ -1002,41 +1085,67 @@ export function disposeRpcWorkModes(session: AgentSession): void {
 }
 
 /**
- * Releases the transient work-mode runtime a session holds, without persisting a
- * `mode_change`. External tool/model restoration completes before any snapshot
- * is discarded, so a failed clear can be retried against the original base.
- *
- * A transition may request a reversible vibe suspension. Its caller must commit
- * or roll back the returned token after learning which session stayed current.
+ * Releases transient process-local work-mode state without persisting a
+ * `mode_change`. With reversible preparation, rollback restores the exact
+ * outgoing mode runtime, including a pending plan proposal and its handlers.
  */
 export async function clearRpcTransientModeState(
 	session: AgentSession,
 	options?: { reversibleVibeSuspension?: boolean },
-): Promise<VibeScopeSuspension | undefined> {
+): Promise<RpcTransientModeSuspension | undefined> {
 	const runtime = runtimes.get(session);
-	const restoreTools = runtime?.planPreviousTools ?? runtime?.goalPreviousTools;
-	const restoreModel = runtime?.planPreviousModel;
-	const vibeEnabled = session.getVibeModeState()?.enabled === true;
-	const vibeScope = runtime?.vibeOwnerScope;
-	const vibeTools = runtime?.vibePreviousTools;
+	const planState = session.getPlanModeState();
+	const goalState = session.getGoalModeState();
+	const vibeState = session.getVibeModeState();
+	const snapshot: RpcTransientModeSnapshot = {
+		planState: planState ? { ...planState } : undefined,
+		goalState: goalState ? { ...goalState, goal: { ...goalState.goal } } : undefined,
+		vibeState: vibeState ? { ...vibeState } : undefined,
+		activeTools: session.getEnabledToolNames(),
+		activeModel: session.model
+			? { model: session.model, thinkingLevel: session.configuredThinkingLevel() }
+			: undefined,
+		planProposalHandler: session.peekPlanProposalHandler(),
+		planPreviousTools: runtime?.planPreviousTools ? [...runtime.planPreviousTools] : undefined,
+		planPreviousModel: runtime?.planPreviousModel,
+		planHasEntered: runtime?.planHasEntered,
+		planProposal: runtime?.planProposal ? { ...runtime.planProposal } : undefined,
+		goalPreviousTools: runtime?.goalPreviousTools ? [...runtime.goalPreviousTools] : undefined,
+		goalTurnHadToolCalls: runtime?.goalTurnHadToolCalls,
+		goalContinuationTurnInFlight: runtime?.goalContinuationTurnInFlight,
+		goalSuppressNextContinuation: runtime?.goalSuppressNextContinuation,
+		vibePreviousTools: runtime?.vibePreviousTools ? [...runtime.vibePreviousTools] : undefined,
+		vibeOwnerScope: runtime?.vibeOwnerScope,
+	};
+	const restoreTools = snapshot.planPreviousTools ?? snapshot.goalPreviousTools;
+	const restoreModel = snapshot.planPreviousModel;
+	const vibeEnabled = snapshot.vibeState?.enabled === true;
 	let vibeSuspension: VibeScopeSuspension | undefined;
 
-	if (vibeEnabled && vibeScope) {
-		vibeSuspension = await VibeSessionRegistry.global().suspendScopeReversibly(vibeScope, session.asyncJobManager);
+	if (vibeEnabled && snapshot.vibeOwnerScope) {
+		vibeSuspension = await VibeSessionRegistry.global().suspendScopeReversibly(
+			snapshot.vibeOwnerScope,
+			session.asyncJobManager,
+		);
 	}
 	try {
 		if (vibeEnabled) {
-			// A vibe snapshot taken by this session is the correct base to return to;
-			// without one (a session that already swapped) keep the active set and
-			// strip only the ephemeral vibe tools.
-			if (vibeTools) await session.deactivateVibeTools(vibeTools);
+			if (snapshot.vibePreviousTools) await session.deactivateVibeTools(snapshot.vibePreviousTools);
 			else await session.removeVibeToolsPreservingActive();
 		} else if (restoreTools) {
 			await session.setActiveToolsByName(restoreTools);
 		}
 		if (restoreModel) await restorePlanModel(session, restoreModel);
 	} catch (error) {
-		await vibeSuspension?.rollback();
+		try {
+			await vibeSuspension?.rollback();
+		} finally {
+			try {
+				if (snapshot.activeModel) await restorePlanModel(session, snapshot.activeModel);
+			} finally {
+				await session.setActiveToolsByName(snapshot.activeTools);
+			}
+		}
 		throw error;
 	}
 
@@ -1044,9 +1153,45 @@ export async function clearRpcTransientModeState(
 	session.setGoalModeState(undefined);
 	session.setVibeModeState(undefined);
 	disposeRpcWorkModes(session);
-	if (vibeSuspension && !options?.reversibleVibeSuspension) {
-		await vibeSuspension.commit();
-		return undefined;
-	}
-	return vibeSuspension;
+
+	let settled = false;
+	const suspension: RpcTransientModeSuspension = {
+		commit: async () => {
+			if (settled) return;
+			settled = true;
+			await vibeSuspension?.commit();
+		},
+		rollback: async () => {
+			if (settled) return;
+			settled = true;
+			try {
+				await vibeSuspension?.rollback();
+			} finally {
+				const restoredRuntime = runtimeFor(session);
+				restoredRuntime.planPreviousTools = snapshot.planPreviousTools;
+				restoredRuntime.planPreviousModel = snapshot.planPreviousModel;
+				restoredRuntime.planHasEntered = snapshot.planHasEntered;
+				restoredRuntime.planProposal = snapshot.planProposal;
+				restoredRuntime.goalPreviousTools = snapshot.goalPreviousTools;
+				restoredRuntime.goalTurnHadToolCalls = snapshot.goalTurnHadToolCalls;
+				restoredRuntime.goalContinuationTurnInFlight = snapshot.goalContinuationTurnInFlight;
+				restoredRuntime.goalSuppressNextContinuation = snapshot.goalSuppressNextContinuation;
+				restoredRuntime.vibePreviousTools = snapshot.vibePreviousTools;
+				restoredRuntime.vibeOwnerScope = snapshot.vibeOwnerScope;
+				session.setPlanModeState(snapshot.planState);
+				session.setGoalModeState(snapshot.goalState);
+				session.setVibeModeState(snapshot.vibeState);
+				if (snapshot.activeModel) await restorePlanModel(session, snapshot.activeModel);
+				await session.setActiveToolsByName(snapshot.activeTools);
+				if (snapshot.planState?.enabled) {
+					installPlanProposalHandler(session);
+					if (snapshot.planProposalHandler) session.setPlanProposalHandler(snapshot.planProposalHandler);
+				}
+				if (snapshot.goalState?.enabled) installRpcGoalScheduler(session);
+			}
+		},
+	};
+	if (options?.reversibleVibeSuspension) return suspension;
+	await suspension.commit();
+	return undefined;
 }

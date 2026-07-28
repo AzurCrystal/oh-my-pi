@@ -103,17 +103,17 @@ describe("RPC frame encoding", () => {
 		expect((decoded.messages as unknown[]).length).toBeGreaterThan(0);
 	});
 
-	it("keeps the active run snapshot when a continuing agent_end arrives late", () => {
+	it("keeps the active run snapshot when a non-terminal agent_end arrives", () => {
 		const active = oversizedMessageHistory("active");
 		const stale = { role: "assistant", content: [{ type: "text", text: "stale" }] };
 		const encoder = new RpcFrameEncoder();
 		encoder.encode({ type: "agent_start" });
 		for (const message of active) encoder.encode({ type: "message_end", message });
 
-		expect(decode(encoder.encode({ type: "agent_end", messages: [stale], willContinue: true }))).toEqual({
+		expect(decode(encoder.encode({ type: "agent_end", messages: [stale], isTerminal: false }))).toEqual({
 			type: "agent_end",
 			messages: [stale],
-			willContinue: true,
+			isTerminal: false,
 		});
 		expect(decode(encoder.encode({ type: "agent_end", messages: active }))).toEqual({
 			type: "agent_end",

@@ -2,20 +2,30 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { GoalRuntime, type GoalRuntimeHost } from "../src/goals/runtime";
+import type { GoalModeState, GoalTokenUsage } from "../src/goals/state";
 import * as rpcCollab from "../src/modes/rpc/rpc-collab";
+import { runRpcSessionTransitionAtCommit } from "../src/modes/rpc/rpc-mode";
 import {
 	approveRpcPlanProposal,
 	beginRpcGuidedGoal,
 	clearRpcTransientModeState,
+	createRpcGoal,
 	enterRpcPlanMode,
 	enterRpcVibeMode,
 	exitRpcPlanMode,
 	exitRpcVibeMode,
+	pauseRpcGoal,
+	type RpcTransientModeSuspension,
+	readRpcPlanModeState,
+	rejectRpcPlanProposal,
 	submitRpcPlanReview,
 } from "../src/modes/rpc/rpc-work-modes";
 import type { PlanModeState } from "../src/plan-mode/state";
 import type { AgentSession } from "../src/session/agent-session";
+import type { SessionTransitionRunner } from "../src/session/agent-session-types";
 import { SessionManager } from "../src/session/session-manager";
+import type { PlanProposalHandler } from "../src/tools/resolve";
 import { VibeSessionRegistry } from "../src/vibe/runtime";
 import type { VibeModeState } from "../src/vibe/state";
 
@@ -40,6 +50,7 @@ function createVibeSession(
 		setVibeModeState: (state: VibeModeState | undefined) => {
 			vibeModeState = state;
 		},
+		peekPlanProposalHandler: () => undefined,
 		setPlanProposalHandler: () => {},
 		getEnabledToolNames: () => [...activeTools],
 		setActiveToolsByName: async (names: string[]) => {
@@ -67,7 +78,11 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 	let nextToolRestoreError: Error | undefined;
 	let nextModelRestoreError: Error | undefined;
 	let planModeState: PlanModeState | undefined;
+	let planProposalHandler: PlanProposalHandler | undefined;
 	const newSession = vi.fn(async () => true);
+	let transitionRunner: SessionTransitionRunner = async transition => (await transition({})).result;
+	const runSessionTransition: SessionTransitionRunner = (transition, transitionOptions) =>
+		transitionRunner(transition, transitionOptions);
 	const session = {
 		sessionManager,
 		isStreaming: false,
@@ -85,7 +100,12 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		setGoalModeState: () => {},
 		getVibeModeState: () => undefined,
 		setVibeModeState: () => {},
-		setPlanProposalHandler: () => {},
+		peekPlanProposalHandler: () => planProposalHandler,
+		setPlanProposalHandler: (handler: PlanProposalHandler | null) => {
+			planProposalHandler = handler ?? undefined;
+		},
+		prompt: async () => {},
+		followUp: async () => {},
 		preparePlanForReview: async (title: string) => ({
 			details: {
 				planFilePath: options?.proposalPath ?? "local://PLAN.md",
@@ -116,6 +136,9 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		},
 		setThinkingLevel: () => {},
 		newSession,
+		runSessionTransition,
+		markPlanInternalAbortPending: () => {},
+		clearPlanInternalAbortPending: () => {},
 		setPlanReferencePath: () => {},
 		markPlanReferenceSent: () => {},
 	} as unknown as AgentSession;
@@ -131,6 +154,31 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		failNextModelRestore: (error: Error) => {
 			nextModelRestoreError = error;
 		},
+		setTransitionRunner: (runner: SessionTransitionRunner) => {
+			transitionRunner = runner;
+		},
+	};
+}
+
+function createWorkModeTransitionRunner(
+	session: AgentSession,
+	quiesce: () => Promise<void> = async () => {},
+): SessionTransitionRunner {
+	return async (transition, options = {}) => {
+		let suspension: RpcTransientModeSuspension | undefined;
+		return runRpcSessionTransitionAtCommit(
+			transition,
+			async () => {
+				await quiesce();
+				suspension = await clearRpcTransientModeState(session, { reversibleVibeSuspension: true });
+			},
+			async ({ committed }) => {
+				if (committed) await suspension?.commit();
+				else await suspension?.rollback();
+			},
+			options.honorPlanDefaultOnCommit === true,
+			options.preserveCurrentSessionOnSuccess === true,
+		);
 	};
 }
 
@@ -200,6 +248,83 @@ describe("RPC guided goal", () => {
 		);
 		expect(disabled.setActiveToolsByName).not.toHaveBeenCalled();
 	});
+
+	test("serializes guided setup and rolls back failed kickoff tools", async () => {
+		const concurrent = createGuidedGoalSession({ streaming: false });
+		const pending = Promise.withResolvers<void>();
+		concurrent.submit.mockImplementationOnce(() => pending.promise);
+		const first = beginRpcGuidedGoal(concurrent.session, "First");
+		await expect(beginRpcGuidedGoal(concurrent.session, "Second")).rejects.toThrow(
+			"Goal setup is already in progress.",
+		);
+		pending.resolve();
+		await expect(first).resolves.toEqual({ queued: false });
+
+		const failed = createGuidedGoalSession({ streaming: false });
+		failed.submit.mockRejectedValueOnce(new Error("kickoff failed")).mockResolvedValueOnce(undefined);
+		await expect(beginRpcGuidedGoal(failed.session, "Retry me")).rejects.toThrow("kickoff failed");
+		expect(failed.enabledTools()).toEqual(["read"]);
+		await expect(beginRpcGuidedGoal(failed.session, "Retry me")).resolves.toEqual({ queued: false });
+		expect(failed.enabledTools()).toEqual(["read", "goal"]);
+	});
+
+	test("restores an active goal when tool restoration fails during pause", async () => {
+		const sessionManager = SessionManager.inMemory(".");
+		let state: GoalModeState | undefined;
+		let tools = ["read"];
+		let failNextToolChange = false;
+		const activeGoal = {
+			id: "goal-1",
+			objective: "Keep working",
+			status: "active" as const,
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		const session = {
+			sessionManager,
+			settings: { get: (key: string) => key === "goal.enabled" },
+			isStreaming: false,
+			subscribe: () => () => {},
+			prompt: async () => {},
+			getPlanModeState: () => undefined,
+			getGoalModeState: () => state,
+			setGoalModeState: (next: GoalModeState | undefined) => {
+				state = next;
+			},
+			getVibeModeState: () => undefined,
+			getEnabledToolNames: () => [...tools],
+			setActiveToolsByName: async (next: string[]) => {
+				if (failNextToolChange) {
+					failNextToolChange = false;
+					throw new Error("tool restore failed");
+				}
+				tools = [...next];
+			},
+			goalRuntime: {
+				createGoal: async () => ({ enabled: true, mode: "active", goal: activeGoal }),
+				pauseGoal: async () => {
+					state = { enabled: false, mode: "active", goal: { ...activeGoal, status: "paused" } };
+					return state;
+				},
+				resumeGoal: async () => {
+					state = { enabled: true, mode: "active", goal: activeGoal };
+					return state;
+				},
+			},
+		} as unknown as AgentSession;
+
+		await createRpcGoal(session, activeGoal.objective);
+		failNextToolChange = true;
+		await expect(pauseRpcGoal(session)).rejects.toThrow("Failed to pause goal mode: tool restore failed");
+		expect(state?.enabled).toBe(true);
+		expect(state?.goal.status).toBe("active");
+		expect(tools).toEqual(["read", "goal"]);
+
+		await expect(pauseRpcGoal(session)).resolves.toMatchObject({ enabled: false });
+		expect(tools).toEqual(["read"]);
+	});
 });
 
 describe("RPC plan proposal guest guard", () => {
@@ -224,6 +349,177 @@ describe("RPC plan proposal guest guard", () => {
 		} finally {
 			await tempDir.remove();
 		}
+	});
+
+	test("preserves a cancelled execute proposal and can retry it", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-cancel-");
+		try {
+			const planPath = tempDir.join("PLAN.md");
+			await Bun.write(planPath, "# Retryable plan\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Retryable execution");
+			const proposalHandler = plan.session.peekPlanProposalHandler();
+			const entryCount = plan.sessionManager.getEntries().length;
+			plan.newSession.mockResolvedValue(false);
+
+			await expect(approveRpcPlanProposal(plan.session, undefined, "execute")).rejects.toThrow(
+				"Plan execution session creation was cancelled.",
+			);
+			expect(plan.session.getPlanModeState()?.enabled).toBe(true);
+			expect(plan.activeTools()).toEqual(["read", "bash", "write"]);
+			expect(plan.activeModelId()).toBe("plan-model");
+			expect(plan.session.peekPlanProposalHandler()).toBe(proposalHandler);
+			expect(plan.sessionManager.getEntries()).toHaveLength(entryCount);
+
+			await expect(approveRpcPlanProposal(plan.session, undefined, "execute")).rejects.toThrow(
+				"Plan execution session creation was cancelled.",
+			);
+			expect(plan.newSession).toHaveBeenCalledTimes(2);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+});
+
+describe("RPC reversible work-mode transitions", () => {
+	test("preserves pending proposal details and decisions across reversible transitions", async () => {
+		const cases = [
+			{ name: "same logical reload", preserveCurrent: true, decision: "approved" },
+			{ name: "precommit failure", preserveCurrent: false, decision: "rejected" },
+		] as const;
+
+		for (const testCase of cases) {
+			const tempDir = TempDir.createSync(`@pi-rpc-plan-${testCase.decision}-`);
+			try {
+				const planPath = tempDir.join("PLAN.md");
+				const content = `# ${testCase.name}\n\nKeep this exact proposal.\n`;
+				const title = `${testCase.name} proposal`;
+				await Bun.write(planPath, content);
+				const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+				plan.setTransitionRunner(createWorkModeTransitionRunner(plan.session));
+				await enterRpcPlanMode(plan.session);
+				await submitRpcPlanReview(plan.session, title);
+				const proposalHandler = plan.session.peekPlanProposalHandler();
+
+				const transition = plan.session.runSessionTransition(
+					async transitionOptions => {
+						await transitionOptions.beforeCommit?.();
+						if (!testCase.preserveCurrent) throw new Error("transition failed before commit");
+						return { result: true, committed: true, honorPlanDefault: false };
+					},
+					testCase.preserveCurrent ? { preserveCurrentSessionOnSuccess: true } : undefined,
+				);
+
+				if (testCase.preserveCurrent) await expect(transition).resolves.toBe(true);
+				else await expect(transition).rejects.toThrow("transition failed before commit");
+
+				expect((await readRpcPlanModeState(plan.session)).proposal).toEqual({
+					planFilePath: planPath,
+					title,
+					content,
+				});
+				expect(plan.session.peekPlanProposalHandler()).toBe(proposalHandler);
+				expect(plan.session.getPlanModeState()?.enabled).toBe(true);
+
+				if (testCase.decision === "approved") {
+					const result = await approveRpcPlanProposal(plan.session, undefined, "keep-context");
+					expect(result).toMatchObject({ decision: "approved", planFilePath: planPath, title });
+				} else {
+					const result = await rejectRpcPlanProposal(plan.session);
+					expect(result).toMatchObject({ decision: "rejected", planFilePath: planPath, title });
+				}
+			} finally {
+				await tempDir.remove();
+			}
+		}
+	});
+
+	test("flushes active goal accounting before reversible transition teardown", async () => {
+		const runCase = async (committed: boolean) => {
+			const sessionManager = SessionManager.inMemory(".");
+			let state: GoalModeState | undefined;
+			let usage: GoalTokenUsage = { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 };
+			let now = 1_000;
+			let activeTools = ["read"];
+			const host: GoalRuntimeHost = {
+				getState: () => state,
+				setState: next => {
+					state = next;
+				},
+				getCurrentUsage: () => ({ ...usage }),
+				emit: async () => {},
+				persist: (mode, next) => {
+					if (mode === "none") sessionManager.appendModeChange("none");
+					else if (next) sessionManager.appendModeChange(mode, { goal: next.goal });
+				},
+				sendHiddenMessage: async () => {},
+				now: () => now,
+			};
+			const goalRuntime = new GoalRuntime(host);
+			const session = {
+				sessionManager,
+				goalRuntime,
+				settings: { get: (key: string) => key === "goal.enabled" },
+				isStreaming: false,
+				model: undefined,
+				subscribe: () => () => {},
+				prompt: async () => {},
+				getPlanModeState: () => undefined,
+				setPlanModeState: () => {},
+				getGoalModeState: () => state,
+				setGoalModeState: (next: GoalModeState | undefined) => {
+					state = next;
+				},
+				getVibeModeState: () => undefined,
+				setVibeModeState: () => {},
+				peekPlanProposalHandler: () => undefined,
+				setPlanProposalHandler: () => {},
+				getEnabledToolNames: () => [...activeTools],
+				setActiveToolsByName: async (names: string[]) => {
+					activeTools = [...names];
+				},
+				configuredThinkingLevel: () => undefined,
+			} as unknown as AgentSession;
+			const runner = createWorkModeTransitionRunner(session, () =>
+				goalRuntime.onTaskAborted({ reason: "internal" }),
+			);
+
+			await createRpcGoal(session, "Finish transition accounting", 8);
+			goalRuntime.onTurnStart("turn-1", usage);
+			usage = { input: 16, output: 2, cacheRead: 100, cacheWrite: 1 };
+			now += 2_500;
+
+			await runner(async transitionOptions => {
+				await transitionOptions.beforeCommit?.();
+				if (committed) transitionOptions.onCommitted?.();
+				return { result: committed, committed, honorPlanDefault: false };
+			});
+
+			expect(sessionManager.buildSessionContext()).toMatchObject({
+				mode: "goal",
+				modeData: {
+					goal: {
+						status: "budget-limited",
+						tokensUsed: 9,
+						timeUsedSeconds: 2,
+					},
+				},
+			});
+			if (committed) {
+				expect(state).toBeUndefined();
+				expect(activeTools).toEqual(["read"]);
+			} else {
+				expect(state).toMatchObject({
+					enabled: true,
+					goal: { status: "budget-limited", tokensUsed: 9, timeUsedSeconds: 2 },
+				});
+				expect(activeTools).toEqual(["read", "goal"]);
+			}
+		};
+
+		await runCase(false);
+		await runCase(true);
 	});
 });
 

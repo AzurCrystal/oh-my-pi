@@ -414,7 +414,20 @@ export class CollabGuestLink {
 		// SessionManager still adopts the header cwd for display/relativization.
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
-		await this.#ctx.session.switchSession(replicaPath);
+		const switched = this.#ctx.runSessionTransition
+			? await this.#ctx.runSessionTransition(
+					async transitionOptions => {
+						const didSwitch = await this.#ctx.session.switchSession(replicaPath, transitionOptions);
+						return {
+							result: didSwitch,
+							committed: didSwitch,
+							honorPlanDefault: false,
+						};
+					},
+					{ preserveCollabAttachmentOnCommit: true },
+				)
+			: await this.#ctx.session.switchSession(replicaPath);
+		if (!switched) throw new Error("Collab replica session switch was cancelled.");
 		this.state = pending.state;
 		if (this.#ctx.statusLine) reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#applyHostState(pending.state);
@@ -725,12 +738,36 @@ export class CollabGuestLink {
 		this.#clearTransientUi();
 		// Replica file stays on disk: it is a valid session file outside the
 		// sessions dir, so it never shows up in /resume but remains readable.
-		if (this.#returnSessionFile) {
-			if (this.#ctx.handleResumeSession) await this.#ctx.handleResumeSession(this.#returnSessionFile);
-			else await this.#ctx.session.switchSession(this.#returnSessionFile);
+		const returnSessionFile = this.#returnSessionFile;
+		if (returnSessionFile) {
+			if (this.#ctx.runSessionTransition) {
+				const switched = await this.#ctx.runSessionTransition(async transitionOptions => {
+					const didSwitch = await this.#ctx.session.switchSession(returnSessionFile, transitionOptions);
+					return {
+						result: didSwitch,
+						committed: didSwitch,
+						honorPlanDefault: false,
+					};
+				});
+				if (!switched) throw new Error("Local session restore was cancelled.");
+			} else if (this.#ctx.handleResumeSession) {
+				await this.#ctx.handleResumeSession(returnSessionFile);
+			} else {
+				await this.#ctx.session.switchSession(returnSessionFile);
+			}
 			return;
 		}
-		await this.#ctx.session.newSession();
+		const created = this.#ctx.runSessionTransition
+			? await this.#ctx.runSessionTransition(async transitionOptions => {
+					const didCreate = await this.#ctx.session.newSession(transitionOptions);
+					return {
+						result: didCreate,
+						committed: didCreate,
+						honorPlanDefault: didCreate,
+					};
+				})
+			: await this.#ctx.session.newSession();
+		if (!created) throw new Error("Local session creation was cancelled.");
 		if (this.#ctx.statusLine) {
 			setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
 			this.#ctx.statusLine.invalidate();

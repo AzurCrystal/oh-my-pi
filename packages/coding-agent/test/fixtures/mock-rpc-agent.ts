@@ -16,6 +16,7 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
 let protocolV2Enabled = false;
+let lifecycleScenario: "queued" | "continuing" | undefined;
 process.stdout.write(
 	`${JSON.stringify(
 		supportsProtocolV2
@@ -78,6 +79,61 @@ for await (const raw of console) {
 				});
 				protocolV2Enabled = true;
 				continue;
+			}
+			if (Bun.env.MOCK_RPC_LIFECYCLE === "1") {
+				if (frame.type === "prompt") {
+					writeFrame({ id, type: "response", command: frame.type, success: true });
+					if (frame.message === "local-only") {
+						writeFrame({ type: "prompt_result", id, agentInvoked: false });
+					} else if (frame.message === "queued-B") {
+						lifecycleScenario = "queued";
+						writeFrame({ type: "prompt_result", id, agentInvoked: true });
+					} else {
+						if (frame.message === "continuing") lifecycleScenario = "continuing";
+						writeFrame({ type: "agent_start" });
+						writeFrame({ type: "prompt_result", id, agentInvoked: true });
+					}
+					continue;
+				}
+				if (frame.type === "abort_and_prompt") {
+					if (frame.message === "immediate-reject") {
+						writeFrame({
+							id,
+							type: "response",
+							command: frame.type,
+							success: false,
+							error: "Replacement rejected immediately",
+							code: "operation_failed",
+						});
+						continue;
+					}
+					writeFrame({ id, type: "response", command: frame.type, success: true });
+					await Promise.resolve();
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "Replacement scheduling failed",
+						code: "prompt_scheduling_failed",
+					});
+					continue;
+				}
+				if (frame.type === "get_state") {
+					writeFrame({
+						type: "agent_end",
+						messages: [],
+						...(lifecycleScenario === "continuing" ? { isTerminal: false } : {}),
+					});
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+				if (frame.type === "get_settings") {
+					writeFrame({ type: "agent_start" });
+					writeFrame({ type: "agent_end", messages: [] });
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
 			}
 			if (frame.type === "prompt" && Bun.env.MOCK_RPC_PROMPT_RESULTS === "1") {
 				const agentInvoked = frame.message === "agent" ? true : frame.message === "no-agent" ? false : undefined;

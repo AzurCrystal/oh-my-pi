@@ -6,6 +6,7 @@
  * behavior, and UI context differ between callers — those stay as
  * caller-supplied hooks.
  */
+import { normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
@@ -112,27 +113,70 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
-				return { cancelled: !success };
-			},
-			branch: async entryId => {
-				const result = await session.branch(entryId);
-				return { cancelled: result.cancelled };
-			},
-			navigateTree: async (targetId, navOptions) => {
-				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async sessionPath => {
-				const success = await session.switchSession(sessionPath);
-				return { cancelled: !success };
-			},
+			newSession: newOptions =>
+				session.runSessionTransition(
+					async transitionOptions => {
+						const created = await session.newSession({
+							parentSession: newOptions?.parentSession,
+							...transitionOptions,
+						});
+						if (created && newOptions?.setup) await newOptions.setup(session.sessionManager);
+						return {
+							result: { cancelled: !created },
+							committed: created,
+							honorPlanDefault: created,
+						};
+					},
+					{ honorPlanDefaultOnCommit: true },
+				),
+			branch: entryId =>
+				session.runSessionTransition(async transitionOptions => {
+					const result = await session.branch(entryId, transitionOptions);
+					return {
+						result: { cancelled: result.cancelled },
+						committed: !result.cancelled,
+						honorPlanDefault: false,
+					};
+				}),
+			navigateTree: (targetId, navOptions) =>
+				session.runSessionTransition(async transitionOptions => {
+					const previousLeafId = session.sessionManager.getLeafId();
+					const result = await session.navigateTree(
+						targetId,
+						{ summarize: navOptions?.summarize },
+						transitionOptions,
+					);
+					const committed =
+						result.askReanswerCommitted === true ||
+						(!result.cancelled && session.sessionManager.getLeafId() !== previousLeafId);
+					return { result: { cancelled: result.cancelled }, committed, honorPlanDefault: false };
+				}),
+			switchSession: sessionPath =>
+				session.runSessionTransition(
+					async transitionOptions => {
+						const switched = await session.switchSession(sessionPath, transitionOptions);
+						return {
+							result: { cancelled: !switched },
+							committed: switched,
+							honorPlanDefault: false,
+						};
+					},
+					{
+						preserveCurrentSessionOnSuccess:
+							session.sessionFile !== undefined &&
+							normalizePathForComparison(session.sessionFile) === normalizePathForComparison(sessionPath),
+					},
+				),
 			reload: async () => {
-				await session.reload();
+				const sessionFile = session.sessionFile;
+				if (!sessionFile) return;
+				await session.runSessionTransition(
+					async transitionOptions => {
+						const switched = await session.switchSession(sessionFile, transitionOptions);
+						return { result: undefined, committed: switched, honorPlanDefault: false };
+					},
+					{ preserveCurrentSessionOnSuccess: true },
+				);
 			},
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},

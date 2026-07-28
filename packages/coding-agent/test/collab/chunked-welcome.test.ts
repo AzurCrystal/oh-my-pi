@@ -17,6 +17,10 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type {
+	SessionTransitionRunner,
+	SessionTransitionRunOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
@@ -219,5 +223,48 @@ describe("collab chunked welcome (#3144)", () => {
 			writeSpy.mockRestore();
 			await guest.leave("test cleanup").catch(() => {});
 		}
+	});
+
+	it("routes replica and return switches through the injected transition runner", async () => {
+		const transitionOptions: (SessionTransitionRunOptions | undefined)[] = [];
+		const switchedPaths: string[] = [];
+		const runSessionTransition: SessionTransitionRunner = async (transition, options) => {
+			transitionOptions.push(options);
+			return (await transition({})).result;
+		};
+		const ctx = {
+			settings: { get: () => "" },
+			sessionManager: {
+				getSessionFile: () => "/tmp/local-session.jsonl",
+				getSessionName: () => "local",
+				getCwd: () => "/tmp",
+			},
+			session: {
+				switchSession: async (sessionPath: string) => {
+					switchedPaths.push(sessionPath);
+					return true;
+				},
+				newSession: async () => true,
+				messages: [],
+				agent: {
+					state: { model: undefined },
+					setModel: () => {},
+					setThinkingLevel: () => {},
+					setDisableReasoning: () => {},
+				},
+			},
+			runSessionTransition,
+			collabGuest: undefined,
+		} as unknown as InteractiveModeContext;
+		const guest = new CollabGuestLink(ctx);
+		guestCleanups.push(() => void guest.leave("test cleanup"));
+
+		await guest.join(host.link);
+		expect(transitionOptions).toEqual([{ preserveCollabAttachmentOnCommit: true }]);
+		expect(switchedPaths).toHaveLength(1);
+
+		await guest.leave("done");
+		expect(transitionOptions).toEqual([{ preserveCollabAttachmentOnCommit: true }, undefined]);
+		expect(switchedPaths.at(-1)).toBe("/tmp/local-session.jsonl");
 	});
 });

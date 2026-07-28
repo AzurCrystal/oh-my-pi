@@ -810,6 +810,7 @@ class BashResult:
     output_bytes: int
     artifact_id: str | None = None
 
+
 @dataclass(slots=True, frozen=True)
 class PythonResult:
     output: str
@@ -968,9 +969,7 @@ def _serialize_extension_ask_dialog_result(
         if not isinstance(item.multi, bool):
             raise ValueError(f"{field_name}.multi must be a boolean")
         if not all(isinstance(option, str) for option in item.selected_options):
-            raise ValueError(
-                f"{field_name}.selected_options must contain only strings"
-            )
+            raise ValueError(f"{field_name}.selected_options must contain only strings")
         if item.custom_input is not None and not isinstance(item.custom_input, str):
             raise ValueError(f"{field_name}.custom_input must be a string or None")
         if item.note is not None and not isinstance(item.note, str):
@@ -1050,6 +1049,7 @@ class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
+    is_terminal: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1088,6 +1088,7 @@ class ContextMessageAddedEvent:
     message: AgentMessage
     display: bool
     type: Literal["context_message_added"] = "context_message_added"
+
 
 @dataclass(slots=True, frozen=True)
 class ToolExecutionStartEvent:
@@ -1273,6 +1274,7 @@ class SubagentEvent:
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
+
 
 @dataclass(slots=True, frozen=True)
 class ProviderRequestObservationEvent:
@@ -1890,11 +1892,15 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
     if event_type == "settings_update":
         return SettingsUpdateEvent(
             path=_require_str(payload, "path"),
-            value=_clone_json_value(payload.get("value"), field="settings_update.value"),
+            value=_clone_json_value(
+                payload.get("value"), field="settings_update.value"
+            ),
         )
     if event_type == "raw_sse_update":
         return RawSseUpdateEvent(
-            snapshot=_clone_json_object(payload.get("snapshot"), field="raw_sse_update.snapshot")
+            snapshot=_clone_json_object(
+                payload.get("snapshot"), field="raw_sse_update.snapshot"
+            )
         )
     if event_type == "mcp_auth_challenge":
         return McpAuthChallengeEvent(
@@ -1914,13 +1920,16 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
         request_id = _optional_int(payload, "requestId")
         if request_id is None:
-            raise ValueError("provider_request_observation.requestId must be an integer")
+            raise ValueError(
+                "provider_request_observation.requestId must be an integer"
+            )
         if stage == "context":
             return ProviderRequestObservationEvent(
                 stage=cast(Literal["context"], stage),
                 request_id=request_id,
                 messages=_clone_json_value(
-                    payload.get("messages"), field="provider_request_observation.messages"
+                    payload.get("messages"),
+                    field="provider_request_observation.messages",
                 ),
                 serialization_error=_optional_str(payload, "serializationError"),
             )
@@ -1964,6 +1973,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 cast(JsonValue | None, payload.get("messages"))
             ),
             message_count=_optional_int(payload, "messageCount"),
+            is_terminal=_optional_bool(payload, "isTerminal"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()

@@ -15,16 +15,6 @@ async function waitForPromptHandlers(prompt: Promise<unknown>): Promise<void> {
 	await Promise.resolve();
 }
 
-async function waitForTrackedPromptHandlers(trackedPrompt: {
-	prompt: Promise<unknown>;
-	waitForAgentMessageTasks: () => Promise<void>;
-}): Promise<void> {
-	await trackedPrompt.prompt.catch(() => undefined);
-	await trackedPrompt.waitForAgentMessageTasks();
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
 describe("routeRpcCollabGuestPrompt", () => {
 	test("emits exactly one correlated true result and acknowledges accepted relay input", () => {
 		const output: object[] = [];
@@ -197,10 +187,11 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(sentOptions).toEqual({ triggerTurn: true });
 	});
 
-	test("emits true prompt_result when extension sendUserMessage succeeds", async () => {
+	test("emits one true prompt_result before a deferred extension sendUserMessage settles", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		let sentContent: unknown;
 		const output: object[] = [];
+		const deferredSend = Promise.withResolvers<void>();
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
 		const session = {
 			extensionRunner: {
@@ -210,8 +201,9 @@ describe("reportLocalOnlyPromptResult", () => {
 				onError: () => {},
 				emit: async () => {},
 			},
-			sendUserMessage: async (content: unknown) => {
+			sendUserMessage: (content: unknown) => {
 				sentContent = content;
+				return deferredSend.promise;
 			},
 		} as unknown as AgentSession;
 
@@ -240,15 +232,20 @@ describe("reportLocalOnlyPromptResult", () => {
 				throw error;
 			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
-			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 		});
-		await waitForTrackedPromptHandlers(trackedPrompt);
+		await waitForPromptHandlers(trackedPrompt.prompt);
 
 		expect(sentContent).toBe("start work");
 		expect(output).toEqual([{ type: "prompt_result", id: "req_success", agentInvoked: true }]);
+
+		deferredSend.resolve();
+		await deferredSend.promise;
+		await Promise.resolve();
+
+		expect(output).toEqual([{ type: "prompt_result", id: "req_success", agentInvoked: true }]);
 	});
 
-	test("emits prompt_result when extension sendUserMessage rejects", async () => {
+	test("emits true prompt_result and reports extension sendUserMessage rejection", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		const output: object[] = [];
 		const reportedErrors: Error[] = [];
@@ -292,12 +289,11 @@ describe("reportLocalOnlyPromptResult", () => {
 				throw error;
 			},
 			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
-			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
 		});
-		await waitForTrackedPromptHandlers(trackedPrompt);
+		await waitForPromptHandlers(trackedPrompt.prompt);
 
 		expect(reportedErrors).toEqual([thrown]);
-		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected", agentInvoked: false }]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected", agentInvoked: true }]);
 	});
 
 	test("emits one correlated true result when prompt invokes the agent", async () => {

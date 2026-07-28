@@ -226,7 +226,11 @@ import type {
 	SessionHandoffOptions,
 	SessionOAuthAccountList,
 	SessionStats,
+	SessionTransitionCoordinator,
+	SessionTransitionLease,
 	SessionTransitionOptions,
+	SessionTransitionOutcome,
+	SessionTransitionRunOptions,
 	UsageFallbackConfirmation,
 } from "./agent-session-types";
 import {
@@ -1555,6 +1559,33 @@ export class AgentSession {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	#sessionTransitionCoordinator: SessionTransitionCoordinator | undefined;
+
+	/** Installs the active frontend's single commit/reconcile boundary. */
+	setSessionTransitionCoordinator(coordinator: SessionTransitionCoordinator | null): void {
+		this.#sessionTransitionCoordinator = coordinator ?? undefined;
+	}
+
+	/** Runs a transition through the active frontend, or directly when none owns reconciliation. */
+	async runSessionTransition<T>(
+		transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+		options?: SessionTransitionRunOptions,
+	): Promise<T> {
+		const coordinator = this.#sessionTransitionCoordinator;
+		if (coordinator) return coordinator.run(transition, options);
+		return (await transition({})).result;
+	}
+
+	/** Reserves the active transition boundary across asynchronous protocol setup. */
+	acquireSessionTransition(): SessionTransitionLease {
+		const coordinator = this.#sessionTransitionCoordinator;
+		if (coordinator) return coordinator.acquire();
+		return {
+			run: async transition => (await transition({})).result,
+			release: () => {},
+		};
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -6234,7 +6265,13 @@ export class AgentSession {
 			options?.onCommitted?.();
 			this.#bash.markSessionTransition(bashTransition);
 		} finally {
-			this.#bash.finishSessionTransition(bashTransition, true);
+			try {
+				this.#bash.finishSessionTransition(bashTransition, true);
+			} finally {
+				// A fork changes transcript ownership only after SessionManager commits.
+				// Failed or cancelled forks must leave the source session's jobs deliverable.
+				this.#cancelOwnAsyncJobs();
+			}
 		}
 
 		// Copy artifacts directory if it exists
@@ -7408,6 +7445,7 @@ export class AgentSession {
 		await this.sessionManager.flush();
 		await this.#drainAutolearnCapture();
 		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("branch the session");
 		const bashTransition = this.#bash.beginSessionTransition();
 
 		let sessionTransitioned = false;
@@ -7460,6 +7498,7 @@ export class AgentSession {
 	async branchFromBtw(
 		question: string,
 		assistantMessage: AssistantMessage,
+		options?: SessionTransitionOptions,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		const previousSessionFile = this.sessionFile;
 		if (!this.sessionManager.getSessionFile()) {
@@ -7502,6 +7541,10 @@ export class AgentSession {
 		) {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
+		await this.#bash.flushPending();
+		await this.sessionManager.flush();
+		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("branch the session");
 
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -7510,8 +7553,6 @@ export class AgentSession {
 			await this.abort({ goalReason: "internal", reason: "branching /btw" });
 			this.agent.replaceQueues([], []);
 		}
-		await this.#bash.flushPending();
-		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
 		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
@@ -7520,9 +7561,10 @@ export class AgentSession {
 		let sessionTransitioned = false;
 		try {
 			this.sessionManager.createBranchedSession(leafId);
+			sessionTransitioned = true;
+			options?.onCommitted?.();
 			this.#bash.markSessionTransition(bashTransition);
 			this.#advisors.clearCost();
-			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
@@ -7597,6 +7639,7 @@ export class AgentSession {
 			 */
 			reanswerAskResult?: AgentToolResult<AskToolDetails>;
 		} = {},
+		transitionOptions?: SessionTransitionOptions,
 	): Promise<{
 		editorText?: string;
 		/** Image attachments of the target user message, parallel to the positional `[Image #N]` markers in {@link editorText}. */
@@ -7778,6 +7821,7 @@ export class AgentSession {
 		// new sibling answer — the trigger for resuming the agent afterwards so the
 		// model consumes it, mirroring a live `ask` completion (issue #6483).
 		let isAskReanswerCompletion = false;
+		let askReanswerMessage: ToolResultMessage | undefined;
 
 		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 			// User message: leaf = parent (null if root), text goes to editor
@@ -7806,7 +7850,7 @@ export class AgentSession {
 			// off the same `ask` toolCall instead of reusing `targetId` — the
 			// original answer's branch stays reachable (issue #5642).
 			const reanswer = options.reanswerAskResult;
-			const toolResultMessage: ToolResultMessage = {
+			askReanswerMessage = {
 				role: "toolResult",
 				toolCallId: targetEntry.message.toolCallId,
 				toolName: "ask",
@@ -7815,7 +7859,7 @@ export class AgentSession {
 				isError: reanswer.isError === true,
 				timestamp: Date.now(),
 			};
-			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
+			newLeafId = targetEntry.parentId;
 			isAskReanswerCompletion = true;
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
@@ -7827,10 +7871,15 @@ export class AgentSession {
 
 		// Switch leaf (with or without summary)
 		// Summary is attached at the navigation target position (newLeafId), not the old branch
+		await transitionOptions?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("navigate session history");
 		const bashTransition = this.#bash.beginSessionTransition();
 		let summaryEntry: BranchSummaryEntry | undefined;
 		let branchTransitioned = false;
 		try {
+			if (askReanswerMessage) {
+				newLeafId = this.sessionManager.appendMessageToBranch(askReanswerMessage, newLeafId);
+			}
 			if (summaryText) {
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
@@ -7845,8 +7894,9 @@ export class AgentSession {
 			} else {
 				this.sessionManager.branch(newLeafId);
 			}
-			this.#bash.markSessionTransition(bashTransition);
 			branchTransitioned = true;
+			transitionOptions?.onCommitted?.();
+			this.#bash.markSessionTransition(bashTransition);
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
 		}

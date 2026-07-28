@@ -5,7 +5,7 @@
  * THAT session, and `hasPendingAsyncWork()` / `settleAsyncWork()` define the
  * run quiescence the task executor's barrier is built on.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -265,6 +265,158 @@ describe("AgentSession owner-routed async delivery", () => {
 			}),
 		);
 		expect(leaked).toBe(false);
+	});
+
+	it("cancels a source job only after fork commits and never delivers it into the fork", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		sessionManager.appendMessage({ role: "user", content: "source transcript", timestamp: 1 });
+		await sessionManager.flush();
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			ownedAsyncJobManager: manager,
+		});
+
+		const sourceSessionFile = session.sessionFile;
+		const gate = Promise.withResolvers<string>();
+		let jobSignal: AbortSignal | undefined;
+		const jobId = manager.register(
+			"task",
+			"source session job",
+			({ signal }) => {
+				jobSignal = signal;
+				return gate.promise;
+			},
+			{ id: "source-session-job", ownerId: "Main" },
+		);
+		expect(jobSignal?.aborted).toBe(false);
+
+		expect(await session.fork()).toBe(true);
+		expect(session.sessionFile).not.toBe(sourceSessionFile);
+		expect(jobSignal?.aborted).toBe(true);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+
+		gate.resolve("STALE SOURCE JOB RESULT");
+		await manager.waitForAll();
+		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+		expect(session.hasPendingAsyncWork()).toBe(false);
+
+		const callsBefore = mock.calls.length;
+		await session.sendUserMessage("fork prompt");
+		const leaked = mock.calls.slice(callsBefore).some(call =>
+			call.context.messages.some(message => {
+				if (typeof message.content === "string") return message.content.includes("STALE SOURCE JOB RESULT");
+				return (
+					Array.isArray(message.content) &&
+					message.content.some(
+						content => content.type === "text" && content.text.includes("STALE SOURCE JOB RESULT"),
+					)
+				);
+			}),
+		);
+		expect(leaked).toBe(false);
+		expect(JSON.stringify(session.messages)).not.toContain("STALE SOURCE JOB RESULT");
+	});
+
+	it("preserves a source job when fork fails before or during commit", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		sessionManager.appendMessage({ role: "user", content: "source transcript", timestamp: 1 });
+		await sessionManager.flush();
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			ownedAsyncJobManager: manager,
+		});
+
+		const sourceSessionFile = session.sessionFile;
+		const gate = Promise.withResolvers<string>();
+		let jobSignal: AbortSignal | undefined;
+		const jobId = manager.register(
+			"task",
+			"preserved source job",
+			({ signal }) => {
+				jobSignal = signal;
+				return gate.promise;
+			},
+			{ id: "preserved-source-job", ownerId: "Main" },
+		);
+		const preCommitFailure = new Error("pre-commit failed");
+		const forkFailure = new Error("fork failed before commit");
+
+		await expect(
+			session.fork({
+				beforeCommit: () => {
+					throw preCommitFailure;
+				},
+			}),
+		).rejects.toBe(preCommitFailure);
+		expect(session.sessionFile).toBe(sourceSessionFile);
+		expect(jobSignal?.aborted).toBe(false);
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		await expect(
+			session.fork({
+				beforeCommit: async () => {
+					vi.spyOn(sessionManager, "fork").mockRejectedValueOnce(forkFailure);
+				},
+			}),
+		).rejects.toBe(forkFailure);
+
+		expect(session.sessionFile).toBe(sourceSessionFile);
+		expect(jobSignal?.aborted).toBe(false);
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		gate.resolve("PRESERVED SOURCE JOB RESULT");
+		await session.settleAsyncWork();
+
+		expect(jobSignal?.aborted).toBe(false);
+		const delivered = mock.calls.some(call =>
+			call.context.messages.some(message => {
+				if (typeof message.content === "string") return message.content.includes("PRESERVED SOURCE JOB RESULT");
+				return (
+					Array.isArray(message.content) &&
+					message.content.some(
+						content => content.type === "text" && content.text.includes("PRESERVED SOURCE JOB RESULT"),
+					)
+				);
+			}),
+		);
+		expect(delivered).toBe(true);
+		expect(JSON.stringify(session.messages)).toContain("PRESERVED SOURCE JOB RESULT");
 	});
 
 	it("preserves running jobs when reloading the same session", async () => {

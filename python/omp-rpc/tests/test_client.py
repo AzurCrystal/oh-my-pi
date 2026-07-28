@@ -21,6 +21,7 @@ from omp_rpc import (
     RpcCommandError,
     RpcConcurrencyError,
     RpcProcessExitError,
+    RpcTimeoutError,
     RpcError,
     host_tool,
 )
@@ -1106,6 +1107,79 @@ PROMPT_ACCOUNTING_SERVER = textwrap.dedent(
     """
 )
 
+LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    def respond(command, *, success=True, error=None, code=None):
+        payload = {
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": success,
+        }
+        if error is not None:
+            payload["error"] = error
+        if code is not None:
+            payload["code"] = code
+        emit(payload)
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+
+        if command_type == "prompt":
+            respond(command)
+            emit({"type": "agent_start"})
+            emit({
+                "type": "prompt_result",
+                "id": command["id"],
+                "agentInvoked": True,
+            })
+        elif command_type == "follow_up":
+            if command["message"] == "reject":
+                respond(
+                    command,
+                    success=False,
+                    error="follow-up rejected",
+                    code="follow_up_rejected",
+                )
+            else:
+                respond(command)
+        elif command_type == "abort_and_prompt":
+            respond(command)
+            emit({
+                "id": command["id"],
+                "type": "response",
+                "command": command_type,
+                "success": False,
+                "error": "replacement rejected",
+                "code": "prompt_scheduling_failed",
+            })
+        elif command_type == "finish_active":
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        elif command_type == "finish_follow_up":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        elif command_type == "intermediate_end":
+            emit({"type": "agent_end", "messages": [], "isTerminal": False})
+            respond(command)
+        elif command_type == "finish_continuation":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        else:
+            respond(command)
+    """
+)
+
 DISPATCHER_CONTROL_SERVER = textwrap.dedent(
     """
     import json
@@ -1118,6 +1192,7 @@ DISPATCHER_CONTROL_SERVER = textwrap.dedent(
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         command_type = command["type"]
+
         emit({
             "id": command["id"],
             "type": "response",
@@ -1137,7 +1212,6 @@ DISPATCHER_CONTROL_SERVER = textwrap.dedent(
             break
     """
 )
-
 
 
 DELTA_COMMANDS_SERVER = textwrap.dedent(
@@ -1191,6 +1265,73 @@ NULLABLE_RESPONSE_SERVER = textwrap.dedent(
     """
 )
 
+EXECUTION_TIMEOUT_SERVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    control_dir = Path(os.environ["OMP_RPC_TEST_CONTROL_DIR"])
+    counts = {"bash": 0, "python": 0}
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        request_id = command["id"]
+        if command_type in counts:
+            counts[command_type] += 1
+            sequence = counts[command_type]
+            prefix = control_dir / f"{command_type}-{sequence}"
+            prefix.with_suffix(".json").write_text(json.dumps(command), encoding="utf-8")
+            while not prefix.with_suffix(".release").exists():
+                time.sleep(0.001)
+            if sequence == 2:
+                emit({
+                    "id": request_id,
+                    "type": "response",
+                    "command": command_type,
+                    "success": False,
+                    "error": "late execution failure",
+                })
+            else:
+                data = {
+                    "output": f"{command_type} complete\\n",
+                    "exitCode": 0,
+                    "cancelled": False,
+                    "truncated": False,
+                    "totalLines": 1,
+                    "totalBytes": 16,
+                    "outputLines": 1,
+                    "outputBytes": 16,
+                }
+                if command_type == "python":
+                    data["displayOutputs"] = []
+                    data["stdinRequested"] = False
+                emit({
+                    "id": request_id,
+                    "type": "response",
+                    "command": command_type,
+                    "success": True,
+                    "data": data,
+                })
+        else:
+            emit({
+                "id": request_id,
+                "type": "response",
+                "command": command_type,
+                "success": True,
+                "data": {"ok": True},
+            })
+    """
+)
+
+
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
         return RpcClient(
@@ -1210,6 +1351,7 @@ class RpcClientTests(unittest.TestCase):
         }
         encoded_empty = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         frame["data"]["payload"] = "x" * (1024 * 1024 - len(encoded_empty))
+
         encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         self.assertEqual(len(encoded), 1024 * 1024)
 
@@ -1231,6 +1373,78 @@ class RpcClientTests(unittest.TestCase):
             )
 
         self.assertEqual(decoded, frame)
+
+    def test_bash_and_python_response_timeouts_are_opt_in_and_out_of_band(
+        self,
+    ) -> None:
+        for command_type in ("bash", "python"):
+            with self.subTest(command_type=command_type):
+                with tempfile.TemporaryDirectory() as control_dir:
+                    client = RpcClient(
+                        command=[sys.executable, "-u", "-c", EXECUTION_TIMEOUT_SERVER],
+                        env={"OMP_RPC_TEST_CONTROL_DIR": control_dir},
+                        startup_timeout=2.0,
+                        request_timeout=0.01,
+                    )
+                    client.start()
+                    errors: list[BaseException] = []
+
+                    def execute_default() -> None:
+                        try:
+                            if command_type == "bash":
+                                client.bash("long command")
+                            else:
+                                client.python("long_call()")
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    def wait_for(path: Path) -> None:
+                        deadline = time.monotonic() + 2.0
+                        while not path.exists():
+                            if time.monotonic() >= deadline:
+                                self.fail(f"Timed out waiting for {path}")
+                            time.sleep(0.001)
+
+                    try:
+                        default_thread = threading.Thread(target=execute_default)
+                        default_thread.start()
+                        first_prefix = Path(control_dir) / f"{command_type}-1"
+                        first_payload_path = first_prefix.with_suffix(".json")
+                        wait_for(first_payload_path)
+                        first_payload = json.loads(
+                            first_payload_path.read_text(encoding="utf-8")
+                        )
+                        self.assertNotIn("response_timeout", first_payload)
+                        self.assertNotIn("client_response_timeout", first_payload)
+                        self.assertNotIn("_client_response_timeout", first_payload)
+                        time.sleep(0.05)
+                        self.assertTrue(default_thread.is_alive())
+                        first_prefix.with_suffix(".release").touch()
+                        default_thread.join(timeout=2.0)
+                        self.assertFalse(default_thread.is_alive())
+                        self.assertEqual(errors, [])
+
+                        with self.assertRaises(RpcTimeoutError):
+                            if command_type == "bash":
+                                client.bash("timed command", response_timeout=0.01)
+                            else:
+                                client.python("timed_call()", response_timeout=0.01)
+
+                        second_prefix = Path(control_dir) / f"{command_type}-2"
+                        second_payload_path = second_prefix.with_suffix(".json")
+                        wait_for(second_payload_path)
+                        second_payload = json.loads(
+                            second_payload_path.read_text(encoding="utf-8")
+                        )
+                        self.assertNotIn("response_timeout", second_payload)
+                        self.assertNotIn("client_response_timeout", second_payload)
+                        self.assertNotIn("_client_response_timeout", second_payload)
+                        second_prefix.with_suffix(".release").touch()
+
+                        self.assertEqual(client.request_raw("control"), {"ok": True})
+                        self.assertEqual(client.protocol_errors, ())
+                    finally:
+                        client.stop()
 
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
@@ -1309,20 +1523,14 @@ class RpcClientTests(unittest.TestCase):
             client.on_btw_output(lambda event: seen["btw"].append(event))
             client.on_idle_recap(lambda event: seen["idle"].append(event))
             client.on_raw_sse_update(lambda event: seen["sse"].append(event))
-            client.on_mcp_auth_challenge(
-                lambda event: seen["challenge"].append(event)
-            )
+            client.on_mcp_auth_challenge(lambda event: seen["challenge"].append(event))
             client.on_ttsr_generation_event(lambda event: seen["ttsr"].append(event))
             client.on_voice_event(lambda event: seen["voice"].append(event))
             client.on_available_commands_update(
                 lambda event: seen["commands"].append(event)
             )
-            client.on_subagent_lifecycle(
-                lambda event: seen["lifecycle"].append(event)
-            )
-            client.on_subagent_progress(
-                lambda event: seen["progress"].append(event)
-            )
+            client.on_subagent_lifecycle(lambda event: seen["lifecycle"].append(event))
+            client.on_subagent_progress(lambda event: seen["progress"].append(event))
             client.on_subagent_event(lambda event: seen["subagent"].append(event))
             client.on_extension_ui_cancel(lambda event: seen["ui_cancel"].append(event))
             client.on_provider_request_observation(
@@ -1354,10 +1562,14 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(seen["progress"][0].payload["progress"], 0.5)
         self.assertEqual(seen["subagent"][0].payload["event"]["type"], "message")
         self.assertTrue(seen["ui_cancel"][0].timed_out)
-        self.assertEqual(seen["provider_observation"][0].messages[0]["content"], "rewritten context")
+        self.assertEqual(
+            seen["provider_observation"][0].messages[0]["content"], "rewritten context"
+        )
         self.assertEqual(seen["provider_observation"][1].payload["model"], "test-model")
         self.assertFalse(seen["context_message"][0].display)
-        self.assertEqual(seen["context_message"][0].message["content"], "injected context")
+        self.assertEqual(
+            seen["context_message"][0].message["content"], "injected context"
+        )
 
     def test_nullable_response_wrappers_preserve_none(self) -> None:
         with self.make_client(server=NULLABLE_RESPONSE_SERVER) as client:
@@ -1436,9 +1648,7 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(approved["received"]["editedContent"], "revised plan")
         self.assertEqual(approved["received"]["strategy"], "keep-context")
-        self.assertEqual(
-            approved["received"]["executionModel"]["modelId"], "gpt-5.6"
-        )
+        self.assertEqual(approved["received"]["executionModel"]["modelId"], "gpt-5.6")
         self.assertEqual(approved["received"]["thinkingLevel"], "high")
         self.assertEqual(
             [
@@ -1527,7 +1737,9 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(role_cleared["received"]["role"], "reviewer")
         self.assertEqual(logout["received"]["credentialId"], 7)
         self.assertEqual(removed_account["received"]["credentialId"], 8)
-        self.assertEqual(removed_provider["received"]["type"], "remove_provider_credentials")
+        self.assertEqual(
+            removed_provider["received"]["type"], "remove_provider_credentials"
+        )
         self.assertEqual(mcp_added["received"]["config"]["command"], "demo-mcp")
         self.assertEqual(mcp_removed["received"]["scope"], "project")
         self.assertTrue(mcp_enabled["received"]["enabled"])
@@ -1536,7 +1748,9 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(mcp_unauthenticated["received"]["name"], "demo")
         self.assertEqual(mcp_reauth_started["received"]["type"], "mcp_begin_reauth")
         self.assertEqual(mcp_reauth_completed["received"]["completion"], "code")
-        self.assertEqual(smithery_started["received"]["type"], "mcp_begin_smithery_login")
+        self.assertEqual(
+            smithery_started["received"]["type"], "mcp_begin_smithery_login"
+        )
         self.assertEqual(smithery_completed["received"]["apiKey"], "key")
         self.assertEqual(smithery_logged_out["received"]["type"], "mcp_logout_smithery")
         self.assertEqual(registry["received"]["semantic"], True)
@@ -1603,9 +1817,11 @@ class RpcClientTests(unittest.TestCase):
         notifications: list[PromptResultEvent] = []
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
             client.on_notification(
-                lambda event: notifications.append(event)
-                if isinstance(event, PromptResultEvent)
-                else None
+                lambda event: (
+                    notifications.append(event)
+                    if isinstance(event, PromptResultEvent)
+                    else None
+                )
             )
 
             started = time.monotonic()
@@ -1642,6 +1858,7 @@ class RpcClientTests(unittest.TestCase):
         outcomes_received = threading.Event()
 
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
             def capture_outcome(event: object) -> None:
                 if not isinstance(event, PromptResultEvent) or event.id is None:
                     return
@@ -1659,9 +1876,7 @@ class RpcClientTests(unittest.TestCase):
             client.wait_for_idle(timeout=0.5)
             self.assertEqual(outcomes, {"req_1": False, "req_2": True})
             self.assertEqual(client._pending_prompt_outcomes, {})
-            self.assertEqual(
-                client._scheduled_agent_runs, client._completed_agent_runs
-            )
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
 
     def test_notification_before_response_is_returned_by_acknowledgement(
         self,
@@ -1680,6 +1895,7 @@ class RpcClientTests(unittest.TestCase):
         listener_errors: list[BaseException] = []
 
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
             def wait_for_idle(event: object) -> None:
                 if not isinstance(event, PromptResultEvent):
                     return
@@ -1705,6 +1921,7 @@ class RpcClientTests(unittest.TestCase):
         listener_errors: list[BaseException] = []
 
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
             def wait_from_prompt_result(event: object) -> None:
                 if not isinstance(event, PromptResultEvent) or not event.agent_invoked:
                     return
@@ -1737,6 +1954,7 @@ class RpcClientTests(unittest.TestCase):
         finished = threading.Event()
 
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
             def record(event: object) -> None:
                 event_type = getattr(event, "type", None)
                 if event_type not in {"prompt_result", "agent_start", "agent_end"}:
@@ -1756,6 +1974,7 @@ class RpcClientTests(unittest.TestCase):
         release_start_listener = threading.Event()
 
         with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+
             def block_agent_start(_event: object) -> None:
                 start_listener_entered.set()
                 release_start_listener.wait(1.0)
@@ -1763,9 +1982,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_agent_start(block_agent_start)
             try:
                 client.prompt_with_result("active")
-                client.prompt_with_result(
-                    "active-steer", streaming_behavior="steer"
-                )
+                client.prompt_with_result("active-steer", streaming_behavior="steer")
                 self.assertTrue(start_listener_entered.wait(1.0))
                 client.wait_for_idle(timeout=0.5)
                 self.assertEqual(client._scheduled_agent_runs, 1)
@@ -1786,9 +2003,7 @@ class RpcClientTests(unittest.TestCase):
 
     def test_idle_steer_opens_one_lifecycle_reservation(self) -> None:
         with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
-            client.prompt_with_result(
-                "idle-steer", streaming_behavior="steer"
-            )
+            client.prompt_with_result("idle-steer", streaming_behavior="steer")
             client.wait_for_idle(timeout=0.5)
 
             self.assertEqual(client._scheduled_agent_runs, 1)
@@ -1798,14 +2013,116 @@ class RpcClientTests(unittest.TestCase):
     def test_followup_keeps_a_separate_lifecycle_reservation(self) -> None:
         with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
             client.prompt_with_result("followup-base")
-            client.prompt_with_result(
-                "queued-followup", streaming_behavior="followUp"
-            )
+            client.prompt_with_result("queued-followup", streaming_behavior="followUp")
             client.wait_for_idle(timeout=0.5)
 
             self.assertEqual(client._scheduled_agent_runs, 2)
             self.assertEqual(client._completed_agent_runs, 2)
             self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_follow_up_reservation_spans_the_previous_run_gap(self) -> None:
+        first_end = threading.Event()
+        wait_started = threading.Event()
+        wait_finished = threading.Event()
+        wait_errors: list[BaseException] = []
+
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.on_agent_end(lambda _event: first_end.set())
+            client.prompt_with_result("active")
+            client.follow_up("queued")
+
+            def wait_for_both_runs() -> None:
+                wait_started.set()
+                try:
+                    client.wait_for_idle(timeout=1.0)
+                except BaseException as exc:
+                    wait_errors.append(exc)
+                finally:
+                    wait_finished.set()
+
+            waiter = threading.Thread(target=wait_for_both_runs)
+            waiter.start()
+            self.assertTrue(wait_started.wait(1.0))
+
+            client.request_raw("finish_active")
+            self.assertTrue(first_end.wait(1.0))
+            self.assertFalse(wait_finished.is_set())
+
+            client.request_raw("finish_follow_up")
+            self.assertTrue(wait_finished.wait(1.0))
+            waiter.join(1.0)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(wait_errors, [])
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_immediate_follow_up_rejection_rolls_back_its_reservation(self) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            with self.assertRaises(RpcCommandError) as ctx:
+                client.follow_up("reject")
+
+            self.assertEqual(ctx.exception.command, "follow_up")
+            self.assertEqual(ctx.exception.code, "follow_up_rejected")
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_non_terminal_agent_end_keeps_the_run_reserved(self) -> None:
+        intermediate_seen = threading.Event()
+        wait_started = threading.Event()
+        wait_finished = threading.Event()
+        wait_errors: list[BaseException] = []
+        terminal_states: list[bool | None] = []
+
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+
+            def capture_end(event: object) -> None:
+                terminal_states.append(getattr(event, "is_terminal", None))
+                if terminal_states[-1] is False:
+                    intermediate_seen.set()
+
+            client.on_agent_end(capture_end)
+            client.prompt_with_result("active")
+
+            def wait_for_terminal_end() -> None:
+                wait_started.set()
+                try:
+                    client.wait_for_idle(timeout=1.0)
+                except BaseException as exc:
+                    wait_errors.append(exc)
+                finally:
+                    wait_finished.set()
+
+            waiter = threading.Thread(target=wait_for_terminal_end)
+            waiter.start()
+            self.assertTrue(wait_started.wait(1.0))
+
+            client.request_raw("intermediate_end")
+            self.assertTrue(intermediate_seen.wait(1.0))
+            self.assertFalse(wait_finished.is_set())
+
+            client.request_raw("finish_continuation")
+            self.assertTrue(wait_finished.wait(1.0))
+            waiter.join(1.0)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(wait_errors, [])
+            self.assertEqual(terminal_states, [False, None])
+
+    def test_late_abort_and_prompt_failure_is_raised_once_without_protocol_noise(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.abort_and_prompt("replacement")
+
+            with self.assertRaises(RpcCommandError) as ctx:
+                client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(ctx.exception.command, "abort_and_prompt")
+            self.assertEqual(ctx.exception.error, "replacement rejected")
+            self.assertEqual(ctx.exception.code, "prompt_scheduling_failed")
+            self.assertEqual(client.protocol_errors, ())
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
 
     def test_unexpected_close_discards_pending_listener_callbacks(self) -> None:
         for close_command in ("invalid", "eof"):
@@ -2114,7 +2431,6 @@ class RpcClientTests(unittest.TestCase):
             )
             self.assertEqual(client.get_state().session_id, "fake-session")
 
-
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
         event_types: list[str] = []
@@ -2420,13 +2736,10 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.command, "prompt")
         self.assertEqual(ctx.exception.error, "late failure")
-        self.assertEqual(len(protocol_errors), 1)
-        self.assertIn("late failure", protocol_errors[0])
-        self.assertEqual(len(client.protocol_errors), 1)
+        self.assertEqual(protocol_errors, [])
+        self.assertEqual(client.protocol_errors, ())
         self.assertEqual(client._pending_prompt_outcomes, {})
-        self.assertLessEqual(
-            client._completed_agent_runs, client._scheduled_agent_runs
-        )
+        self.assertLessEqual(client._completed_agent_runs, client._scheduled_agent_runs)
 
     def test_stop_after_prompt_response_raises_process_exit_without_lost_outcome(
         self,
@@ -2456,9 +2769,7 @@ class RpcClientTests(unittest.TestCase):
             client.stop()
 
         self.assertEqual(client._pending_prompt_outcomes, {})
-        self.assertLessEqual(
-            client._completed_agent_runs, client._scheduled_agent_runs
-        )
+        self.assertLessEqual(client._completed_agent_runs, client._scheduled_agent_runs)
 
     def test_listener_exceptions_are_reported_without_stopping_client(self) -> None:
         listener_errors: list[tuple[str, str | None, str]] = []

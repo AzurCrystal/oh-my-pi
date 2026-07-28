@@ -664,11 +664,16 @@ export interface RpcPromptSubmissionResult extends RpcPromptAcknowledgement {
 	requestId: string;
 }
 
-/** Prompt scheduling failure emitted after the initial acknowledgement. */
+/** Client-side acknowledgement for an asynchronous command that may report a later same-id failure. */
+export interface RpcAsyncCommandSubmissionResult {
+	requestId: string;
+}
+
+/** Prompt scheduling failure emitted after the initial prompt or abort-and-prompt acknowledgement. */
 export interface RpcPromptErrorResponse {
 	id: string;
 	type: "response";
-	command: "prompt";
+	command: "prompt" | "abort_and_prompt";
 	success: false;
 	error: string;
 	code?: string;
