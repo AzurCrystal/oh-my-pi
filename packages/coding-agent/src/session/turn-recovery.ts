@@ -106,6 +106,7 @@ export interface TurnRecoveryHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	appendContextMessage(message: AgentMessage): void;
 	scheduleAgentContinue(options: { delayMs?: number; generation?: number }): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
@@ -485,7 +486,7 @@ export class TurnRecovery {
 			return false;
 		}
 		this.discardAssistantTurn(assistantMessage);
-		this.#host.agent.appendMessage({
+		this.#host.appendContextMessage({
 			role: "developer",
 			content: [{ type: "text", text: this.#emptyStopRetryReminder() }],
 			attribution: "agent",
@@ -575,7 +576,7 @@ export class TurnRecovery {
 			return false;
 		}
 
-		this.#host.agent.appendMessage({
+		this.#host.appendContextMessage({
 			role: "developer",
 			content: [{ type: "text", text: this.#unexpectedStopRetryReminder() }],
 			attribution: "agent",
@@ -674,7 +675,7 @@ export class TurnRecovery {
 		) {
 			return;
 		}
-		this.#host.agent.appendMessage(assistantMessage);
+		this.#host.appendContextMessage(assistantMessage);
 	}
 
 	#discardAcceptedTerminalEmptyStop(assistantMessage: AssistantMessage): void {
@@ -1538,7 +1539,7 @@ export class TurnRecovery {
 	#maybeInjectThinkingLoopRedirect(id: number): void {
 		if (!AIError.is(id, AIError.Flag.ThinkingLoop)) return;
 		if (this.#host.settings.get("model.loopGuard.enabled") !== true) return;
-		this.#host.agent.appendMessage({
+		this.#host.appendContextMessage({
 			role: "custom",
 			customType: THINKING_LOOP_REDIRECT_TYPE,
 			content: thinkingLoopRedirectTemplate,

@@ -19,6 +19,7 @@ export interface IrcBridgeHost {
 	isStreaming(): boolean;
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	appendContextMessage(message: CustomMessage): void;
 	wakeForIrc(records: CustomMessage[]): void;
 	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
 }
@@ -142,7 +143,7 @@ export class IrcBridge {
 			return "injected";
 		}
 		if (this.#host.planModeEnabled()) {
-			this.#host.agent.appendMessage(record);
+			this.#host.appendContextMessage(record);
 			this.#host.sessionManager.appendCustomMessageEntry(
 				record.customType,
 				record.content,

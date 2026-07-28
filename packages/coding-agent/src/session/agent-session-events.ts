@@ -1,4 +1,4 @@
-import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AgentEvent, AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
@@ -15,6 +15,16 @@ export type AgentSessionEvent =
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
 	  })
+	| {
+			/**
+			 * A message was appended directly to provider context outside the normal
+			 * message lifecycle. This event is observational and never persists it.
+			 */
+			type: "context_message_added";
+			message: AgentMessage;
+			/** Whether a conversation renderer should show the message. */
+			display: boolean;
+	  }
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";

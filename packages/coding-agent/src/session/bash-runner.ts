@@ -46,6 +46,7 @@ export interface BashRunnerHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	extensionRunner(): ExtensionRunner | undefined;
+	appendContextMessage(message: BashExecutionMessage): void;
 	isStreaming(): boolean;
 }
 
@@ -288,7 +289,7 @@ export class BashRunner {
 	#appendMessage(destination: BashAppendDestination, message: BashExecutionMessage): void {
 		switch (destination.kind) {
 			case "current":
-				this.#host.agent.appendMessage(message);
+				this.#host.appendContextMessage(message);
 				destination.manager.appendMessage(message);
 				break;
 			case "detached":

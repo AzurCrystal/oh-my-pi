@@ -41,6 +41,7 @@ export interface TodoTrackerHost {
 	model(): Model | undefined;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	appendContextMessage(message: AgentMessage): void;
 	scheduleAgentContinue(options: { generation?: number }): void;
 	promptGeneration(): number;
 	hasPendingAsyncWake(): boolean;
@@ -268,7 +269,7 @@ export class TodoTracker {
 		};
 		this.#mutationsSinceLastTouch = 0;
 		this.#reminderAwaitingProgress = true;
-		this.#host.agent.appendMessage(reminderMessage);
+		this.#host.appendContextMessage(reminderMessage);
 		this.#host.sessionManager.appendMessage(reminderMessage);
 		this.#host.scheduleAgentContinue({ generation: this.#host.promptGeneration() });
 		return true;

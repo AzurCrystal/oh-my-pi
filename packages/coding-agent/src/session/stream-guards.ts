@@ -31,6 +31,7 @@ export interface StreamGuardsHost {
 	promptGeneration(): number;
 	localProtocolOptions(): LocalProtocolOptions;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	appendContextMessage(message: AgentMessage): void;
 	schedulePostPromptTask(task: (signal: AbortSignal) => Promise<void>): void;
 	discardAssistantTurn(message: AssistantMessage): void;
 }
@@ -344,8 +345,8 @@ export class LoopGuards {
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
-		messages.push(redirectMessage);
-		if (this.#host.agent.state.messages !== messages) this.#host.agent.appendMessage(redirectMessage);
+		if (this.#host.agent.state.messages !== messages) messages.push(redirectMessage);
+		this.#host.appendContextMessage(redirectMessage);
 		this.#host.sessionManager.appendCustomMessageEntry(
 			TOOL_CALL_LOOP_REDIRECT_TYPE,
 			content,
@@ -391,7 +392,7 @@ export class LoopGuards {
 			if (aborted) this.#host.discardAssistantTurn(aborted);
 			const content = prompt.render(geminiToolReminderTemplate, { count: headerCount });
 			const details = { headers: headerCount };
-			this.#host.agent.appendMessage({
+			this.#host.appendContextMessage({
 				role: "custom",
 				customType: GEMINI_TOOL_REMINDER_TYPE,
 				content,

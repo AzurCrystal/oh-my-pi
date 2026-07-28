@@ -672,7 +672,7 @@ export class AgentSession {
 			// Plan mode: fold stranded IRC asides into context without waking an
 			// autonomous turn. Convergence to ask/resolve stays user-driven.
 			for (const record of records) {
-				this.agent.appendMessage(record);
+				this.appendContextMessage(record);
 				this.sessionManager.appendCustomMessageEntry(
 					record.customType,
 					record.content,
@@ -818,6 +818,7 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			settings: this.settings,
 			extensionRunner: () => this.#extensionRunner,
+			appendContextMessage: message => this.appendContextMessage(message),
 			isStreaming: () => this.isStreaming,
 		};
 		this.#bash = new BashRunner(bashHost);
@@ -829,7 +830,7 @@ export class AgentSession {
 			extensionRunner: () => this.#extensionRunner,
 			isStreaming: () => this.isStreaming,
 			appendSessionMessage: message => {
-				this.agent.appendMessage(message);
+				this.appendContextMessage(message);
 				this.sessionManager.appendMessage(message);
 			},
 		};
@@ -845,6 +846,7 @@ export class AgentSession {
 			isStreaming: () => this.isStreaming,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			appendContextMessage: message => this.appendContextMessage(message),
 			wakeForIrc: records => this.#wakeForIrc(records),
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
 		};
@@ -878,6 +880,7 @@ export class AgentSession {
 			model: () => this.model,
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			appendContextMessage: message => this.appendContextMessage(message),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
 			hasPendingAsyncWake: () => this.#hasPendingAsyncWake(),
@@ -936,6 +939,7 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			appendContextMessage: message => this.appendContextMessage(message),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
 			appendSessionMessage: message => this.#appendSessionMessage(message),
@@ -1106,6 +1110,7 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			settings: this.settings,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			appendContextMessage: message => this.appendContextMessage(message),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
@@ -1138,6 +1143,7 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
+			appendContextMessage: message => this.appendContextMessage(message),
 			schedulePostPromptTask: task => this.#schedulePostPromptTask(task),
 			discardAssistantTurn: message => this.#recovery.discardAssistantTurn(message),
 		};
@@ -1738,6 +1744,19 @@ export class AgentSession {
 		this.#emit({ type: "notice", level, message, source });
 	}
 
+	/**
+	 * Append context outside the core message lifecycle and make the mutation
+	 * observable without changing its independent persistence behavior.
+	 */
+	appendContextMessage(message: AgentMessage, display?: boolean): void {
+		this.agent.appendMessage(message);
+		this.#emit({
+			type: "context_message_added",
+			message,
+			display: display ?? (message.role === "custom" || message.role === "hookMessage" ? message.display : false),
+		});
+	}
+
 	#recordToolExecutionStart(event: Extract<AgentEvent, { type: "tool_execution_start" }>): void {
 		const data: ToolExecutionStartData = {
 			toolCallId: event.toolCallId,
@@ -2193,7 +2212,7 @@ export class AgentSession {
 		// hidden continuity turn visible to the next prompt before any awaited
 		// extension delivery or persistence can stall this handler.
 		if (interruptedThinkingMessage) {
-			this.agent.appendMessage(interruptedThinkingMessage);
+			this.appendContextMessage(interruptedThinkingMessage);
 		}
 
 		const messageEndPersistence =
@@ -4360,6 +4379,11 @@ export class AgentSession {
 		return this.#promptTemplates;
 	}
 
+	/** File-based slash commands currently available for prompt expansion. */
+	get slashCommands(): ReadonlyArray<FileSlashCommand> {
+		return this.#slashCommands;
+	}
+
 	/** Replace file-based slash commands used for prompt expansion. */
 	setSlashCommands(slashCommands: FileSlashCommand[]): void {
 		this.#slashCommands = [...slashCommands];
@@ -5506,7 +5530,7 @@ export class AgentSession {
 				});
 				return true;
 			}
-			this.agent.appendMessage(normalizedAppMessage);
+			this.appendContextMessage(normalizedAppMessage);
 			this.sessionManager.appendCustomMessageEntry(
 				normalizedAppMessage.customType,
 				normalizedAppMessage.content,
@@ -5526,7 +5550,7 @@ export class AgentSession {
 			return true;
 		}
 
-		this.agent.appendMessage(normalizedAppMessage);
+		this.appendContextMessage(normalizedAppMessage);
 		this.sessionManager.appendCustomMessageEntry(
 			normalizedAppMessage.customType,
 			normalizedAppMessage.content,
@@ -5626,6 +5650,16 @@ export class AgentSession {
 		return {
 			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
 			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
+		};
+	}
+
+	getRestorableQueuedMessages(): {
+		steering: RestoredQueuedMessage[];
+		followUp: RestoredQueuedMessage[];
+	} {
+		return {
+			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(toRestoredQueuedMessage),
+			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(toRestoredQueuedMessage),
 		};
 	}
 
@@ -6252,7 +6286,7 @@ export class AgentSession {
 			"You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.",
 			"</system-warning>",
 		].join("\n");
-		this.agent.appendMessage({
+		this.appendContextMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
 			attribution: "agent",
@@ -6387,7 +6421,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		this.agent.appendMessage(reminderMessage);
+		this.appendContextMessage(reminderMessage);
 		this.sessionManager.appendMessage(reminderMessage);
 		this.#scheduleAgentContinue({
 			generation: this.#promptGeneration,

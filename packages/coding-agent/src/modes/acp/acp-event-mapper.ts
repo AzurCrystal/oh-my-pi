@@ -254,6 +254,8 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "todo_auto_clear":
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries: [] })];
+		case "context_message_added":
+			return [];
 		default:
 			return [];
 	}

@@ -32,6 +32,7 @@ export interface TtsrCoordinatorHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	appendContextMessage(message: AgentMessage): void;
 	schedulePostPromptTask(task: (signal: AbortSignal) => Promise<void>, options?: { delayMs?: number }): void;
 	scheduleAgentContinue(options: TtsrContinueOptions): void;
 	promptGeneration(): number;
@@ -433,7 +434,7 @@ export class TtsrCoordinator {
 				const injection = this.#getInjectionContent();
 				if (injection) {
 					const details = { rules: injection.rules.map(rule => rule.name) };
-					this.#host.agent.appendMessage({
+					this.#host.appendContextMessage({
 						role: "custom",
 						customType: "ttsr-injection",
 						content: injection.content,
