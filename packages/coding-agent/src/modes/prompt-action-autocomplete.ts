@@ -40,6 +40,7 @@ interface PromptActionAutocompleteOptions {
 	moveCursorToMessageStart: () => void;
 	moveCursorToLineStart: () => void;
 	moveCursorToLineEnd: () => void;
+	baseProvider?: AutocompleteProvider;
 }
 
 function fuzzyMatch(query: string, target: string): boolean {
@@ -127,13 +128,18 @@ function applyGithubRefCompletion(
 
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#commands: SlashCommand[];
-	#baseProvider: CombinedAutocompleteProvider;
+	#baseProvider: AutocompleteProvider;
 	#actions: PromptActionDefinition[];
 	#basePath: string;
 
-	constructor(commands: SlashCommand[], basePath: string, actions: PromptActionDefinition[]) {
+	constructor(
+		commands: SlashCommand[],
+		basePath: string,
+		actions: PromptActionDefinition[],
+		baseProvider?: AutocompleteProvider,
+	) {
 		this.#commands = commands;
-		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath);
+		this.#baseProvider = baseProvider ?? new CombinedAutocompleteProvider(commands, basePath);
 		this.#basePath = basePath;
 		this.#actions = actions;
 	}
@@ -316,5 +322,5 @@ export function createPromptActionAutocompleteProvider(
 		},
 	];
 
-	return new PromptActionAutocompleteProvider(options.commands, options.basePath, actions);
+	return new PromptActionAutocompleteProvider(options.commands, options.basePath, actions, options.baseProvider);
 }

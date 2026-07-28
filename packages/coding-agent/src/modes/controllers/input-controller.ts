@@ -1772,7 +1772,11 @@ export class InputController {
 		}
 	}
 
-	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
+	createAutocompleteProvider(
+		commands: SlashCommand[],
+		basePath: string,
+		baseProvider?: AutocompleteProvider,
+	): AutocompleteProvider {
 		return createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
@@ -1784,6 +1788,7 @@ export class InputController {
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
+			baseProvider,
 		});
 	}
 

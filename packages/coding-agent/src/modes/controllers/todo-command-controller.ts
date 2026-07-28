@@ -474,7 +474,7 @@ export class TodoCommandController {
 			attribution: "user" as const,
 			timestamp: Date.now(),
 		};
-		this.ctx.agent.appendMessage(message);
+		this.ctx.session.appendContextMessage(message);
 		this.ctx.sessionManager.appendMessage(message);
 	}
 }
