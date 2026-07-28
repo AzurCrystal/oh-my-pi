@@ -1,37 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
-import { RpcFrameDecoder } from "../src/modes/rpc/rpc-frame";
-
-type Frame = Record<string, unknown>;
-type Command = Record<string, unknown> & { type: string };
-
-const cliPath = path.join(import.meta.dir, "..", "src", "cli.ts");
-
-function withTimeout<T>(promise: Promise<T>, timeout: number, message: string): Promise<T> {
-	// This is an external-process E2E boundary: fake timers cannot advance or
-	// terminate the child, so a real watchdog is required to prevent process leaks.
-	return new Promise<T>((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error(message)), timeout);
-		promise.then(
-			value => {
-				clearTimeout(timer);
-				resolve(value);
-			},
-			error => {
-				clearTimeout(timer);
-				reject(error);
-			},
-		);
-	});
-}
-
-interface RpcHarness {
-	frames: Frame[];
-	collectUntil(commands: Command[], predicate: (frames: Frame[]) => boolean, timeout?: number): Promise<void>;
-	stop(): Promise<string>;
-}
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	array,
+	type Command,
+	type Frame,
+	type RpcHarness,
+	record,
+	removeTempDir,
+	response,
+	spawnRpcHarness,
+} from "./rpc-test-harness";
 
 async function spawnRpc(root: TempDir, agentDir: string): Promise<RpcHarness> {
 	const projectDir = root.join("project");
@@ -44,117 +24,7 @@ async function spawnRpc(root: TempDir, agentDir: string): Promise<RpcHarness> {
 		fs.mkdir(agentDir, { recursive: true }),
 	]);
 
-	const child = Bun.spawn(
-		["bun", cliPath, "--mode", "rpc", "--provider", "anthropic", "--model", "claude-sonnet-4-5"],
-		{
-			cwd: projectDir,
-			env: {
-				...Bun.env,
-				// Exercise the production availability probe instead of its test-runtime bypass.
-				BUN_ENV: undefined,
-				NODE_ENV: undefined,
-				PI_NO_TITLE: "1",
-				PI_CODING_AGENT_DIR: agentDir,
-				HOME: homeDir,
-				USERPROFILE: homeDir,
-				XDG_CONFIG_HOME: xdgDir,
-			},
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		},
-	);
-
-	const frames: Frame[] = [];
-	const decoder = new RpcFrameDecoder();
-	const waiters = new Set<() => void>();
-	const notifyWaiters = () => {
-		for (const waiter of [...waiters]) waiter();
-	};
-	let readerError: unknown;
-	let exited = false;
-	const exitPromise = child.exited.then(() => {
-		exited = true;
-		notifyWaiters();
-	});
-	const stderrPromise = new Response(child.stderr as ReadableStream<Uint8Array>).text();
-	const readerPromise = (async () => {
-		for await (const physicalFrame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
-			const logicalFrame = decoder.push(physicalFrame);
-			if (logicalFrame && isRecord(logicalFrame)) {
-				frames.push(logicalFrame);
-				notifyWaiters();
-			}
-		}
-	})().catch(error => {
-		readerError = error;
-		notifyWaiters();
-	});
-
-	return {
-		frames,
-		async collectUntil(commands, predicate, timeout = 45_000) {
-			for (const command of commands) {
-				child.stdin.write(`${JSON.stringify(command)}\n`);
-				await child.stdin.flush();
-			}
-			if (predicate(frames)) return;
-
-			await withTimeout(
-				new Promise<void>((resolve, reject) => {
-					const check = () => {
-						if (predicate(frames)) {
-							waiters.delete(check);
-							resolve();
-						} else if (readerError) {
-							waiters.delete(check);
-							reject(readerError);
-						} else if (exited) {
-							waiters.delete(check);
-							reject(new Error("RPC process exited before the expected frames arrived"));
-						}
-					};
-					waiters.add(check);
-					check();
-				}),
-				timeout,
-				`Timed out waiting for RPC frames after ${timeout} ms`,
-			);
-		},
-		async stop() {
-			if (!exited) child.stdin.end();
-			try {
-				await withTimeout(exitPromise, 10_000, "RPC process did not exit after stdin closed");
-			} catch {
-				child.kill();
-				await exitPromise.catch(() => {});
-			}
-			await readerPromise;
-			return stderrPromise;
-		},
-	};
-}
-
-function response(frames: Frame[], id: string): Frame {
-	const found = frames.find(frame => frame.type === "response" && frame.id === id);
-	if (!found) throw new Error(`Missing RPC response for ${id}`);
-	return found;
-}
-
-function record(value: unknown, label: string): Frame {
-	if (!isRecord(value)) throw new Error(`${label} is not an object`);
-	return value;
-}
-
-function array(value: unknown, label: string): unknown[] {
-	if (!Array.isArray(value)) throw new Error(`${label} is not an array`);
-	return value;
-}
-
-async function removeTempDir(tempDir: TempDir | undefined): Promise<void> {
-	// Windows can keep short-lived process files open briefly; cleanup failure must
-	// not turn a passing protocol contract into a flaky EBUSY failure.
-	await tempDir?.remove().catch(() => {});
+	return spawnRpcHarness({ projectDir, homeDir, xdgDir, agentDir });
 }
 
 describe("RPC protocol TUI parity", () => {
