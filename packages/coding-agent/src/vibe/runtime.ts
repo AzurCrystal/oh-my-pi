@@ -1103,7 +1103,7 @@ export class VibeSessionRegistry {
 		terminateScope: boolean,
 	): Promise<VibeScopeSuspension> {
 		const suspendedScopeKey = scopeKey(scope, "");
-		const suspended = await this.#withTerminationLock(scope, async () => {
+		const { snapshots: suspended, capturedJobs } = await this.#withTerminationLock(scope, async () => {
 			if (this.#suspendedScopes.has(suspendedScopeKey)) {
 				throw new ToolError("Vibe session scope is already suspended.");
 			}
@@ -1111,25 +1111,25 @@ export class VibeSessionRegistry {
 			const snapshots = [...this.#records.values()]
 				.filter(record => matchesScope(record, scope))
 				.map(record => {
-					const turnJobId = record.turn?.jobId;
-					const jobId = turnJobId ?? record.lastJobId;
-					const job = jobId && manager ? manager.getJob(jobId) : undefined;
-					const unsettledJob =
-						job && (turnJobId !== undefined || job.status === "running" || job.status === "cancelled")
-							? job
-							: undefined;
+					const jobs = [...new Set([record.turn?.jobId, record.lastJobId])]
+						.flatMap(jobId => (jobId && manager ? [manager.getJob(jobId)] : []))
+						.filter((job): job is AsyncJob => job?.status === "running" || job?.status === "cancelled");
 					return {
 						record,
 						ref: this.#registeredAgent(record),
-						job: unsettledJob,
+						jobs,
 					};
 				});
+			const capturedJobs = new Map<string, { job: AsyncJob; ownerId: string }>();
+			for (const { record, jobs } of snapshots) {
+				for (const job of jobs) capturedJobs.set(job.id, { job, ownerId: record.ownerId });
+			}
 			for (const { record } of snapshots) {
 				record.suspended = true;
 				this.#records.delete(scopeKey(scope, record.id));
 			}
-			manager?.acknowledgeDeliveries(snapshots.flatMap(({ job }) => (job ? [job.id] : [])));
-			return snapshots;
+			manager?.acknowledgeDeliveries([...capturedJobs.keys()]);
+			return { snapshots, capturedJobs };
 		});
 
 		let state: "pending" | "committing" | "committed" | "rolling-back" | "rolled-back" = "pending";
@@ -1144,14 +1144,18 @@ export class VibeSessionRegistry {
 			state = "committing";
 			operation = (async () => {
 				await this.#withTerminationLock(scope, async () => {
-					for (const { record, job } of suspended) {
+					for (const { record } of suspended) {
 						record.queue.length = 0;
 						record.killed = true;
 						record.state = "dead";
 						record.lastActivityAt = Date.now();
 						record.lastActivity = "suspended for parent-session switch";
 						record.settledWhileSuspended = undefined;
-						if (job && manager) manager.cancel(job.id, { ownerId: record.ownerId });
+					}
+					if (manager) {
+						for (const { job, ownerId } of capturedJobs.values()) {
+							manager.cancel(job.id, { ownerId });
+						}
 					}
 				});
 				for (const { record, ref } of suspended) {
@@ -1165,7 +1169,7 @@ export class VibeSessionRegistry {
 						});
 					}
 				}
-				await awaitCancelledTurnJobs(new Set(suspended.flatMap(({ job }) => (job ? [job] : []))));
+				await awaitCancelledTurnJobs(new Set([...capturedJobs.values()].map(({ job }) => job)));
 				await this.#withTerminationLock(scope, async () => {
 					this.#suspendedScopes.delete(suspendedScopeKey);
 					if (terminateScope) this.#terminatedScopes.add(suspendedScopeKey);
@@ -1211,7 +1215,7 @@ export class VibeSessionRegistry {
 							if (settlement) this.#drainQueuedTurn(settlement.session, settlement.manager, record);
 						}
 					});
-					manager?.resumeDeliveries(suspended.flatMap(({ job }) => (job ? [job.id] : [])));
+					manager?.resumeDeliveries([...capturedJobs.keys()]);
 					state = "rolled-back";
 				} catch (error) {
 					state = "pending";

@@ -347,6 +347,29 @@ describe("vibe session registry", () => {
 		return manager;
 	}
 
+	function gateFirstJobAfterRuntimeCompletion(manager: AsyncJobManager) {
+		const completed = deferred();
+		const release = deferred();
+		const register = manager.register.bind(manager);
+		let first = true;
+		vi.spyOn(manager, "register").mockImplementation((type, label, run, options) => {
+			if (!first) return register(type, label, run, options);
+			first = false;
+			return register(
+				type,
+				label,
+				async context => {
+					const result = await run(context);
+					completed.resolve();
+					await release.promise;
+					return result;
+				},
+				options,
+			);
+		});
+		return { completed: completed.promise, release: release.resolve };
+	}
+
 	function installPersistedSpawnMock(): void {
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			const artifactsDir = options.artifactsDir;
@@ -900,6 +923,151 @@ describe("vibe session registry", () => {
 		expect(manager.getDeliveryState({ ownerId: "Main" }).queued).toBe(0);
 		expect(AgentRegistry.global().get("commit-settlement")).toBeUndefined();
 		await expect(suspension.rollback()).rejects.toThrow("already committed");
+	});
+
+	it("commits every job in an overlapping settled-and-next-turn snapshot without late delivery", async () => {
+		const initialStarted = deferred();
+		const releaseInitial = deferred();
+		const followUpStarted = deferred();
+		const releaseFollowUp = deferred();
+		const worker = createFakeWorkerSession();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: "Main",
+				session: worker.session,
+				status: "running",
+			});
+			initialStarted.resolve();
+			await releaseInitial.promise;
+			AgentRegistry.global().setStatus(options.id, "idle");
+			return makeResult(options.id);
+		});
+		const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => {
+			followUpStarted.resolve();
+			await releaseFollowUp.promise;
+			return makeResult(options.id, { output: "Overlapping follow-up completed." });
+		});
+		const deliveries: string[] = [];
+		const manager = createManager();
+		const previousJob = gateFirstJobAfterRuntimeCompletion(manager);
+		manager.registerDeliverySink("Main", jobId => {
+			deliveries.push(jobId);
+		});
+		const session = createSession({ manager });
+		const registry = VibeSessionRegistry.global();
+		const spawned = await registry.spawn(session, {
+			cli: "fast",
+			name: "commit-overlap",
+			prompt: INITIAL_VIBE_TASK,
+		});
+		await initialStarted.promise;
+		expect(
+			await registry.send(session, { session: "commit-overlap", message: "Start the overlapping turn." }),
+		).toMatchObject({ mode: "queued" });
+		releaseInitial.resolve();
+		await Promise.all([previousJob.completed, followUpStarted.promise]);
+
+		const jobIds = manager
+			.getRunningJobs({ ownerId: "Main" })
+			.map(job => job.id)
+			.sort();
+		expect(jobIds).toEqual([spawned.jobId, "commit-overlap-t2"].sort());
+		const acknowledge = vi.spyOn(manager, "acknowledgeDeliveries");
+		const cancel = vi.spyOn(manager, "cancel");
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(session), manager);
+
+		const committed = suspension.commit();
+		await flushMicrotasks();
+		previousJob.release();
+		releaseFollowUp.resolve();
+		await committed;
+		await Promise.all(jobIds.map(jobId => manager.getJob(jobId)!.promise));
+		await flushMicrotasks();
+		expect(acknowledge).toHaveBeenCalledTimes(1);
+		expect(new Set(acknowledge.mock.calls[0]?.[0])).toEqual(new Set(jobIds));
+
+		expect(cancel).toHaveBeenCalledTimes(2);
+		expect(new Set(cancel.mock.calls.map(([jobId]) => jobId))).toEqual(new Set(jobIds));
+		expect(jobIds.map(jobId => manager.getJob(jobId)?.status)).toEqual(["cancelled", "cancelled"]);
+		expect(followUp).toHaveBeenCalledTimes(1);
+		expect(deliveries).toEqual([]);
+		expect(manager.getDeliveryState({ ownerId: "Main" }).queued).toBe(0);
+	});
+
+	it("rolls back every overlapping job once without duplicating the queued turn", async () => {
+		const initialStarted = deferred();
+		const releaseInitial = deferred();
+		const followUpStarted = deferred();
+		const releaseFollowUp = deferred();
+		const worker = createFakeWorkerSession();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: "Main",
+				session: worker.session,
+				status: "running",
+			});
+			initialStarted.resolve();
+			await releaseInitial.promise;
+			AgentRegistry.global().setStatus(options.id, "idle");
+			return makeResult(options.id);
+		});
+		const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => {
+			followUpStarted.resolve();
+			await releaseFollowUp.promise;
+			return makeResult(options.id, { output: "Rollback follow-up completed." });
+		});
+		const deliveries: string[] = [];
+		const manager = createManager();
+		const previousJob = gateFirstJobAfterRuntimeCompletion(manager);
+		manager.registerDeliverySink("Main", jobId => {
+			deliveries.push(jobId);
+		});
+		const session = createSession({ manager });
+		const registry = VibeSessionRegistry.global();
+		const spawned = await registry.spawn(session, {
+			cli: "fast",
+			name: "rollback-overlap",
+			prompt: INITIAL_VIBE_TASK,
+		});
+		await initialStarted.promise;
+		expect(
+			await registry.send(session, { session: "rollback-overlap", message: "Start the overlapping turn." }),
+		).toMatchObject({ mode: "queued" });
+		releaseInitial.resolve();
+		await Promise.all([previousJob.completed, followUpStarted.promise]);
+
+		const jobIds = manager
+			.getRunningJobs({ ownerId: "Main" })
+			.map(job => job.id)
+			.sort();
+		expect(jobIds).toEqual([spawned.jobId, "rollback-overlap-t2"].sort());
+		const resume = vi.spyOn(manager, "resumeDeliveries");
+		const suspension = await registry.suspendScopeReversibly(registry.ownerScope(session), manager);
+		await suspension.rollback();
+		await suspension.rollback();
+
+		const restoredIds = registry.listIds(session);
+		const restoredScreens = registry.screens(session);
+
+		previousJob.release();
+		releaseFollowUp.resolve();
+		await Promise.all(jobIds.map(jobId => manager.getJob(jobId)!.promise));
+		await pollUntil(() => deliveries.length === 2);
+
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(new Set(resume.mock.calls[0]?.[0])).toEqual(new Set(jobIds));
+		expect(restoredIds).toEqual(["rollback-overlap"]);
+		expect(restoredScreens).toMatchObject([{ id: "rollback-overlap", state: "running", turns: 2, queued: 0 }]);
+		expect(followUp).toHaveBeenCalledTimes(1);
+		expect(new Set(deliveries)).toEqual(new Set(jobIds));
+		expect(deliveries).toHaveLength(2);
+		expect(registry.screens(session)).toMatchObject([{ id: "rollback-overlap", state: "idle", turns: 2, queued: 0 }]);
 	});
 
 	it("suspends a blocked in-flight worker for fresh-process disposal without tombstoning it", async () => {
