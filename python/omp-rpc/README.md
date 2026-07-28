@@ -187,16 +187,44 @@ full replacement content.
 ## Extension UI Requests
 
 Extensions in RPC mode can ask the host for input. Those requests are available as
-typed `ExtensionUiRequest` instances:
+typed `ExtensionUiRequest` instances. Rich `askDialog` questions and options are
+immutable dataclasses, so a host can inspect them before responding:
 
 ```python
+from omp_rpc import ExtensionAskDialogResultItem, ExtensionAskDialogSubmitResult
+
 request = client.next_ui_request(timeout=5.0)
 
-if request.method == "confirm":
+if request.method == "askDialog":
+    assert request.questions is not None
+    for question in request.questions:
+        print(question.header or question.id, question.question)
+        print([option.label for option in question.options])
+
+    question = request.questions[0]
+    client.send_ui_ask_dialog_result(
+        request.id,
+        ExtensionAskDialogSubmitResult(
+            results=(
+                ExtensionAskDialogResultItem(
+                    id=question.id,
+                    question=question.question,
+                    options=tuple(option.label for option in question.options),
+                    multi=question.multi or False,
+                    selected_options=(question.options[0].label,),
+                ),
+            )
+        ),
+    )
+elif request.method == "confirm":
     client.send_ui_confirmation(request.id, True)
 elif request.method in {"input", "editor"}:
     client.send_ui_value(request.id, "approved")
 ```
+
+Use `client.cancel_ui_request(request.id)` instead when the host cannot answer an
+interactive request. An ask dialog can also return
+`ExtensionAskDialogChatResult()` when the user chooses to continue in chat.
 
 For non-interactive scripts, you can install a default headless policy instead of
 handling every request manually:
@@ -209,8 +237,9 @@ with RpcClient(model="anthropic/claude-sonnet-4-5") as client:
 ```
 
 That helper ignores passive UI notifications (`notify`, `setStatus`, `setWidget`,
-`setTitle`, `set_editor_text`), answers `confirm` with `False`, and cancels
-`select`/`input`/`editor` requests unless you provide explicit values.
+`setTitle`, `set_editor_text`), answers `confirm` with `False`, always cancels
+`askDialog`, and cancels `select`/`input`/`editor` requests unless you provide
+explicit values.
 
 ## Prompt Outcomes
 

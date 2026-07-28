@@ -31,6 +31,7 @@ from .protocol import (
     CancellationResult,
     CompactionResult,
     ExtensionError,
+    ExtensionAskDialogResult,
     ExtensionUiRequest,
     ExecOutputEvent,
     ExtensionUiCancelEvent,
@@ -96,6 +97,7 @@ from .protocol import (
     parse_session_stats,
     parse_thinking_level_cycle_result,
     parse_todo_phases,
+    _serialize_extension_ask_dialog_result,
 )
 
 AgentEventListener = Callable[[RpcAgentEvent], None]
@@ -1039,8 +1041,9 @@ class RpcClient:
         """Auto-handle RPC UI requests for non-interactive hosts.
 
         Passive UI methods such as notifications and status updates are ignored.
-        Confirm dialogs default to `False`. Select, input, and editor requests
-        are cancelled unless an explicit value is provided.
+        Confirm dialogs default to `False`. Ask dialogs are always cancelled.
+        Select, input, and editor requests are cancelled unless an explicit value
+        is provided.
         """
 
         def handle(request: ExtensionUiRequest) -> None:
@@ -1058,6 +1061,9 @@ class RpcClient:
                     )
 
             if request.method == "cancel" or request.is_passive():
+                return
+            if request.method == "askDialog":
+                self.cancel_ui_request(request.id)
                 return
             if request.method == "confirm":
                 self.send_ui_confirmation(request.id, confirm)
@@ -1098,6 +1104,17 @@ class RpcClient:
     def send_ui_confirmation(self, request_id: str, confirmed: bool) -> None:
         self._send_notification(
             {"type": "extension_ui_response", "id": request_id, "confirmed": confirmed}
+        )
+
+    def send_ui_ask_dialog_result(
+        self, request_id: str, result: ExtensionAskDialogResult
+    ) -> None:
+        self._send_notification(
+            {
+                "type": "extension_ui_response",
+                "id": request_id,
+                "result": _serialize_extension_ask_dialog_result(result),
+            }
         )
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:

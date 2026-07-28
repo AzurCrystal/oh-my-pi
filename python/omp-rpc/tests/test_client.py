@@ -14,6 +14,8 @@ from pathlib import Path
 import unittest
 
 from omp_rpc import (
+    ExtensionAskDialogResultItem,
+    ExtensionAskDialogSubmitResult,
     PromptResultEvent,
     RpcClient,
     RpcCommandError,
@@ -280,7 +282,10 @@ FAKE_SERVER = textwrap.dedent(
         request_id = command.get("id")
 
         if command_type == "extension_ui_response":
-            emit_prompt_turn("ui acknowledged")
+            if command.get("id") in {"ui-ask-1", "ui-ask-2"}:
+                emit_prompt_turn(json.dumps(command, sort_keys=True))
+            else:
+                emit_prompt_turn("ui acknowledged")
             continue
 
         if command_type == "get_state":
@@ -414,6 +419,29 @@ FAKE_SERVER = textwrap.dedent(
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
+                continue
+            if message in {"needs ask dialog", "needs headless ask dialog"}:
+                dialog_id = "ui-ask-1" if message == "needs ask dialog" else "ui-ask-2"
+                print(json.dumps({
+                    "type": "extension_ui_request",
+                    "id": dialog_id,
+                    "method": "askDialog",
+                    "questions": [{
+                        "id": "database",
+                        "question": "Which database should we use?",
+                        "header": "Database",
+                        "options": [
+                            {
+                                "label": "Postgres",
+                                "description": "Relational database",
+                                "preview": "CREATE TABLE users (...);",
+                            },
+                            {"label": "SQLite"},
+                        ],
+                        "multi": False,
+                        "recommended": 0,
+                    }],
+                }), flush=True)
                 continue
             if message == "needs host tool":
                 print(json.dumps({"type": "agent_start"}), flush=True)
@@ -2021,6 +2049,71 @@ class RpcClientTests(unittest.TestCase):
             client.prompt_and_wait("needs ui", timeout=2.0)
 
         self.assertEqual(seen_methods, ["input"])
+
+    def test_send_ui_ask_dialog_result_emits_exact_frame(self) -> None:
+        with self.make_client() as client:
+            client.prompt("needs ask dialog")
+            request = client.next_ui_request(timeout=2.0)
+            self.assertEqual(request.method, "askDialog")
+
+            client.send_ui_ask_dialog_result(
+                request.id,
+                ExtensionAskDialogSubmitResult(
+                    results=(
+                        ExtensionAskDialogResultItem(
+                            id="database",
+                            question="Which database should we use?",
+                            options=("Postgres", "SQLite"),
+                            multi=False,
+                            selected_options=("Postgres",),
+                        ),
+                    )
+                ),
+            )
+            client.wait_for_idle(timeout=2.0)
+
+            response_text = client.get_last_assistant_text()
+            assert response_text is not None
+            self.assertEqual(
+                json.loads(response_text),
+                {
+                    "type": "extension_ui_response",
+                    "id": "ui-ask-1",
+                    "result": {
+                        "kind": "submit",
+                        "results": [
+                            {
+                                "id": "database",
+                                "question": "Which database should we use?",
+                                "options": ["Postgres", "SQLite"],
+                                "multi": False,
+                                "selectedOptions": ["Postgres"],
+                                "customInput": None,
+                                "note": None,
+                                "timedOut": None,
+                            }
+                        ],
+                    },
+                },
+            )
+
+    def test_install_headless_ui_cancels_ask_dialog_and_keeps_client_alive(
+        self,
+    ) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui()
+            turn = client.prompt_and_wait("needs headless ask dialog", timeout=2.0)
+
+            self.assertEqual(
+                json.loads(turn.require_assistant_text()),
+                {
+                    "type": "extension_ui_response",
+                    "id": "ui-ask-2",
+                    "cancelled": True,
+                },
+            )
+            self.assertEqual(client.get_state().session_id, "fake-session")
+
 
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
