@@ -7,6 +7,7 @@
  * hashline DSL form. Other tools and surfaces fall through to
  * abort-and-retry handled by the agent loop.
  */
+import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { AssistantMessage, Model, ToolCall } from "../types";
 
 // Single source of truth for the marker pattern. `M` in the errata.
@@ -32,6 +33,17 @@ const HARMONY_CONTROL_TOKEN_ESCAPE_RE = /<\|(start|end|message|channel|constrain
  */
 export function escapeHarmonyControlTokens(text: string): string {
 	return text.replace(HARMONY_CONTROL_TOKEN_ESCAPE_RE, "<\\|$1\\|>");
+}
+
+/**
+ * Whether requests to `model` are served by a Harmony-dialect backend
+ * (gpt-5.x / gpt-oss), which rejects reserved control-token spellings appearing
+ * as data in the request. Resolves the wire model id (`requestModelId ?? id`)
+ * so deployment/catalog aliases — e.g. an Azure alias whose `requestModelId` is
+ * `gpt-5.4` — are detected even when the local id is opaque.
+ */
+export function isHarmonyDialectModel(model: Model): boolean {
+	return preferredDialect(model.requestModelId ?? model.id) === "harmony";
 }
 
 // Channel-word adjacency (`C`): channel/role name appearing immediately before the marker.

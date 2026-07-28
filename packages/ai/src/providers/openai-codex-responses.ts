@@ -1,6 +1,5 @@
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
-import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	CODEX_BASE_URL,
@@ -56,7 +55,7 @@ import {
 } from "../utils";
 import { clearStreamingPartialJson, kStreamingLastParseLen, kStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { escapeHarmonyControlTokens } from "../utils/harmony-leak";
+import { escapeHarmonyControlTokens, isHarmonyDialectModel } from "../utils/harmony-leak";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	armPreResponseTimeout,
@@ -106,6 +105,7 @@ import {
 	createSequentialCutoffSummaryState,
 	encodeResponsesToolCallId,
 	encodeTextSignatureV1,
+	escapeReplayedClientText,
 	finalizeCustomToolCallInputDone,
 	finalizeMessageText,
 	finalizePendingResponsesToolCalls,
@@ -4157,7 +4157,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 						knownCallIds.add(item.call_id);
 					}
 				}
-				messages.push(...replayItems);
+				messages.push(...(isHarmonyDialectModel(model) ? escapeReplayedClientText(replayItems) : replayItems));
 				msgIndex += 1;
 				continue;
 			}
@@ -4257,7 +4257,7 @@ function normalizeInputMessageContent(
 	// gpt-5.x codex rejects reserved Harmony control-token spellings in input
 	// data; escape the transport copy of untrusted user text so ordinary docs or
 	// grep results cannot poison the session (#6913). History is left untouched.
-	const escapeControlTokens = preferredDialect(model.id) === "harmony";
+	const escapeControlTokens = isHarmonyDialectModel(model);
 	if (typeof content === "string") {
 		if (!content || content.trim() === "") return [];
 		const text = content.toWellFormed();

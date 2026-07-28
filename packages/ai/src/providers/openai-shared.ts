@@ -1,6 +1,6 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { toFirepassWireModelId, toFireworksWireModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
-import { isGlm52ReasoningEffortModelId, isKimiK3ModelId, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { isGlm52ReasoningEffortModelId, isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type {
@@ -78,7 +78,7 @@ import {
 	kStreamingPartialJson,
 } from "../utils/block-symbols";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { escapeHarmonyControlTokens } from "../utils/harmony-leak";
+import { escapeHarmonyControlTokens, isHarmonyDialectModel } from "../utils/harmony-leak";
 import type { CapturedHttpErrorResponse } from "../utils/http-inspector";
 import { getOpenRouterHeaders } from "../utils/openrouter-headers";
 import { isForcedToolChoice } from "../utils/tool-choice";
@@ -1610,6 +1610,37 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	preserveAssistantMessageIds?: boolean;
 }
 
+/**
+ * Escape reserved Harmony control tokens in the client-boundary text of
+ * replayed Responses input items — user/developer/system message text and
+ * tool-result output. Model-owned items (assistant output, reasoning, tool-call
+ * arguments) carry no client data and are returned untouched.
+ *
+ * Native history replay pushes stored `providerPayload` items straight onto the
+ * wire, bypassing {@link convertResponsesInputContent}; without this a stored
+ * `input_text` carrying `<|channel|>analysis` still reaches gpt-5.x raw (#6913).
+ * Callers gate on {@link isHarmonyDialectModel}. Items are copied, not mutated.
+ */
+export function escapeReplayedClientText(items: ResponseInput): ResponseInput {
+	return items.map(item => {
+		if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+			return typeof item.output === "string" ? { ...item, output: escapeHarmonyControlTokens(item.output) } : item;
+		}
+		if (item.type === "message" && (item.role === "user" || item.role === "developer" || item.role === "system")) {
+			if (typeof item.content === "string") {
+				return { ...item, content: escapeHarmonyControlTokens(item.content) };
+			}
+			return {
+				...item,
+				content: item.content.map(part =>
+					part.type === "input_text" ? { ...part, text: escapeHarmonyControlTokens(part.text) } : part,
+				),
+			};
+		}
+		return item;
+	});
+}
+
 export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInputOptions<TApi>): ResponseInput {
 	const messages: ResponseInput = [];
 	const systemPrompts = options.systemRole ? normalizeSystemPrompts(options.context.systemPrompt) : [];
@@ -1641,7 +1672,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	// reserved control-token spellings; escape the transport copy of untrusted
 	// user/tool text so ordinary docs, code, or grep results cannot poison the
 	// session (#6913). The persisted transcript is never touched.
-	const escapeControlTokens = preferredDialect(options.model.id) === "harmony";
+	const escapeControlTokens = isHarmonyDialectModel(options.model);
 
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
@@ -1663,14 +1694,13 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 					supportsImageDetailOriginal,
 					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
-				messages.push(
-					...adaptResponsesReplayItemsForModel(
-						sanitizedItems,
-						supportsCustomToolCalls,
-						customToolWireNameMap,
-						options.model.supportsComputerUse === true,
-					),
+				const replayItems = adaptResponsesReplayItemsForModel(
+					sanitizedItems,
+					supportsCustomToolCalls,
+					customToolWireNameMap,
+					options.model.supportsComputerUse === true,
 				);
+				messages.push(...(escapeControlTokens ? escapeReplayedClientText(replayItems) : replayItems));
 				knownCallIds = collectKnownCallIds(messages);
 				for (const id of collectCustomCallIds(messages)) customCallIds.add(id);
 				for (const id of collectComputerCallIds(messages)) computerCallIds.add(id);
@@ -1984,7 +2014,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	// Harmony-server models reject reserved control-token spellings even as tool
 	// data; escape the transport copy so a grep/read result cannot poison the
 	// session (#6913). Covers every downstream branch that consumes `output`.
-	const output = preferredDialect(model.id) === "harmony" ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
+	const output = isHarmonyDialectModel(model) ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({
 			type: "message",

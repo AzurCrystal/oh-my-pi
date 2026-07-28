@@ -3,6 +3,7 @@ import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-
 import type { ResponseInput } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { AssistantMessage, Context, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai/types";
+import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { createCodexModel } from "./helpers";
 
@@ -125,5 +126,70 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 		);
 
 		expect(wire).toContain(MARKER);
+	});
+
+	it("detects Harmony via the wire model id for deployment/catalog aliases", () => {
+		// Opaque local id, gpt-5.4 on the wire (Azure-style alias). The gate must
+		// resolve `requestModelId`, not the non-Harmony local id.
+		const model = buildModel({
+			id: "my-azure-deployment",
+			requestModelId: "gpt-5.4",
+			name: "my-azure-deployment",
+			api: "openai-responses",
+			provider: "azure",
+			baseUrl: "https://example.openai.azure.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		const { context } = harmonyPoisonedContext();
+
+		const wire = collectWireText(
+			buildResponsesInput({ model, context, strictResponsesPairing: false, supportsImageDetailOriginal: false }),
+		);
+
+		expect(wire).toContain(ESCAPED);
+		expect(wire).not.toContain(MARKER);
+	});
+
+	it("escapes replayed native-history input items carrying a raw marker", () => {
+		const model = buildModel({
+			id: "gpt-5.6",
+			name: "gpt-5.6",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		// A stored client turn replayed verbatim via providerPayload — the branch
+		// that bypasses convertResponsesInputContent entirely.
+		const user: UserMessage = {
+			role: "user",
+			timestamp: 0,
+			content: "continue",
+			providerPayload: createOpenAIResponsesHistoryPayload("openai", [
+				{ type: "message", role: "user", content: [{ type: "input_text", text: `stored ${MARKER} turn` }] },
+				{ type: "function_call_output", call_id: "call_x", output: `tool said ${MARKER}` },
+			]),
+		};
+
+		const wire = collectWireText(
+			buildResponsesInput({
+				model,
+				context: { messages: [user] },
+				strictResponsesPairing: false,
+				supportsImageDetailOriginal: false,
+				nativeHistory: { replay: true, filterReasoning: false },
+			}),
+		);
+
+		expect(wire).toContain(ESCAPED);
+		expect(wire).not.toContain(MARKER);
 	});
 });
