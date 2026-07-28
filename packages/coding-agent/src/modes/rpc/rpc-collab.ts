@@ -1,0 +1,211 @@
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
+import { resolveCollabUrls } from "../../collab/config";
+import type { CollabGuestContext, CollabHostContext } from "../../collab/context";
+import { CollabGuestLink } from "../../collab/guest";
+import { CollabHost } from "../../collab/host";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { EventBus } from "../../utils/event-bus";
+
+export interface RpcCollabLinks {
+	link: string;
+	viewLink: string;
+	webLink: string;
+	webViewLink: string;
+}
+
+export interface RpcCollabParticipant {
+	name: string;
+	role: "host" | "guest";
+	readOnly: boolean;
+}
+
+export interface RpcCollabStatus {
+	role: "host" | "guest" | "none";
+	links: RpcCollabLinks | null;
+	participants: RpcCollabParticipant[];
+	readOnly: boolean;
+}
+
+/** Machine-readable reasons a guest action cannot be routed to the collab host. */
+export type RpcCollabGuestRoutingErrorCode = "not_guest" | "read_only" | "link_unavailable";
+
+/** Thrown when RPC attempts to route a guest action that cannot reach the host. */
+export class RpcCollabGuestRoutingError extends Error {
+	constructor(
+		message: string,
+		readonly code: RpcCollabGuestRoutingErrorCode,
+	) {
+		super(message);
+		this.name = "RpcCollabGuestRoutingError";
+	}
+}
+
+type RpcCollabContext = CollabHostContext & CollabGuestContext;
+
+const contexts = new WeakMap<AgentSession, RpcCollabContext>();
+
+function getContext(session: AgentSession, eventBus?: EventBus): RpcCollabContext {
+	let context = contexts.get(session);
+	if (!context) {
+		context = {
+			session,
+			sessionManager: session.sessionManager,
+			settings: session.settings,
+			eventBus,
+			showStatus: message => session.emitNotice("info", message, "collab"),
+			showError: message => session.emitNotice("error", message, "collab"),
+		};
+		contexts.set(session, context);
+	} else if (eventBus) {
+		context.eventBus = eventBus;
+	}
+	return context;
+}
+
+function links(host: CollabHost): RpcCollabLinks {
+	return {
+		link: host.link,
+		viewLink: host.viewLink,
+		webLink: host.webLink,
+		webViewLink: host.webViewLink,
+	};
+}
+
+function participants(host: CollabHost): RpcCollabParticipant[] {
+	return host.participants.map(participant => ({
+		name: participant.name,
+		role: participant.role,
+		readOnly: participant.readOnly === true,
+	}));
+}
+
+function writableGuest(session: AgentSession): CollabGuestLink {
+	const guest = contexts.get(session)?.collabGuest;
+	if (!guest) {
+		throw new RpcCollabGuestRoutingError("This session is not a collaboration guest", "not_guest");
+	}
+	if (guest.readOnly) {
+		throw new RpcCollabGuestRoutingError("This collaboration guest is read-only", "read_only");
+	}
+	if (!guest.isConnected) {
+		throw new RpcCollabGuestRoutingError("The collaboration guest link is unavailable", "link_unavailable");
+	}
+	return guest;
+}
+
+/** Whether this session is currently a collaboration guest replica. */
+export function isRpcCollabGuest(session: AgentSession): boolean {
+	return contexts.get(session)?.collabGuest !== undefined;
+}
+
+/**
+ * Route a guest message to the authoritative host. The collab protocol has one
+ * prompt frame, so normal prompts, steer, and follow-up share host-side steer semantics.
+ */
+export function sendRpcCollabGuestPrompt(session: AgentSession, text: string, images?: ImageContent[]): void {
+	writableGuest(session).sendPrompt(text, images);
+}
+
+/** Route a guest abort to the authoritative host. */
+export function sendRpcCollabGuestAbort(session: AgentSession): void {
+	writableGuest(session).sendAbort();
+}
+
+/** Start sharing the current session through the configured collaboration relay. */
+export async function startRpcCollabHosting(
+	session: AgentSession,
+	relayUrl?: string,
+	eventBus?: EventBus,
+): Promise<RpcCollabLinks> {
+	const context = getContext(session, eventBus);
+	if (context.collabGuest) throw new Error("Already in a collab session as a guest; leave first");
+	if (context.collabHost) return links(context.collabHost);
+
+	const urls = resolveCollabUrls(session.settings, relayUrl);
+	if (!urls) throw new Error("No collaboration relay configured");
+
+	const host = new CollabHost(context);
+	await host.start(urls.relayUrl, urls.webUrl);
+	context.collabHost = host;
+	return links(host);
+}
+
+/** Stop sharing the current session. No-op when the session is not hosting. */
+export async function stopRpcCollabHosting(session: AgentSession): Promise<void> {
+	await contexts.get(session)?.collabHost?.stop("host stopped");
+}
+
+/** Read the collaboration role, links, and participant display names. */
+export async function getRpcCollabStatus(session: AgentSession): Promise<RpcCollabStatus> {
+	const context = contexts.get(session);
+	const host = context?.collabHost;
+	if (host) {
+		return {
+			role: "host",
+			links: links(host),
+			participants: participants(host),
+			readOnly: false,
+		};
+	}
+	const guest = context?.collabGuest;
+	if (guest) {
+		return {
+			role: "guest",
+			links: null,
+			participants:
+				guest.state?.participants.map(participant => ({
+					name: participant.name,
+					role: participant.role,
+					readOnly: participant.readOnly === true,
+				})) ?? [],
+			readOnly: guest.readOnly,
+		};
+	}
+	return { role: "none", links: null, participants: [], readOnly: false };
+}
+
+/** Join a shared session and replicate it into the supplied AgentSession. */
+export async function joinRpcCollabSession(
+	session: AgentSession,
+	link: string,
+	eventBus?: EventBus,
+	onEvent?: (event: AgentSessionEvent) => void,
+	onUiRequest?: (request: CollabUiRequest, signal: AbortSignal) => Promise<CollabUiResponseValue>,
+): Promise<RpcCollabStatus> {
+	const context = getContext(session, eventBus);
+	if (context.collabHost) throw new Error("Stop hosting before joining a collab session");
+	if (context.collabGuest) throw new Error("Already in a collab session; leave first");
+	context.handleEvent = onEvent;
+	context.handleUiRequest = onUiRequest;
+	const guest = new CollabGuestLink(context);
+	await guest.join(link);
+	return getRpcCollabStatus(session);
+}
+
+/** Leave a guest session, or stop hosting when called by the current host. */
+export async function leaveRpcCollabSession(session: AgentSession): Promise<void> {
+	const context = contexts.get(session);
+	if (context?.collabGuest) {
+		await context.collabGuest.leave("left");
+		return;
+	}
+	await context?.collabHost?.stop("host stopped");
+}
+
+/** Dispose every collaboration relay owned by this session. No-op when inactive. */
+export async function disposeRpcCollab(session: AgentSession): Promise<void> {
+	const context = contexts.get(session);
+	if (!context) return;
+	const guest = context.collabGuest;
+	const host = context.collabHost;
+	try {
+		await guest?.leave("session ended");
+	} finally {
+		try {
+			await host?.stop("session ended");
+		} finally {
+			contexts.delete(session);
+		}
+	}
+}
