@@ -6030,28 +6030,91 @@ export class AgentSession {
 		await beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 
-		this.#disconnectFromAgent();
-		await this.abort();
-		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: newSessionOptions.drop !== true });
+		const previousSessionState = this.sessionManager.captureState();
+		const previousAgentMessages = [...this.agent.state.messages];
+		const previousSteeringMessages = [...this.agent.peekSteeringQueue()];
+		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
+		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 		let sessionTransitioned = false;
+
+		const activateCommittedSession = (): void => {
+			try {
+				try {
+					this.#cancelOwnAsyncJobs();
+					this.#closeAllProviderSessions("new session");
+				} finally {
+					this.agent.reset();
+				}
+			} finally {
+				// A committed transcript must never remain detached, including when
+				// reset or an earlier synchronous cleanup step throws.
+				this.#reconnectToAgent();
+			}
+		};
+
+		this.#disconnectFromAgent();
 		try {
-			await this.sessionManager.newSession({
-				...newSessionOptions,
-				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
+			await this.abort();
+			const bashTransition = this.#bash.beginSessionTransition({
+				persistDetached: newSessionOptions.drop !== true,
 			});
-			sessionTransitioned = true;
-			onCommitted?.();
-			this.#bash.markSessionTransition(bashTransition);
-			// The new session owns the transcript from here, so the previous
-			// conversation's advisor spend is retired with it. Clearing at the commit
-			// point keeps the status line honest even if a later step below throws.
-			this.#advisors.clearCost();
-		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			try {
+				await this.sessionManager.newSession({
+					...newSessionOptions,
+					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
+				});
+				sessionTransitioned = true;
+				onCommitted?.();
+				this.#bash.markSessionTransition(bashTransition);
+				// The new session owns the transcript from here, so the previous
+				// conversation's advisor spend is retired with it. Clearing at the commit
+				// point keeps the status line honest even if a later step below throws.
+				this.#advisors.clearCost();
+			} finally {
+				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			}
+		} catch (error) {
+			if (!sessionTransitioned) {
+				try {
+					this.sessionManager.restoreState(previousSessionState);
+				} finally {
+					try {
+						this.agent.replaceMessages(previousAgentMessages);
+						this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
+						this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
+						this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+					} finally {
+						this.#reconnectToAgent();
+					}
+				}
+			} else {
+				try {
+					activateCommittedSession();
+				} catch (activationError) {
+					logger.warn("Failed to activate committed session after new-session error", {
+						error: String(activationError),
+					});
+				}
+				try {
+					this.#syncAgentSessionId();
+					this.#memory.rekeyForCurrentSessionId();
+				} catch (syncError) {
+					logger.warn("Failed to synchronize committed session after new-session error", {
+						error: String(syncError),
+					});
+				}
+			}
+			throw error;
 		}
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
-		this.agent.reset();
+
+		try {
+			activateCommittedSession();
+		} finally {
+			this.#syncAgentSessionId();
+			this.#memory.rekeyForCurrentSessionId();
+		}
+
 		if (newSessionOptions.drop && previousSessionFile) {
 			// Stop the old recorder before deleting its transcript and artifacts.
 			await this.#advisors.detachAndCloseRecorders();
@@ -6067,8 +6130,6 @@ export class AgentSession {
 		this.setTodoPhases([]);
 		this.#freshProviderSessionId = undefined;
 		this.#clearInheritedProviderPromptCacheKey();
-		this.#syncAgentSessionId();
-		this.#memory.rekeyForCurrentSessionId();
 		await this.#memory.resetContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -6080,7 +6141,6 @@ export class AgentSession {
 		this.#planReferenceSent = false;
 		this.#planReferencePath = "local://PLAN.md";
 		this.#advisors.resetSessionState();
-		this.#reconnectToAgent();
 		// The workspace-roots block must reflect the new session's directory set,
 		// not the previous session's — refresh before the next turn goes out.
 		await this.refreshBaseSystemPrompt();
@@ -7269,7 +7329,11 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			throw error;
 		}
-		options?.onCommitted?.();
+		try {
+			options?.onCommitted?.();
+		} finally {
+			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs();
+		}
 		return true;
 	}
 

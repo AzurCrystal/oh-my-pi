@@ -43,7 +43,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: false }]);
 	});
 
-	test("does not emit false prompt_result when an extension command schedules a user message", async () => {
+	test("emits true prompt_result when an extension command schedules a user message", async () => {
 		const output: object[] = [];
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
 		const trackedPrompt = extensionUserMessages.watchPrompt(() => {
@@ -62,10 +62,10 @@ describe("reportLocalOnlyPromptResult", () => {
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
 
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: true }]);
 	});
 
-	test("does not emit false prompt_result when an extension command schedules a triggerTurn custom message", async () => {
+	test("emits true prompt_result when an extension command schedules a triggerTurn custom message", async () => {
 		const output: object[] = [];
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
 		const trackedPrompt = extensionUserMessages.watchPrompt(() => {
@@ -84,7 +84,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		});
 		await waitForPromptHandlers(trackedPrompt.prompt);
 
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: true }]);
 	});
 
 	test("ignores extension user messages scheduled before the watched prompt", async () => {
@@ -150,7 +150,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(sentOptions).toEqual({ triggerTurn: true });
 	});
 
-	test("suppresses prompt_result when extension sendUserMessage succeeds", async () => {
+	test("emits true prompt_result when extension sendUserMessage succeeds", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		let sentContent: unknown;
 		const output: object[] = [];
@@ -198,7 +198,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		await waitForTrackedPromptHandlers(trackedPrompt);
 
 		expect(sentContent).toBe("start work");
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_success", agentInvoked: true }]);
 	});
 
 	test("emits prompt_result when extension sendUserMessage rejects", async () => {
@@ -253,7 +253,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected", agentInvoked: false }]);
 	});
 
-	test("does not emit when prompt invokes the agent", async () => {
+	test("emits one correlated true result when prompt invokes the agent", async () => {
 		const output: object[] = [];
 		const prompt = Promise.resolve(true);
 
@@ -267,7 +267,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		});
 		await waitForPromptHandlers(prompt);
 
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: true }]);
 	});
 
 	test("reports prompt rejection without emitting output", async () => {
@@ -311,7 +311,7 @@ describe("watchAndReportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: false }]);
 	});
 
-	test("does not report builtin residual prompts that invoke the agent", async () => {
+	test("reports builtin residual prompts that invoke the agent", async () => {
 		const output: object[] = [];
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
 
@@ -327,6 +327,6 @@ describe("watchAndReportLocalOnlyPromptResult", () => {
 		});
 		await waitForPromptHandlers(prompt);
 
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: true }]);
 	});
 });

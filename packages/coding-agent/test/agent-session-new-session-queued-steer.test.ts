@@ -140,7 +140,7 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		expect(branchText).not.toContain(LATE_OUTPUT);
 	});
 
-	it("preserves the outgoing agent and queues when persistence preflight fails", async () => {
+	it("restores the outgoing agent and queues when abort fails after disconnect", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let providerCalls = 0;
 		const mock: MockModel = createMockModel({
@@ -171,17 +171,64 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 			timestamp: Date.now(),
 		});
 		const before = collectText(agent.state.messages);
-		const failure = new Error("session flush failed");
-		const flush = vi.spyOn(sessionManager, "flush").mockRejectedValueOnce(failure);
+		const failure = new Error("abort cleanup failed");
+		const originalAbort = session.abort.bind(session);
+		const abort = vi.spyOn(session, "abort").mockImplementationOnce(async options => {
+			await originalAbort(options);
+			throw failure;
+		});
 
 		await expect(session.newSession()).rejects.toBe(failure);
 
 		expect(collectText(agent.state.messages)).toEqual(before);
 		expect(agent.hasQueuedMessages()).toBe(true);
-		flush.mockRestore();
+		abort.mockRestore();
 
 		await session.prompt("retry current session");
 		await agent.waitForIdle();
 		expect(providerCalls).toBeGreaterThan(1);
+	});
+
+	it("keeps the committed session connected when post-reset initialization throws", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let providerCalls = 0;
+		const mock: MockModel = createMockModel({
+			handler: async () => {
+				providerCalls++;
+				return { content: [`response-${providerCalls}`], stopReason: "stop" };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+
+		await session.prompt(OLD_USER);
+		const failure = new Error("new-session metadata append failed");
+		const appendThinkingLevelChange = vi
+			.spyOn(sessionManager, "appendThinkingLevelChange")
+			.mockImplementationOnce(() => {
+				throw failure;
+			});
+
+		await expect(session.newSession()).rejects.toBe(failure);
+
+		expect(appendThinkingLevelChange).toHaveBeenCalledTimes(1);
+		appendThinkingLevelChange.mockRestore();
+		expect(collectText(agent.state.messages)).not.toContain(OLD_USER);
+
+		await session.prompt("fresh session prompt");
+		await agent.waitForIdle();
+		const persisted = collectText(sessionManager.buildSessionContext().messages);
+		expect(persisted).toContain("fresh session prompt");
+		expect(persisted).toContain("response-2");
 	});
 });

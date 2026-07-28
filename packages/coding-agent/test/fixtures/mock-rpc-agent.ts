@@ -88,10 +88,8 @@ for await (const raw of console) {
 					success: true,
 					data: agentInvoked === undefined ? undefined : { agentInvoked },
 				});
-				if (frame.message === "local-only") {
-					await Promise.resolve();
-					writeFrame({ type: "prompt_result", id, agentInvoked: false });
-				}
+				await Promise.resolve();
+				writeFrame({ type: "prompt_result", id, agentInvoked: agentInvoked ?? false });
 				continue;
 			}
 			if (frame.type === "get_messages_page") {

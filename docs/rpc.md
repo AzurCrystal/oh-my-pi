@@ -77,7 +77,7 @@ The table below names the 18 asynchronous frames and event variants a standalone
 | `extension_ui_request` | An extension, login flow, collab host, or tool needs host UI. Requests that expect an answer are completed with `extension_ui_response`. | Automatic; use `RpcClient.onExtensionUiRequest`. |
 | `extension_error` | An extension event handler throws. | Automatic raw stdout frame; the TypeScript client has no dedicated listener. |
 | `available_commands_update` | Emitted once at startup and whenever slash-command metadata changes. | Automatic; use `RpcClient.onAvailableCommandsUpdate`. |
-| `prompt_result` | An immediately acknowledged scheduled `prompt` later finishes locally without invoking the agent. | Automatic; use `RpcClient.onPromptResult` and correlate by `id`. Use `promptWithResult` when the immediate `agentInvoked` outcome is also needed. |
+| `prompt_result` | A successfully resolved `prompt` reports whether it invoked agent work (`true`) or completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`. | Automatic; use `RpcClient.onPromptResult`. Use `promptWithResult` when the outcome already known in the acknowledgement is also needed. |
 | `subagent_lifecycle` | A subscribed subagent starts, stops, or changes lifecycle state. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentLifecycle`. |
 | `subagent_progress` | A subscribed subagent publishes progress. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentProgress`. |
 | `subagent_event` | A subscribed subagent emits its underlying session event. | Send `set_subagent_subscription` with `level: "events"`, then use `RpcClient.onSubagentEvent`. |
@@ -138,7 +138,7 @@ Important edge behavior from runtime:
 - Unknown command responses preserve the request `id` when one was provided.
 - Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
+- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means it invoked agent work; omitted means the outcome is still resolving and will arrive in the correlated `prompt_result`.
 - `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
 
 ## Command Schema (canonical)
@@ -220,7 +220,7 @@ There is no separate reset command. A descriptor with `nullable: true` accepts `
 - `{ id?, type: "approve_plan_proposal", editedContent?: string, strategy?: "execute" | "keep-context" | "compact-context", executionModel?: { provider: string, modelId: string }, thinkingLevel?: ConfiguredThinkingLevel }`
 - `{ id?, type: "reject_plan_proposal", feedback?: string }`
 
-Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPlanDecisionResult`. Every plan snapshot includes `paused`. `pause_plan_mode` preserves plan mode as the persisted `plan_paused` session mode and returns `{ enabled: false, paused: true, ... }`; `resume_plan_mode` restores the active plan runtime. Approval may replace the proposal with `editedContent`. `execute` starts a new execution session, `keep-context` executes in the current context, and `compact-context` compacts the current context before execution. `executionModel` and `thinkingLevel` select the execution turn.
+Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPlanDecisionResult`. Every plan snapshot includes `paused`. `pause_plan_mode` preserves plan mode as the persisted `plan_paused` session mode and returns `{ enabled: false, paused: true, ... }`; `resume_plan_mode` restores the active plan runtime. Approval may replace the proposal with `editedContent`. `execute` starts a new execution session, `keep-context` executes in the current context, and `compact-context` compacts the current context before execution. `executionModel` and `thinkingLevel` select the execution turn. A collaboration guest cannot use `strategy: "execute"` until it calls `leave_collab_session`; the proposal remains pending and plan mode remains active.
 
 #### Goal and guided-goal modes
 
@@ -255,7 +255,7 @@ Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_st
 - `{ id?, type: "get_pause_state" }`
 - `{ id?, type: "get_session_tree" }`
 
-Loop state reports `enabled`, `state`, `action`, `prompt`, and an optional iteration or duration limit. `cancel_loop_iteration` pauses future repeats and aborts only the active loop turn. Pause commands operate on the process-wide agent pause gate.
+Loop state reports `enabled`, `state`, `action`, `prompt`, and an optional iteration or duration limit. `cancel_loop_iteration` pauses future repeats and aborts only the active loop turn. `action: "reset"` starts a new session and is rejected for collaboration guests before the loop is enabled; call `leave_collab_session` first. Other loop actions are unchanged. Pause commands operate on the process-wide agent pause gate.
 
 `get_session_tree` returns `{ leafId, tree }`. Every node's `id` is a valid `navigate_tree.targetId`; clients MUST use these ids rather than deriving targets from messages or labels.
 
@@ -468,7 +468,7 @@ Realtime `/live` and harness-side microphone STT emit `voice_event` frames. Spee
 - `{ id?, type: "join_collab_session", link: string }`
 - `{ id?, type: "leave_collab_session" }`
 
-After `join_collab_session` makes the RPC session a guest, `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` are routed to the authoritative host instead of mutating the local replica. Normal prompt, steer, and follow-up share the collab protocol's host-side steer path. A guest-routing failure uses `code: "not_guest"`, `"read_only"`, or `"link_unavailable"` so clients need not match error text. Remote host dialog requests reuse `extension_ui_request`.
+After `join_collab_session` makes the RPC session a guest, `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` are routed to the authoritative host instead of mutating the local replica. Normal prompt, steer, and follow-up share the collab protocol's host-side steer path. Session-changing entrypoints (`new_session`, `switch_session`, `branch`, `fork`, `branch_btw`, active-session deletion, plan approval with `strategy: "execute"`, and loops with `action: "reset"`) fail with `code: "operation_failed"` and instruct the client to call `leave_collab_session`; deleting a non-active session remains allowed. A guest-routing failure uses `code: "not_guest"`, `"read_only"`, or `"link_unavailable"` so clients need not match error text. Remote host dialog requests reuse `extension_ui_request`.
 
 ## Response Schema
 
@@ -493,15 +493,18 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 }
 ```
 
-`data.agentInvoked: false` is a completion signal for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the prompt produced agent lifecycle events; those events can be emitted before or after the prompt response depending on the command path. Older runtimes may omit `data`; hosts should then rely on `agent_end`, custom message completion, or `prompt_result`.
+`data.agentInvoked: false` is an immediate outcome for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` is an immediate outcome for prompts that invoke agent work. Older runtimes may omit `data`; current runtimes always follow with one correlated `prompt_result` when the outcome is known.
 
-`prompt_result` is emitted when a prompt was accepted immediately but later resolves as local-only:
+`prompt_result` carries that terminal prompt outcome for both values:
 
 ```json
-{ "type": "prompt_result", "id": "req_1", "agentInvoked": false }
+[
+  { "type": "prompt_result", "id": "req_1", "agentInvoked": false },
+  { "type": "prompt_result", "id": "req_2", "agentInvoked": true }
+]
 ```
 
-Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
+Local-only slash commands may emit `command_output` frames before their `prompt_result`. They do not emit `agent_end`. A `true` result means agent work was invoked; use `agent_end` separately when the host must wait for that run to finish.
 
 ### `get_state` payload
 
@@ -929,9 +932,9 @@ This is the most important operational behavior.
 
 That means:
 
-- command acceptance != run completion
-- agent turns complete via `agent_end`
-- local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
+- command acceptance != prompt outcome or run completion
+- each prompt outcome arrives in the same-id `prompt_result`
+- agent runs complete via `agent_end`; local-only prompts have no agent lifecycle
 
 ### While streaming
 

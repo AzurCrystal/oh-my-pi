@@ -773,7 +773,7 @@ export class RpcClient {
 		return () => this.#idleRecapListeners.delete(listener);
 	}
 
-	/** Subscribe to asynchronous completion of prompts handled without an agent turn. */
+	/** Subscribe to correlated terminal prompt outcomes for both agent-invoking and local-only prompts. */
 	onPromptResult(listener: RpcPromptResultListener): () => void {
 		this.#promptResultListeners.add(listener);
 		return () => this.#promptResultListeners.delete(listener);

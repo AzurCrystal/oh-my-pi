@@ -30,6 +30,7 @@ import {
 	VibeSessionRegistry,
 } from "../../vibe/runtime";
 import { readRpcLoopState } from "./rpc-runtime-control";
+import { assertRpcSessionTransitionAllowed } from "./rpc-session-guard";
 
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
 
@@ -625,6 +626,7 @@ export async function approveRpcPlanProposal(
 	if (strategy !== "execute" && strategy !== "keep-context" && strategy !== "compact-context") {
 		throw new Error(`Unknown plan finalization strategy: ${String(strategy)}`);
 	}
+	if (strategy === "execute") assertRpcSessionTransitionAllowed(session);
 
 	const planContent =
 		editedContent ??

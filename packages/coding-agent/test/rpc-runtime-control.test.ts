@@ -1,6 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
-import { installRpcRuntimeControl, pauseRpcAgents } from "../src/modes/rpc/rpc-runtime-control";
+import * as rpcCollab from "../src/modes/rpc/rpc-collab";
+import {
+	enableRpcLoop,
+	installRpcRuntimeControl,
+	pauseRpcAgents,
+	readRpcLoopState,
+} from "../src/modes/rpc/rpc-runtime-control";
 import type { AgentSession } from "../src/session/agent-session";
 
 function fakeSession(): AgentSession {
@@ -12,6 +18,40 @@ function fakeSession(): AgentSession {
 
 afterEach(() => {
 	agentPauseGate.resume();
+	vi.restoreAllMocks();
+});
+
+describe("RPC runtime loop guest guard", () => {
+	test("rejects reset before installing the loop or submitting its first prompt", async () => {
+		const subscribe = vi.fn(() => () => {});
+		const prompt = vi.fn(async () => {});
+		const newSession = vi.fn(async () => true);
+		const session = {
+			isDisposed: false,
+			isStreaming: false,
+			isCompacting: false,
+			hasPostPromptWork: false,
+			subscribe,
+			prompt,
+			newSession,
+			settings: { get: () => "prompt" },
+			getVibeModeState: () => undefined,
+		} as unknown as AgentSession;
+		vi.spyOn(rpcCollab, "isRpcCollabGuest").mockReturnValue(true);
+
+		await expect(enableRpcLoop(session, "repeat", "reset")).rejects.toThrow("Run leave_collab_session first.");
+
+		expect(await readRpcLoopState(session)).toEqual({
+			enabled: false,
+			state: "waiting",
+			action: null,
+			prompt: null,
+			limit: null,
+		});
+		expect(subscribe).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(newSession).not.toHaveBeenCalled();
+	});
 });
 
 describe("RPC runtime pause control", () => {

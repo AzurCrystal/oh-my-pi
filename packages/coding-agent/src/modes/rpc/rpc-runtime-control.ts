@@ -9,6 +9,7 @@ import {
 	type LoopLimitConfig,
 	type LoopLimitRuntime,
 } from "../loop-limit";
+import { assertRpcSessionTransitionAllowed } from "./rpc-session-guard";
 
 const LOOP_RESUBMIT_DELAY_MS = 800;
 
@@ -182,6 +183,7 @@ async function runLoopIteration(session: AgentSession, runtime: RpcRuntimeContro
 		scheduleLoopTask(runtime, () => runLoopIteration(session, runtime));
 		return;
 	}
+	if (loop.action === "reset") assertRpcSessionTransitionAllowed(session);
 	if (loop.action === "reset" && session.getVibeModeState()?.enabled) {
 		disableLoop(runtime);
 		return;
@@ -269,12 +271,15 @@ export async function enableRpcLoop(
 ): Promise<RpcLoopState> {
 	if (session.isDisposed) throw new Error("Cannot enable loop on a disposed session.");
 	if (!prompt.trim()) throw new Error("Loop prompt must not be empty.");
+	const loopAction = action ?? session.settings.get("loop.mode");
+	if (loopAction === "reset") assertRpcSessionTransitionAllowed(session);
+	const limit = loopLimit(count, durationMs);
 	const runtime = runtimeFor(session);
 	disableLoop(runtime);
 	runtime.loop.enabled = true;
-	runtime.loop.action = action ?? session.settings.get("loop.mode");
+	runtime.loop.action = loopAction;
 	runtime.loop.prompt = prompt;
-	runtime.loop.limit = loopLimit(count, durationMs);
+	runtime.loop.limit = limit;
 	void submitLoopPromptWhenReady(session, runtime).catch(error => reportLoopFailure(runtime, error));
 	return loopSnapshot(runtime);
 }

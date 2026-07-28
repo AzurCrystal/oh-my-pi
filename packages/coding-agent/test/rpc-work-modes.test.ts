@@ -1,13 +1,17 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import * as rpcCollab from "../src/modes/rpc/rpc-collab";
 import {
+	approveRpcPlanProposal,
 	beginRpcGuidedGoal,
 	clearRpcTransientModeState,
 	enterRpcPlanMode,
 	enterRpcVibeMode,
 	exitRpcPlanMode,
 	exitRpcVibeMode,
+	submitRpcPlanReview,
 } from "../src/modes/rpc/rpc-work-modes";
 import type { PlanModeState } from "../src/plan-mode/state";
 import type { AgentSession } from "../src/session/agent-session";
@@ -54,8 +58,8 @@ function createVibeSession(
 	return { session, activeTools: () => [...activeTools] };
 }
 
-function createPlanSession() {
-	const sessionManager = SessionManager.inMemory(".");
+function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
+	const sessionManager = SessionManager.inMemory(options?.cwd ?? ".");
 	const baseModel = { id: "base-model", provider: "test" } as unknown as Model;
 	const planModel = { id: "plan-model", provider: "test" } as unknown as Model;
 	let activeTools = ["read", "bash"];
@@ -63,6 +67,7 @@ function createPlanSession() {
 	let nextToolRestoreError: Error | undefined;
 	let nextModelRestoreError: Error | undefined;
 	let planModeState: PlanModeState | undefined;
+	const newSession = vi.fn(async () => true);
 	const session = {
 		sessionManager,
 		isStreaming: false,
@@ -81,6 +86,13 @@ function createPlanSession() {
 		getVibeModeState: () => undefined,
 		setVibeModeState: () => {},
 		setPlanProposalHandler: () => {},
+		preparePlanForReview: async (title: string) => ({
+			details: {
+				planFilePath: options?.proposalPath ?? "local://PLAN.md",
+				title,
+				planExists: true,
+			},
+		}),
 		getPlanReferencePath: () => undefined,
 		hasBuiltInTool: (name: string) => name === "write",
 		getEnabledToolNames: () => [...activeTools],
@@ -103,10 +115,14 @@ function createPlanSession() {
 			activeModel = model;
 		},
 		setThinkingLevel: () => {},
+		newSession,
+		setPlanReferencePath: () => {},
+		markPlanReferenceSent: () => {},
 	} as unknown as AgentSession;
 	return {
 		session,
 		sessionManager,
+		newSession,
 		activeTools: () => [...activeTools],
 		activeModelId: () => activeModel.id,
 		failNextToolRestore: (error: Error) => {
@@ -183,6 +199,31 @@ describe("RPC guided goal", () => {
 			"Goal mode is disabled. Enable it in settings (goal.enabled).",
 		);
 		expect(disabled.setActiveToolsByName).not.toHaveBeenCalled();
+	});
+});
+
+describe("RPC plan proposal guest guard", () => {
+	test("rejects execute before leaving plan mode or creating a session", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-guest-");
+		try {
+			await Bun.write(tempDir.join("PLAN.md"), "# Guest execution plan\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: tempDir.join("PLAN.md") });
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Guest execution");
+			const entriesBefore = plan.sessionManager.getEntries().length;
+			vi.spyOn(rpcCollab, "isRpcCollabGuest").mockReturnValue(true);
+
+			await expect(approveRpcPlanProposal(plan.session, undefined, "execute")).rejects.toThrow(
+				"Run leave_collab_session first.",
+			);
+
+			expect(plan.newSession).not.toHaveBeenCalled();
+			expect(plan.session.getPlanModeState()?.enabled).toBe(true);
+			expect(plan.activeTools()).toEqual(["read", "bash", "write"]);
+			expect(plan.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		} finally {
+			await tempDir.remove();
+		}
 	});
 });
 

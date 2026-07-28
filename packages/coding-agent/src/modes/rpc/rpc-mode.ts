@@ -81,6 +81,7 @@ import * as rpcMcp from "./rpc-mcp";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import * as rpcModelRoles from "./rpc-model-roles";
 import * as rpcRuntimeControl from "./rpc-runtime-control";
+import { getRpcSessionTransitionGuestBlock } from "./rpc-session-guard";
 import { buildRpcSessionView } from "./rpc-session-view";
 import { buildRpcSettingsSnapshot, validateRpcSettingValue } from "./rpc-settings";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -113,6 +114,7 @@ import { buildRpcRepoStatus, readRpcUsageReports } from "./rpc-workspace";
 
 // Re-export types for consumers
 export type * from "./rpc-types";
+export { getRpcSessionTransitionGuestBlock };
 
 export type PendingExtensionRequest = {
 	resolve: (response: RpcExtensionUIResponse) => void;
@@ -174,15 +176,6 @@ export interface RpcSessionTransitionOutcome<T> {
 	committed: boolean;
 	/** True when the incoming session may adopt the plan-on-startup default. */
 	honorPlanDefault: boolean;
-}
-export function getRpcSessionTransitionGuestBlock(
-	session: AgentSession,
-): { message: string; code: "operation_failed" } | undefined {
-	if (!rpcCollab.isRpcCollabGuest(session)) return undefined;
-	return {
-		message: "Session changes are unavailable while joined as a collaboration guest. Run leave_collab_session first.",
-		code: "operation_failed",
-	};
 }
 
 /**
@@ -262,11 +255,12 @@ export function reportLocalOnlyPromptResult(input: {
 }): void {
 	void input.prompt
 		.then(async agentInvoked => {
-			if (agentInvoked) return;
 			await input.waitForExtensionAgentMessageTasks?.();
-			if (!input.hasExtensionAgentMessageTask?.()) {
-				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
-			}
+			input.output({
+				type: "prompt_result",
+				id: input.id,
+				agentInvoked: agentInvoked || (input.hasExtensionAgentMessageTask?.() ?? false),
+			});
 		})
 		.catch(error => {
 			input.onError(error instanceof Error ? error : new Error(String(error)));
@@ -282,7 +276,7 @@ type RpcExtensionUserMessageScope = {
  * Tracks extension-originated messages while an RPC prompt is executing.
  * A slash command can resolve the outer prompt as local-only while also
  * scheduling agent work through pi.sendUserMessage() or pi.sendMessage()
- * with triggerTurn; that prompt must not report agentInvoked:false to the host.
+ * with triggerTurn; the terminal result must include that nested agent work.
  */
 export class RpcExtensionUserMessageTracker {
 	#activePromptScopes = new Set<RpcExtensionUserMessageScope>();
@@ -1747,39 +1741,52 @@ export async function runRpcMode(
 						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
 					);
 				}
+				const resolvedPrompt = (agentInvoked: boolean): RpcResponse => {
+					output({ type: "prompt_result", id, agentInvoked });
+					return success(id, "prompt", { agentInvoked });
+				};
 				let message = command.message.trim();
 				let images = command.images ? [...command.images] : undefined;
+				let inputAgentInvoked: Promise<boolean> | undefined;
 				const runner = session.extensionRunner;
 				if (runner?.hasHandlers("input")) {
-					const inputResult = await runner.emitInput(message, images, "rpc");
+					const trackedInput = extensionUserMessageTracker.watchPrompt(() =>
+						runner.emitInput(message, images, "rpc"),
+					);
+					const inputResult = await trackedInput.prompt;
+					inputAgentInvoked = trackedInput
+						.waitForAgentMessageTasks()
+						.then(() => trackedInput.hasAgentMessageTask());
 					if (inputResult?.handled) {
-						return success(id, "prompt", { agentInvoked: false });
+						return resolvedPrompt(await inputAgentInvoked);
 					}
 					if (inputResult?.text !== undefined) message = inputResult.text.trim();
 					if (inputResult?.images !== undefined) images = inputResult.images;
 				}
 				if (!message && !images?.length) {
-					return success(id, "prompt", { agentInvoked: false });
+					return resolvedPrompt(inputAgentInvoked ? await inputAgentInvoked : false);
 				}
 
 				recordPromptHistory(message);
 				const skillResult = await tryRunRpcSkillCommand(session, message, command.streamingBehavior);
 				if (skillResult) {
-					return success(id, "prompt", skillResult);
+					return resolvedPrompt(skillResult.agentInvoked);
 				}
 				const builtinResult = await executeRpcBuiltinSlashCommand(message);
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
+							startPrompt: async () =>
+								(await session.prompt(builtinResult.prompt, { images })) ||
+								(inputAgentInvoked ? await inputAgentInvoked : false),
 							output,
 							onError: promptError => output(error(id, "prompt", promptError.message)),
 							extensionUserMessageTracker,
 						});
 						return success(id, "prompt");
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					return resolvedPrompt(inputAgentInvoked ? await inputAgentInvoked : false);
 				}
 
 				// Don't await - events will stream
@@ -1787,11 +1794,11 @@ export async function runRpcMode(
 				// If streaming and streamingBehavior specified, queues via steer/followUp
 				watchAndReportLocalOnlyPromptResult({
 					id,
-					startPrompt: () =>
-						session.prompt(message, {
+					startPrompt: async () =>
+						(await session.prompt(message, {
 							images,
 							streamingBehavior: command.streamingBehavior,
-						}),
+						})) || (inputAgentInvoked ? await inputAgentInvoked : false),
 					output,
 					onError: promptError => output(error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
@@ -1856,8 +1863,13 @@ export async function runRpcMode(
 			case "cancel_btw":
 				return moduleCommand(id, "cancel_btw", () => rpcBtw.cancelRpcBtw(session));
 
-			case "branch_btw":
+			case "branch_btw": {
+				const guestBlock = getRpcSessionTransitionGuestBlock(session);
+				if (guestBlock) {
+					return error(id, "branch_btw", guestBlock.message, guestBlock.code);
+				}
 				return moduleCommand(id, "branch_btw", () => rpcBtw.branchRpcBtw(session));
+			}
 
 			case "complete": {
 				const provider = buildRpcAutocompleteProvider();

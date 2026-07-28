@@ -281,8 +281,8 @@ export interface SessionTransitionOptions {
 	beforeCommit?: () => Promise<void>;
 	/**
 	 * Runs exactly once after the transition can no longer restore the outgoing
-	 * session. It is independent of the operation's return so callers still
-	 * observe a commit when later initialization or hooks throw.
+	 * session. It is independent of the operation's return, and throwing from
+	 * this callback does not roll back the committed session or leave it detached.
 	 */
 	onCommitted?: () => void;
 }
