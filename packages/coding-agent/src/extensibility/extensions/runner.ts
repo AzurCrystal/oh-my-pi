@@ -69,6 +69,48 @@ interface BeforeAgentStartCombinedResult {
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
+/** A deeply JSON-safe value suitable for handing to an out-of-process observer. */
+export type ExtensionJsonSnapshot =
+	| null
+	| boolean
+	| number
+	| string
+	| ExtensionJsonSnapshot[]
+	| { [key: string]: ExtensionJsonSnapshot };
+
+/** Final context or provider body observed immediately before a provider request. */
+export type ExtensionProviderRequestObservation =
+	| {
+			type: "context";
+			/** Runner-local sequence assigned when the context hook chain completes. */
+			requestId: number;
+			messages: ExtensionJsonSnapshot;
+			/** Present only when the value cannot be serialized as JSON. */
+			serializationError?: string;
+	  }
+	| {
+			type: "before_provider_request";
+			/** Matches the preceding context observation for the same request. */
+			requestId: number;
+			payload: ExtensionJsonSnapshot;
+			/** Present only when the value cannot be serialized as JSON. */
+			serializationError?: string;
+	  };
+
+export type ExtensionProviderRequestObserver = (observation: ExtensionProviderRequestObservation) => void;
+
+function createJsonSnapshot(value: unknown): { value: ExtensionJsonSnapshot; serializationError?: string } {
+	try {
+		const serialized = JSON.stringify(value);
+		return { value: serialized === undefined ? null : (JSON.parse(serialized) as ExtensionJsonSnapshot) };
+	} catch (error) {
+		return {
+			value: null,
+			serializationError: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
 
@@ -240,6 +282,9 @@ const noOpUIContext: ExtensionUIContext = {
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#providerRequestObservers?: Set<ExtensionProviderRequestObserver>;
+	#nextObservedRequestId = 0;
+	#pendingObservedRequestId?: number;
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
 	#waitForIdleFn: () => Promise<void> = async () => {};
@@ -445,6 +490,7 @@ export class ExtensionRunner {
 		"ctrl+l": true,
 		"ctrl+o": true,
 		"ctrl+t": true,
+
 		"ctrl+g": true,
 		"alt+m": true,
 		// Default chord for `app.message.followUp` (Windows Terminal can't deliver Ctrl+Enter; #1903).
@@ -487,6 +533,25 @@ export class ExtensionRunner {
 	onError(listener: ExtensionErrorListener): () => void {
 		this.#errorListeners.add(listener);
 		return () => this.#errorListeners.delete(listener);
+	}
+
+	/**
+	 * Observe JSON-safe, unredacted copies of the final extension context and provider body.
+	 * The runner assigns a local request id when context hooks finish; its next provider body
+	 * observation carries that id. Observers run synchronously before the request proceeds and
+	 * cannot affect it.
+	 */
+	onProviderRequestObservation(observer: ExtensionProviderRequestObserver): () => void {
+		const observers = this.#providerRequestObservers ?? new Set<ExtensionProviderRequestObserver>();
+		this.#providerRequestObservers = observers;
+		observers.add(observer);
+		return () => {
+			observers.delete(observer);
+			if (observers.size === 0 && this.#providerRequestObservers === observers) {
+				this.#providerRequestObservers = undefined;
+				this.#pendingObservedRequestId = undefined;
+			}
+		};
 	}
 
 	emitError(error: ExtensionError): void {
@@ -611,6 +676,56 @@ export class ExtensionRunner {
 			reload: () => this.#reloadHandler(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 		};
+	}
+
+	#observeContext(messages: AgentMessage[]): void {
+		if (!this.#providerRequestObservers) return;
+		const requestId = ++this.#nextObservedRequestId;
+		this.#pendingObservedRequestId = requestId;
+		const snapshot = createJsonSnapshot(messages);
+		this.#notifyProviderRequestObservers(
+			snapshot.serializationError
+				? {
+						type: "context",
+						requestId,
+						messages: snapshot.value,
+						serializationError: snapshot.serializationError,
+					}
+				: { type: "context", requestId, messages: snapshot.value },
+		);
+	}
+
+	#observeProviderRequest(payload: unknown): void {
+		if (!this.#providerRequestObservers) return;
+		const requestId = this.#pendingObservedRequestId ?? ++this.#nextObservedRequestId;
+		this.#pendingObservedRequestId = undefined;
+		const snapshot = createJsonSnapshot(payload);
+		this.#notifyProviderRequestObservers(
+			snapshot.serializationError
+				? {
+						type: "before_provider_request",
+						requestId,
+						payload: snapshot.value,
+						serializationError: snapshot.serializationError,
+					}
+				: { type: "before_provider_request", requestId, payload: snapshot.value },
+		);
+	}
+
+	#notifyProviderRequestObservers(observation: ExtensionProviderRequestObservation): void {
+		const observers = this.#providerRequestObservers;
+		if (!observers) return;
+		for (const observer of observers) {
+			try {
+				observer(observation);
+			} catch (error) {
+				logger.warn("Provider request observer threw", {
+					type: observation.type,
+					requestId: observation.requestId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
@@ -957,7 +1072,10 @@ export class ExtensionRunner {
 				break;
 			}
 		}
-		if (!hasContextHandlers) return messages;
+		if (!hasContextHandlers) {
+			if (this.#providerRequestObservers) this.#observeContext(messages);
+			return messages;
+		}
 
 		let currentMessages: AgentMessage[];
 		try {
@@ -989,6 +1107,7 @@ export class ExtensionRunner {
 			}
 		}
 
+		if (this.#providerRequestObservers) this.#observeContext(currentMessages);
 		return currentMessages;
 	}
 
@@ -1019,6 +1138,7 @@ export class ExtensionRunner {
 			}
 		}
 
+		if (this.#providerRequestObservers) this.#observeProviderRequest(currentPayload);
 		return currentPayload;
 	}
 
