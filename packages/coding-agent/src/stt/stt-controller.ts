@@ -8,17 +8,23 @@ import { evaluateSubmitTrigger } from "./submit-trigger";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
-interface ToggleOptions {
+export interface SttTranscript {
+	text: string;
+	final: boolean;
+}
+
+/** Notifications emitted while microphone capture and transcription run. */
+export interface SttControllerNotifications {
 	showWarning(msg: string): void;
 	showStatus(msg: string): void;
 	onStateChange(state: SttState): void;
+	onTranscript?(transcript: SttTranscript): void;
 	/** Force a redraw after async edits to the composer (live segment/preview inserts). */
 	requestRender?(): void;
 }
 
-/** The slice of the composer editor the controller drives. */
-interface Editor {
-	insertText(text: string): void;
+/** Optional composer surface receiving transcribed text. */
+export interface SttTextSink {
 	setVolatileText(text: string): void;
 	clearVolatileText(): void;
 	commitVolatileText(text: string): void;
@@ -44,7 +50,7 @@ export class STTController {
 	// Live streaming capture.
 	#stream: SttStreamHandle | null = null;
 	#streamRecorder: CaptureHandle | null = null;
-	#streamEditor: Editor | null = null;
+	#streamSink: SttTextSink | undefined;
 	#streamCommitted = false;
 	#streamAbort: AbortController | null = null;
 	#streamUtterance = "";
@@ -58,12 +64,12 @@ export class STTController {
 		return this.#state;
 	}
 
-	#setState(state: SttState, options: ToggleOptions): void {
+	#setState(state: SttState, options: SttControllerNotifications): void {
 		this.#state = state;
 		options.onStateChange(state);
 	}
 
-	async toggle(editor: Editor, options: ToggleOptions): Promise<void> {
+	async toggle(sink: SttTextSink | undefined, options: SttControllerNotifications): Promise<void> {
 		if (this.#toggling) {
 			if (this.#state === "idle" || this.#state === "recording") this.#stopAfterStart = true;
 			return;
@@ -72,7 +78,7 @@ export class STTController {
 		try {
 			switch (this.#state) {
 				case "idle":
-					await this.#start(editor, options);
+					await this.#start(sink, options);
 					break;
 				case "recording":
 					await this.#stop(options);
@@ -92,7 +98,7 @@ export class STTController {
 		}
 	}
 
-	async #ensureDeps(options: ToggleOptions): Promise<boolean> {
+	async #ensureDeps(options: SttControllerNotifications): Promise<boolean> {
 		const modelKey = resolveSttModelSpec(settings.get("stt.modelName") as string | undefined).key;
 		// Keyed on the model rather than a one-shot flag: switching stt.modelName
 		// mid-session must re-run preflight so an uncached new tier downloads here
@@ -145,12 +151,12 @@ export class STTController {
 		});
 	}
 
-	async #start(editor: Editor, options: ToggleOptions): Promise<void> {
+	async #start(sink: SttTextSink | undefined, options: SttControllerNotifications): Promise<void> {
 		if (!(await this.#ensureDeps(options))) return;
-		await this.#startStreaming(editor, options);
+		await this.#startStreaming(sink, options);
 	}
 
-	async #stop(options: ToggleOptions): Promise<void> {
+	async #stop(options: SttControllerNotifications): Promise<void> {
 		await this.#stopStreaming(options);
 	}
 
@@ -164,10 +170,10 @@ export class STTController {
 		return this.#streamCommitted ? ` ${normalized}` : normalized;
 	}
 
-	async #startStreaming(editor: Editor, options: ToggleOptions): Promise<void> {
+	async #startStreaming(sink: SttTextSink | undefined, options: SttControllerNotifications): Promise<void> {
 		const modelKey = resolveSttModelSpec(settings.get("stt.modelName") as string | undefined).key;
 		const language = settings.get("stt.language") as string | undefined;
-		this.#streamEditor = editor;
+		this.#streamSink = sink;
 		this.#streamCommitted = false;
 		this.#streamUtterance = "";
 		this.#streamAbort = new AbortController();
@@ -176,20 +182,23 @@ export class STTController {
 			signal: this.#streamAbort.signal,
 			onPartial: text => {
 				if (this.#disposed || this.#state !== "recording") return;
-				this.#streamEditor?.setVolatileText(this.#prefixed(text));
+				const partial = this.#prefixed(text);
+				this.#streamSink?.setVolatileText(partial);
+				options.onTranscript?.({ text: `${this.#streamUtterance}${partial}`, final: false });
 				options.requestRender?.();
 			},
 			onSegment: text => {
 				if (this.#disposed) return;
 				const prefixed = this.#prefixed(text);
 				if (prefixed) {
-					this.#streamEditor?.commitVolatileText(prefixed);
+					this.#streamSink?.commitVolatileText(prefixed);
 					this.#streamCommitted = true;
 					this.#streamUtterance += prefixed;
 				} else {
-					this.#streamEditor?.clearVolatileText();
+					this.#streamSink?.clearVolatileText();
 				}
 				options.requestRender?.();
+				options.onTranscript?.({ text: this.#streamUtterance, final: false });
 			},
 		});
 		this.#stream = stream;
@@ -210,7 +219,7 @@ export class STTController {
 					}
 					this.#streamAbort?.abort(error);
 					stream.cancel();
-					this.#streamEditor?.clearVolatileText();
+					this.#streamSink?.clearVolatileText();
 					options.requestRender?.();
 					this.#cleanupStream();
 					this.#setState("idle", options);
@@ -232,7 +241,7 @@ export class STTController {
 		logger.debug("STT live recording started", { modelKey });
 	}
 
-	async #stopStreaming(options: ToggleOptions): Promise<void> {
+	async #stopStreaming(options: SttControllerNotifications): Promise<void> {
 		const stream = this.#stream;
 		const recorder = this.#streamRecorder;
 		if (!stream) {
@@ -268,23 +277,24 @@ export class STTController {
 		}
 		if (!this.#streamCommitted && finalText) {
 			const prefixed = this.#prefixed(finalText);
-			this.#streamEditor?.commitVolatileText(prefixed);
+			this.#streamSink?.commitVolatileText(prefixed);
 			this.#streamCommitted = true;
 			this.#streamUtterance = prefixed;
 		} else {
-			this.#streamEditor?.clearVolatileText();
+			this.#streamSink?.clearVolatileText();
 		}
 		options.requestRender?.();
 		if (!failed) options.showStatus(this.#streamCommitted ? "" : "No speech detected.");
+		if (!failed) options.onTranscript?.({ text: this.#streamUtterance, final: true });
 
-		if (this.#streamCommitted && !failed && this.#streamEditor) {
+		if (this.#streamCommitted && !failed && this.#streamSink) {
 			const trigger = settings.get("stt.submitTrigger");
 			const { submit, trimTrailing } = evaluateSubmitTrigger(this.#streamUtterance, trigger);
 			if (trimTrailing > 0) {
-				this.#streamEditor.deleteBeforeCursor(trimTrailing);
+				this.#streamSink.deleteBeforeCursor(trimTrailing);
 			}
 			if (submit) {
-				this.#streamEditor.submit();
+				this.#streamSink.submit();
 			}
 		}
 
@@ -295,7 +305,7 @@ export class STTController {
 	#cleanupStream(): void {
 		this.#stream = null;
 		this.#streamRecorder = null;
-		this.#streamEditor = null;
+		this.#streamSink = undefined;
 		this.#streamCommitted = false;
 		this.#streamAbort = null;
 		this.#streamUtterance = "";
