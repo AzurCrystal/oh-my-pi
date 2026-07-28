@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the assistant-facing available-resource summary omitting parameterized MCP resource templates, so a failed `mcp://` read now lists templates alongside concrete resources ([#6911](https://github.com/can1357/oh-my-pi/issues/6911)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes
