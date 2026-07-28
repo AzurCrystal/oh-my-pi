@@ -1,17 +1,15 @@
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, prompt } from "@oh-my-pi/pi-utils";
+import { CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils";
 import type { Rule } from "../../capability/rule";
-import omfgUserPrompt from "../../prompts/system/omfg-user.md" with { type: "text" };
 import { shortenPath } from "../../tools/render-utils";
 import { OmfgPanelComponent } from "../components/omfg-panel";
 import type { InteractiveModeContext } from "../types";
 import {
 	buildOmfgRuleForPath,
-	extractGeneratedRuleJson,
+	type GenerateOmfgCandidateOptions,
+	generateOmfgCandidate,
+	type OmfgGeneratedCandidate,
 	type OmfgRuleSourceLevel,
-	type ParsedGeneratedRule,
-	parseGeneratedRule,
-	validateParsedRuleAgainstAssistantHistory,
 } from "./omfg-rule";
 
 interface OmfgRequest {
@@ -20,18 +18,8 @@ interface OmfgRequest {
 	complaint: string;
 }
 
-interface OmfgCandidate extends ParsedGeneratedRule {
-	validated: boolean;
-}
-
-interface GenerateCandidateOptions {
-	initialFeedback?: string;
-	previousRule?: string;
-}
-
 type SaveCandidateResult = { kind: "saved" | "aborted" | "rejected" } | { kind: "amend"; feedback: string };
 
-const MAX_ATTEMPTS = 3;
 const PROJECT_OPTION = "This project (.omp/rules)";
 const GLOBAL_OPTION = "Global — all projects (~/.omp/agent/rules)";
 const AMEND_OPTION = "Amend with feedback…";
@@ -130,67 +118,46 @@ export class OmfgController {
 
 	async #generateCandidate(
 		request: OmfgRequest,
-		options: GenerateCandidateOptions = {},
-	): Promise<OmfgCandidate | undefined> {
-		const failedAttempts = options.initialFeedback ? [options.initialFeedback] : [];
-		let previousRule = options.previousRule;
-		let lastCandidate: ParsedGeneratedRule | undefined;
-
-		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			if (this.#shouldStop(request)) return undefined;
-			request.component.setRule("");
-			request.component.setStatus("generating", `Attempt ${attempt}/${MAX_ATTEMPTS} · generating…`);
-			const promptText = prompt.render(omfgUserPrompt, {
-				complaint: request.complaint,
-				feedback: failedAttempts.length > 0 ? failedAttempts.join("\n\n") : undefined,
-				previousRule,
-			});
-			const { replyText } = await this.ctx.session.runEphemeralTurn({
-				promptText,
-				dedupeReply: false,
-				onTextDelta: delta => {
-					if (this.#isActiveRequest(request)) {
-						request.component.appendDraft(delta);
-					}
-				},
-				signal: request.abortController.signal,
-			});
-			if (this.#shouldStop(request)) return undefined;
-
-			const parsed = parseGeneratedRule(replyText);
-			if ("error" in parsed) {
-				const failedRule = extractGeneratedRuleJson(replyText) ?? replyText.trim();
-				failedAttempts.push(
-					`Attempt ${attempt} failed: invalid rule (${parsed.error}).\nFailed candidate:\n${failedRule}`,
-				);
-				previousRule = failedRule;
-				request.component.setStatus("validating", `Attempt ${attempt}/${MAX_ATTEMPTS} · ${parsed.error}`);
-				continue;
-			}
-
-			request.component.setRule(parsed.fileContent);
-			request.component.setStatus("validating", `Attempt ${attempt}/${MAX_ATTEMPTS} · validating…`);
-			const validated = validateParsedRuleAgainstAssistantHistory(parsed, this.ctx.session.messages);
-			if (validated.repairedCondition) {
-				request.component.setRule(validated.candidate.fileContent);
-			}
-			if (validated.validation.matched) {
-				return { ...validated.candidate, validated: true };
-			}
-
-			lastCandidate = validated.candidate;
-			const failure =
-				validated.validation.feedback ?? "The rule condition did not match any earlier assistant output.";
-			failedAttempts.push(
-				`Attempt ${attempt} failed validation:\n${failure}\nFailed candidate:\n${validated.candidate.fileContent}`,
-			);
-			previousRule = validated.candidate.fileContent;
-		}
-
-		return lastCandidate ? { ...lastCandidate, validated: false } : undefined;
+		options: GenerateOmfgCandidateOptions = {},
+	): Promise<OmfgGeneratedCandidate | undefined> {
+		return generateOmfgCandidate(this.ctx.session, request.complaint, {
+			...options,
+			signal: request.abortController.signal,
+			onEvent: event => {
+				if (!this.#isActiveRequest(request)) return;
+				switch (event.type) {
+					case "attempt_start":
+						request.component.setRule("");
+						request.component.setStatus(
+							"generating",
+							`Attempt ${event.attempt}/${event.maxAttempts} · generating…`,
+						);
+						break;
+					case "text_delta":
+						request.component.appendDraft(event.delta);
+						break;
+					case "parse_failure":
+						request.component.setStatus(
+							"validating",
+							`Attempt ${event.attempt}/${event.maxAttempts} · ${event.error}`,
+						);
+						break;
+					case "candidate":
+					case "candidate_repaired":
+						request.component.setRule(event.fileContent);
+						break;
+					case "validation_start":
+						request.component.setStatus(
+							"validating",
+							`Attempt ${event.attempt}/${event.maxAttempts} · validating…`,
+						);
+						break;
+				}
+			},
+		});
 	}
 
-	async #saveCandidate(request: OmfgRequest, candidate: OmfgCandidate): Promise<SaveCandidateResult> {
+	async #saveCandidate(request: OmfgRequest, candidate: OmfgGeneratedCandidate): Promise<SaveCandidateResult> {
 		if (this.#shouldStop(request)) return { kind: "aborted" };
 
 		for (;;) {

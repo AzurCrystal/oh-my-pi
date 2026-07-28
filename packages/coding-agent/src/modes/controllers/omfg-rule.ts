@@ -1,9 +1,12 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { prompt } from "@oh-my-pi/pi-utils";
 import { compileRuleCondition, type Rule } from "../../capability/rule";
 import { buildRuleFromMarkdown, createSourceMeta } from "../../discovery/helpers";
 import { TtsrManager, type TtsrMatchContext } from "../../export/ttsr";
+import omfgUserPrompt from "../../prompts/system/omfg-user.md" with { type: "text" };
+import type { AgentSession } from "../../session/agent-session";
 
 export interface ParsedGeneratedRule {
 	rule: Rule;
@@ -23,6 +26,27 @@ export interface ParsedRuleHistoryValidation {
 	repairedCondition: boolean;
 }
 export type OmfgRuleSourceLevel = "project" | "user";
+
+export interface OmfgGeneratedCandidate extends ParsedGeneratedRule {
+	validated: boolean;
+}
+
+export type OmfgGenerationEvent =
+	| { type: "attempt_start"; attempt: number; maxAttempts: number }
+	| { type: "text_delta"; attempt: number; delta: string }
+	| { type: "parse_failure"; attempt: number; maxAttempts: number; error: string }
+	| { type: "candidate"; attempt: number; fileContent: string }
+	| { type: "validation_start"; attempt: number; maxAttempts: number }
+	| { type: "candidate_repaired"; attempt: number; fileContent: string };
+
+export interface GenerateOmfgCandidateOptions {
+	initialFeedback?: string;
+	previousRule?: string;
+	signal?: AbortSignal;
+	onEvent?: (event: OmfgGenerationEvent) => void;
+}
+
+const MAX_GENERATION_ATTEMPTS = 3;
 
 const JSON_FENCE_PATTERN = /```(?:json)?\s*([\s\S]*?)```/i;
 
@@ -151,6 +175,76 @@ export function parseGeneratedRule(text: string): GeneratedRuleParseResult {
 	}
 
 	return { rule, fileContent };
+}
+
+/**
+ * Generates the same model-backed OMFG candidate used by the interactive
+ * controller, including parse repair, conversation validation, and retries.
+ */
+export async function generateOmfgCandidate(
+	session: AgentSession,
+	complaint: string,
+	options: GenerateOmfgCandidateOptions = {},
+): Promise<OmfgGeneratedCandidate | undefined> {
+	const failedAttempts = options.initialFeedback ? [options.initialFeedback] : [];
+	let previousRule = options.previousRule;
+	let lastCandidate: ParsedGeneratedRule | undefined;
+
+	for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+		if (options.signal?.aborted) return undefined;
+		options.onEvent?.({ type: "attempt_start", attempt, maxAttempts: MAX_GENERATION_ATTEMPTS });
+		const promptText = prompt.render(omfgUserPrompt, {
+			complaint,
+			feedback: failedAttempts.length > 0 ? failedAttempts.join("\n\n") : undefined,
+			previousRule,
+		});
+		const { replyText } = await session.runEphemeralTurn({
+			promptText,
+			dedupeReply: false,
+			onTextDelta: delta => options.onEvent?.({ type: "text_delta", attempt, delta }),
+			signal: options.signal,
+		});
+		if (options.signal?.aborted) return undefined;
+
+		const parsed = parseGeneratedRule(replyText);
+		if ("error" in parsed) {
+			const failedRule = extractGeneratedRuleJson(replyText) ?? replyText.trim();
+			failedAttempts.push(
+				`Attempt ${attempt} failed: invalid rule (${parsed.error}).\nFailed candidate:\n${failedRule}`,
+			);
+			previousRule = failedRule;
+			options.onEvent?.({
+				type: "parse_failure",
+				attempt,
+				maxAttempts: MAX_GENERATION_ATTEMPTS,
+				error: parsed.error,
+			});
+			continue;
+		}
+
+		options.onEvent?.({ type: "candidate", attempt, fileContent: parsed.fileContent });
+		options.onEvent?.({ type: "validation_start", attempt, maxAttempts: MAX_GENERATION_ATTEMPTS });
+		const validated = validateParsedRuleAgainstAssistantHistory(parsed, session.messages);
+		if (validated.repairedCondition) {
+			options.onEvent?.({
+				type: "candidate_repaired",
+				attempt,
+				fileContent: validated.candidate.fileContent,
+			});
+		}
+		if (validated.validation.matched) {
+			return { ...validated.candidate, validated: true };
+		}
+
+		lastCandidate = validated.candidate;
+		const failure = validated.validation.feedback ?? "The rule condition did not match any earlier assistant output.";
+		failedAttempts.push(
+			`Attempt ${attempt} failed validation:\n${failure}\nFailed candidate:\n${validated.candidate.fileContent}`,
+		);
+		previousRule = validated.candidate.fileContent;
+	}
+
+	return lastCandidate ? { ...lastCandidate, validated: false } : undefined;
 }
 
 interface GeneratedRulePayload {
