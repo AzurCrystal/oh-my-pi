@@ -540,6 +540,7 @@ export class Settings {
 		if (path === "modelRoles") {
 			modelRolesSignal.fire();
 		}
+		settingChangedSignal.fire(path, value, prev);
 	}
 
 	/** Set once this instance is discarded; background saves become no-ops. */
@@ -1807,6 +1808,11 @@ export class Settings {
 			for (const role of modifiedModelRoles) {
 				this.#modifiedGlobalModelRoles.add(role);
 			}
+			this.#rebuildMerged();
+			// Rethrow so an explicit `flush()` reports the failure instead of
+			// resolving as if the write landed. Background saves stay quiet:
+			// `#queueSave` already attaches a `.catch` to the queued promise.
+			throw error;
 		}
 
 		this.#rebuildMerged();
@@ -2019,6 +2025,13 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 		}
 	},
 };
+/** Fires when any effective setting value changes at runtime. */
+const settingChangedSignal = new SettingSignal<[SettingPath, unknown, unknown]>("settingChanged");
+
+/** Fires on any effective setting-value change (set, override, clearOverride). Returns an unsubscribe function. */
+export const onSettingChanged = (cb: (path: SettingPath, value: unknown, prev: unknown) => void) =>
+	settingChangedSignal.on(cb);
+
 /** Fires when `provider.appendOnlyContext` changes at runtime. */
 const appendOnlyModeSignal = new SettingSignal<[value: string]>("provider.appendOnlyContext");
 
