@@ -12,20 +12,20 @@
  * Host ask dialogs (`ui-request` select/editor) present through the same
  * hook selector/editor seam and answer with `ui-response`; `ui-request-end`
  * dismisses a pending presentation without responding.
- * Everything renders through the same components, so ctrl+o, theming, and
- * transcript behavior are native by construction.
+ * Renderer hooks are optional; the interactive frontend retains native
+ * rendering while headless frontends still replicate session and agent state.
  */
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
-import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
 import { setSessionTerminalTitle } from "../utils/title-generator";
+import type { CollabGuestContext } from "./context";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -84,8 +84,8 @@ interface PendingSnapshot {
 
 /** Minimal context surface the idle-state reconciler mutates. */
 export interface GuestIdleReconcilerCtx {
-	statusLine: { markActivityEnd: () => void };
-	loadingAnimation: { stop: () => void } | undefined;
+	statusLine?: { markActivityEnd: () => void };
+	loadingAnimation?: { stop: () => void };
 }
 
 /**
@@ -102,7 +102,7 @@ export interface GuestIdleReconcilerCtx {
  */
 export function reconcileGuestIdleHostState(ctx: GuestIdleReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) return;
-	ctx.statusLine.markActivityEnd();
+	ctx.statusLine?.markActivityEnd();
 	if (ctx.loadingAnimation) {
 		ctx.loadingAnimation.stop();
 		ctx.loadingAnimation = undefined;
@@ -111,19 +111,19 @@ export function reconcileGuestIdleHostState(ctx: GuestIdleReconcilerCtx, isStrea
 
 /** Reconcile a welcome/resync snapshot's host activity state into the guest meter. */
 export interface GuestSnapshotActivityReconcilerCtx extends GuestIdleReconcilerCtx {
-	statusLine: GuestIdleReconcilerCtx["statusLine"] & { markActivityStart: () => void };
+	statusLine?: { markActivityStart: () => void; markActivityEnd: () => void };
 }
 
 export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconcilerCtx, isStreaming: boolean): void {
 	if (isStreaming) {
-		ctx.statusLine.markActivityStart();
+		ctx.statusLine?.markActivityStart();
 		return;
 	}
 	reconcileGuestIdleHostState(ctx, false);
 }
 
 export class CollabGuestLink {
-	#ctx: InteractiveModeContext;
+	readonly #ctx: CollabGuestContext;
 	#socket: CollabSocket | null = null;
 	#roomId = "";
 	/** Previous session file to restore on leave; null = previous session was unsaved. */
@@ -206,14 +206,19 @@ export class CollabGuestLink {
 		return this.#readOnly;
 	}
 
+	/** Whether the guest currently has an open relay link for a routed action. */
+	get isConnected(): boolean {
+		return this.#socket?.isOpen === true;
+	}
+
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
 	#rejectReadOnly(): boolean {
 		if (!this.#readOnly) return false;
-		this.#ctx.showStatus("This collab link is read-only");
+		this.#ctx.showStatus?.("This collab link is read-only");
 		return true;
 	}
 
-	constructor(ctx: InteractiveModeContext) {
+	constructor(ctx: CollabGuestContext) {
 		this.#ctx = ctx;
 	}
 
@@ -281,7 +286,7 @@ export class CollabGuestLink {
 						// Fail the join with the host's message instead of hanging
 						// until the welcome timeout.
 						this.#clearWelcomeTimer();
-						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
+						if (joined) this.#ctx.showError?.(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
 						return;
 					}
@@ -305,10 +310,10 @@ export class CollabGuestLink {
 				return;
 			}
 			if (willReconnect) {
-				this.#ctx.showStatus(`Collab connection lost (${reason}), reconnecting…`, { dim: true });
+				this.#ctx.showStatus?.(`Collab connection lost (${reason}), reconnecting…`, { dim: true });
 				return;
 			}
-			this.#ctx.showStatus(`Collab session ended (${reason})`);
+			this.#ctx.showStatus?.(`Collab session ended (${reason})`);
 			void this.#restoreLocalSession();
 		};
 		socket.connect();
@@ -332,7 +337,7 @@ export class CollabGuestLink {
 		}
 
 		this.#ctx.collabGuest = this;
-		this.#ctx.syncRunningSubagentBadge();
+		this.#ctx.syncRunningSubagentBadge?.();
 	}
 
 	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
@@ -411,21 +416,22 @@ export class CollabGuestLink {
 		this.#clearAgentMirror();
 		await this.#ctx.session.switchSession(replicaPath);
 		this.state = pending.state;
-		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
+		if (this.#ctx.statusLine) reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#applyHostState(pending.state);
-		this.#ctx.resetObserverRegistry();
+		this.#ctx.resetObserverRegistry?.();
 		this.#applyAgentSnapshots(pending.agents);
-		this.#ctx.syncRunningSubagentBadge();
+		this.#ctx.syncRunningSubagentBadge?.();
 		this.#assistantStreamSynced = false;
-		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
-		this.#ctx.chatContainer.clear();
-		this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
-		await this.#ctx.reloadTodos();
+		if (this.#ctx.statusLine)
+			setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
+		this.#ctx.chatContainer?.clear();
+		this.#ctx.renderInitialMessages?.({ clearTerminalHistory: true });
+		await this.#ctx.reloadTodos?.();
 		this.#updateStatusSegment();
 		this.#readOnly = pending.readOnly;
 		this.#welcomed = true;
 		const suffix = this.#readOnly ? " (read-only)" : "";
-		this.#ctx.showStatus(
+		this.#ctx.showStatus?.(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
 	}
@@ -480,11 +486,13 @@ export class CollabGuestLink {
 			case "state": {
 				this.state = frame.state;
 				this.#applyHostState(frame.state);
-				setSessionTerminalTitle(frame.state.sessionName, frame.state.cwd);
+				if (this.#ctx.statusLine) {
+					setSessionTerminalTitle(frame.state.sessionName, frame.state.cwd);
+					reconcileGuestIdleHostState(this.#ctx, frame.state.isStreaming);
+					this.#ctx.statusLine.invalidate();
+				}
 				this.#updateStatusSegment();
-				reconcileGuestIdleHostState(this.#ctx, frame.state.isStreaming);
-				this.#ctx.statusLine.invalidate();
-				this.#ctx.ui.requestRender();
+				this.#ctx.ui?.requestRender();
 				break;
 			}
 			case "bus":
@@ -494,7 +502,7 @@ export class CollabGuestLink {
 				break;
 			case "agents":
 				this.#applyAgentSnapshots(frame.agents);
-				this.#ctx.syncRunningSubagentBadge();
+				this.#ctx.syncRunningSubagentBadge?.();
 				break;
 			case "ui-request":
 				this.#presentUiRequest(frame.request);
@@ -511,17 +519,22 @@ export class CollabGuestLink {
 				break;
 			}
 			case "bye": {
-				this.#ctx.showStatus(`Collab session ended (${frame.reason})`);
+				this.#ctx.showStatus?.(`Collab session ended (${frame.reason})`);
 				this.#socket?.close();
 				void this.#restoreLocalSession();
 				break;
 			}
 			case "error":
-				this.#ctx.showError(`Collab host: ${frame.message}`);
+				this.#ctx.showError?.(`Collab host: ${frame.message}`);
 				break;
 			default:
 				logger.debug("collab guest ignoring unexpected frame", { type: frame.t });
 		}
+	}
+
+	#dispatchEvent(event: AgentSessionEvent): void {
+		void this.#ctx.eventController?.handleEvent(event);
+		this.#ctx.handleEvent?.(event);
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
@@ -538,9 +551,9 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+			this.#dispatchEvent({ type: "message_start", message: event.message });
 		}
-		void this.#ctx.eventController.handleEvent(event);
+		this.#dispatchEvent(event);
 	}
 
 	/**
@@ -624,18 +637,24 @@ export class CollabGuestLink {
 		// The host only targets writable peers; drop defensively on a read-only link.
 		if (this.#readOnly || this.#pendingUiRequests.has(request.reqId)) return;
 		const abort = new AbortController();
+		let dialog: Promise<string | undefined>;
+		if (this.#ctx.handleUiRequest) {
+			dialog = this.#ctx.handleUiRequest(request, abort.signal);
+		} else if (request.kind === "select") {
+			if (!this.#ctx.showHookSelector) return;
+			dialog = this.#ctx.showHookSelector(request.title, request.options, {
+				signal: abort.signal,
+				initialIndex: request.initialIndex,
+				selectionMarker: request.selectionMarker,
+				checkedIndices: request.checkedIndices,
+				markableCount: request.markableCount,
+				helpText: request.helpText,
+			});
+		} else {
+			if (!this.#ctx.showHookEditor) return;
+			dialog = this.#ctx.showHookEditor(request.title, request.prefill, { signal: abort.signal });
+		}
 		this.#pendingUiRequests.set(request.reqId, abort);
-		const dialog =
-			request.kind === "select"
-				? this.#ctx.showHookSelector(request.title, request.options, {
-						signal: abort.signal,
-						initialIndex: request.initialIndex,
-						selectionMarker: request.selectionMarker,
-						checkedIndices: request.checkedIndices,
-						markableCount: request.markableCount,
-						helpText: request.helpText,
-					})
-				: this.#ctx.showHookEditor(request.title, request.prefill, { signal: abort.signal });
 		dialog
 			.then(value => {
 				// Identity check: only the presentation that still owns the reqId
@@ -681,12 +700,12 @@ export class CollabGuestLink {
 
 	#clearTransientUi(): void {
 		this.#clearUiRequests();
-		this.#ctx.statusContainer.clear();
-		this.#ctx.pendingMessagesContainer.clear();
+		this.#ctx.statusContainer?.clear();
+		this.#ctx.pendingMessagesContainer?.clear();
 		this.#ctx.compactionQueuedMessages = [];
 		this.#ctx.streamingComponent = undefined;
 		this.#ctx.streamingMessage = undefined;
-		this.#ctx.pendingTools.clear();
+		this.#ctx.pendingTools?.clear();
 		if (this.#ctx.loadingAnimation) {
 			this.#ctx.loadingAnimation.stop();
 			this.#ctx.loadingAnimation = undefined;
@@ -698,31 +717,34 @@ export class CollabGuestLink {
 		this.#left = true;
 		this.#socket = null;
 		this.#ctx.collabGuest = undefined;
-		this.#ctx.statusLine.setCollabStatus(null);
+		this.#ctx.statusLine?.setCollabStatus(null);
 		this.#flushPendingTranscripts();
 		this.#clearAgentMirror();
-		this.#ctx.syncRunningSubagentBadge();
-		this.#ctx.resetObserverRegistry();
+		this.#ctx.syncRunningSubagentBadge?.();
+		this.#ctx.resetObserverRegistry?.();
 		this.#clearTransientUi();
 		// Replica file stays on disk: it is a valid session file outside the
 		// sessions dir, so it never shows up in /resume but remains readable.
 		if (this.#returnSessionFile) {
-			await this.#ctx.handleResumeSession(this.#returnSessionFile);
+			if (this.#ctx.handleResumeSession) await this.#ctx.handleResumeSession(this.#returnSessionFile);
+			else await this.#ctx.session.switchSession(this.#returnSessionFile);
 			return;
 		}
 		await this.#ctx.session.newSession();
-		setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
-		this.#ctx.statusLine.invalidate();
-		this.#ctx.statusLine.resetActiveTime();
-		this.#ctx.ui.requestRender();
-		this.#ctx.updateEditorBorderColor();
-		this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
-		await this.#ctx.reloadTodos();
-		this.#ctx.ui.requestRender(true, { clearScrollback: true });
+		if (this.#ctx.statusLine) {
+			setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
+			this.#ctx.statusLine.invalidate();
+			this.#ctx.statusLine.resetActiveTime();
+		}
+		this.#ctx.ui?.requestRender();
+		this.#ctx.updateEditorBorderColor?.();
+		this.#ctx.renderInitialMessages?.({ clearTerminalHistory: true });
+		await this.#ctx.reloadTodos?.();
+		this.#ctx.ui?.requestRender(true, { clearScrollback: true });
 	}
 
 	#updateStatusSegment(): void {
-		this.#ctx.statusLine.setCollabStatus({
+		this.#ctx.statusLine?.setCollabStatus({
 			role: "guest",
 			participantCount: this.state?.participants.length ?? 1,
 			stateOverride: this.state,

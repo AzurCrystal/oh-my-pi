@@ -5,6 +5,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
+import { resolveCollabUrls } from "../collab/config";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
 import {
@@ -932,19 +933,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			const explicitUrl = knownStartVerb ? rest : args;
-			const relayInput = explicitUrl || ctx.settings.get("collab.relayUrl") || "";
-			if (!relayInput) {
+			const urls = resolveCollabUrls(ctx.settings, explicitUrl);
+			if (!urls) {
 				ctx.showError(
 					"No relay configured. Set collab.relayUrl in /settings or pass one: /collab relay.example.com",
 				);
 				return;
 			}
-			// Scheme-less relay args default to wss (ws:// must be spelled out for localhost).
-			const relayUrl = relayInput.includes("://") ? relayInput : `wss://${relayInput}`;
-			const webUrl = ctx.settings.get("collab.webUrl") || "";
 			const host = new CollabHost(ctx);
 			try {
-				await host.start(relayUrl, webUrl);
+				await host.start(urls.relayUrl, urls.webUrl);
 			} catch (err) {
 				ctx.showError(`Failed to start collab session: ${errorMessage(err)}`);
 				return;

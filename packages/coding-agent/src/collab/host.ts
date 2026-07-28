@@ -21,13 +21,13 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
-import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
+import type { CollabHostContext } from "./context";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -119,7 +119,7 @@ const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
 export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseValue } | { kind: "unavailable" };
 
 export class CollabHost {
-	#ctx: InteractiveModeContext;
+	readonly #ctx: CollabHostContext;
 	#socket: CollabSocket | null = null;
 	#link = "";
 	#webLink = "";
@@ -139,7 +139,7 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
 
-	constructor(ctx: InteractiveModeContext) {
+	constructor(ctx: CollabHostContext) {
 		this.#ctx = ctx;
 	}
 
@@ -243,7 +243,7 @@ export class CollabHost {
 				return;
 			}
 			if (willReconnect) {
-				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
+				this.#ctx.showStatus?.(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
 				void this.#teardown();
 				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
@@ -315,8 +315,8 @@ export class CollabHost {
 		this.#socket?.close();
 		this.#socket = null;
 		this.#ctx.collabHost = undefined;
-		this.#ctx.statusLine.setCollabStatus(null);
-		this.#ctx.ui.requestRender();
+		this.#ctx.statusLine?.setCollabStatus(null);
+		this.#ctx.ui?.requestRender();
 	}
 
 	#broadcast(frame: CollabFrame): void {
@@ -476,8 +476,8 @@ export class CollabHost {
 			images && images.length > 0 ? [{ type: "text", text }, ...images] : text;
 		const details: CollabPromptDetails = { from: name };
 		if (this.#ctx.session.isStreaming) {
-			this.#ctx.updatePendingMessagesDisplay();
-			this.#ctx.ui.requestRender();
+			this.#ctx.updatePendingMessagesDisplay?.();
+			this.#ctx.ui?.requestRender();
 			this.#scheduleStateBroadcast();
 		}
 		this.#ctx.session
@@ -520,11 +520,10 @@ export class CollabHost {
 
 	#buildState(): CollabSessionState {
 		const session = this.#ctx.session;
-		// Context numbers come from the status line's memoized breakdown so guests
-		// render exactly the same anchored, provider-real count the host's own
-		// status line shows.
-		const breakdown = this.#ctx.statusLine.getCachedContextBreakdown();
-		const tokens = breakdown.usedTokens ?? 0;
+		const tuiUsage = this.#ctx.statusLine?.getCachedContextBreakdown();
+		const sessionUsage = tuiUsage ? undefined : session.getContextUsage();
+		const tokens = tuiUsage?.usedTokens ?? sessionUsage?.tokens ?? 0;
+		const contextWindow = tuiUsage?.contextWindow ?? sessionUsage?.contextWindow ?? session.model?.contextWindow ?? 0;
 		return {
 			isStreaming: session.isStreaming,
 			isAborting: session.isAborting,
@@ -535,8 +534,8 @@ export class CollabHost {
 			thinkingLevel: session.thinkingLevel,
 			contextUsage: {
 				tokens,
-				contextWindow: breakdown.contextWindow,
-				percent: breakdown.contextWindow > 0 ? (tokens / breakdown.contextWindow) * 100 : 0,
+				contextWindow,
+				percent: contextWindow > 0 ? (tokens / contextWindow) * 100 : 0,
 			},
 			participants: this.participants,
 		};
@@ -684,8 +683,8 @@ export class CollabHost {
 	}
 
 	#updateStatusSegment(): void {
-		this.#ctx.statusLine.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
-		this.#ctx.statusLine.invalidate();
-		this.#ctx.ui.requestRender();
+		this.#ctx.statusLine?.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
+		this.#ctx.statusLine?.invalidate();
+		this.#ctx.ui?.requestRender();
 	}
 }
