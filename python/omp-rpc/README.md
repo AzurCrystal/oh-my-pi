@@ -224,9 +224,12 @@ print(acknowledgement.request_id, acknowledgement.agent_invoked)
 ```
 
 `agent_invoked` is `True` when an agent turn was scheduled, `False` when the
-prompt completed locally, and `None` when the correlated result is still
-pending. `prompt_and_wait()` handles all three states; local-only prompts return
-an empty `PromptTurn` without waiting for `agent_end`.
+prompt completed locally, and `None` only when neither the response nor an
+already-observed correlated notification has resolved the outcome.
+`prompt_and_wait()` also treats `agent_start` or `agent_end` after submission as
+proof that the agent ran, because normal prompt responses may omit
+`agentInvoked` and do not emit a positive `prompt_result`. Local-only prompts
+return an empty `PromptTurn` without waiting for `agent_end`.
 
 ## Error Handling and Retained History
 

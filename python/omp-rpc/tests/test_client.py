@@ -388,7 +388,11 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"steer", "follow_up", "abort"}:
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
-            respond(request_id, command_type, {"agentInvoked": True})
+            respond(
+                request_id,
+                command_type,
+                {} if command_type == "prompt" else {"agentInvoked": True},
+            )
             message = command["message"]
             if message == "needs ui":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
@@ -921,6 +925,7 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
     """
     import json
     import sys
+    import time
 
     print(json.dumps({"type": "ready"}), flush=True)
     for raw_line in sys.stdin:
@@ -934,11 +939,12 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
                 "agentInvoked": message == "async-true-before",
             }), flush=True)
 
-        data = (
-            {"agentInvoked": False}
-            if message in {"ack", "immediate"}
-            else None
-        )
+        if message in {"ack", "immediate"}:
+            data = {"agentInvoked": False}
+        elif message == "immediate-true":
+            data = {"agentInvoked": True}
+        else:
+            data = None
         response = {
             "id": request_id,
             "type": "response",
@@ -949,14 +955,15 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
             response["data"] = data
         print(json.dumps(response), flush=True)
 
-        if message == "async-after":
+        if message in {"async-after", "listener-after"}:
+            time.sleep(0.05)
             print(json.dumps({
                 "type": "prompt_result",
                 "id": request_id,
                 "agentInvoked": False,
             }), flush=True)
 
-        if message == "async-true-before":
+        if message in {"async-true-before", "immediate-true", "normal"}:
             print(json.dumps({"type": "agent_start"}), flush=True)
             print(json.dumps({
                 "type": "agent_end",
@@ -1386,6 +1393,14 @@ class RpcClientTests(unittest.TestCase):
             turn = client.prompt_and_wait("say hello", timeout=2.0)
             self.assertEqual(turn.require_assistant_text(), "pong")
             self.assertGreaterEqual(len(turn.events), 3)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_plain_prompt_cleans_outcome_after_normal_agent_lifecycle(self) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            client.prompt("normal")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._pending_prompt_outcomes, {})
 
     def test_immediate_local_prompt_returns_empty_turn_and_stays_idle(self) -> None:
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
@@ -1393,6 +1408,7 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(acknowledgement.request_id, "req_1")
             self.assertIs(acknowledgement.agent_invoked, False)
             client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
 
             started = time.monotonic()
             turn = client.prompt_and_wait("immediate", timeout=0.5)
@@ -1402,6 +1418,18 @@ class RpcClientTests(unittest.TestCase):
             self.assertIsNone(turn.assistant_message)
             self.assertIsNone(turn.assistant_text)
             client.wait_for_idle(timeout=0.5)
+
+            acknowledgement = client.prompt_with_result("immediate-true")
+            self.assertIs(acknowledgement.agent_invoked, True)
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+            turn = client.prompt_and_wait("immediate-true", timeout=0.5)
+            self.assertEqual(
+                [event.type for event in turn.events],
+                ["agent_start", "agent_end"],
+            )
+            self.assertEqual(client._pending_prompt_outcomes, {})
 
     def test_async_local_prompt_result_is_correlated_across_frame_orderings(
         self,
@@ -1426,21 +1454,55 @@ class RpcClientTests(unittest.TestCase):
             self.assertIsNone(acknowledgement.agent_invoked)
             client.wait_for_idle(timeout=0.5)
 
-            turn = client.prompt_and_wait("async-true-before", timeout=0.5)
+            turn = client.prompt_and_wait("normal", timeout=0.5)
             self.assertEqual(
                 [event.type for event in turn.events],
                 ["agent_start", "agent_end"],
             )
             client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
 
         self.assertEqual(
             notifications,
             [
                 PromptResultEvent(id="req_1", agent_invoked=False),
                 PromptResultEvent(id="req_2", agent_invoked=False),
-                PromptResultEvent(id="req_3", agent_invoked=True),
             ],
         )
+
+    def test_notification_before_response_is_returned_by_acknowledgement(
+        self,
+    ) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            local = client.prompt_with_result("async-before")
+            invoked = client.prompt_with_result("async-true-before")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertIs(local.agent_invoked, False)
+            self.assertIs(invoked.agent_invoked, True)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_prompt_result_listener_observes_idle_after_bookkeeping(self) -> None:
+        listener_finished = threading.Event()
+        listener_errors: list[BaseException] = []
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            def wait_for_idle(event: object) -> None:
+                if not isinstance(event, PromptResultEvent):
+                    return
+                try:
+                    client.wait_for_idle(timeout=0.2)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    listener_finished.set()
+
+            client.on_notification(wait_for_idle)
+            acknowledgement = client.prompt_with_result("listener-after")
+            self.assertIsNone(acknowledgement.agent_invoked)
+            self.assertTrue(listener_finished.wait(1.0))
+            self.assertEqual(listener_errors, [])
+            self.assertEqual(client._pending_prompt_outcomes, {})
 
     def test_prompt_and_wait_reconstructs_compacted_terminal_messages(self) -> None:
         with self.make_client() as client:
