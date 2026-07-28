@@ -10,13 +10,25 @@
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
+
 import { once } from "node:events";
+import * as path from "node:path";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { configureCredentialRedaction, redactSensitiveInObject } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
+import { onSettingChanged } from "../../config/settings";
+import { isCredential, SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+import { SECRET_KEY_PATTERN } from "../../eval/runtime-env";
 import {
+	type AutocompleteProviderFactory,
+	type ExtensionAskDialogQuestion,
+	type ExtensionAskDialogResult,
+	type ExtensionProviderRequestObservation,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
@@ -25,22 +37,56 @@ import {
 } from "../../extensibility/extensions";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
-import { type Theme, theme } from "../../modes/theme/theme";
-import type { AgentSession } from "../../session/agent-session";
+import type { Goal } from "../../goals/state";
+import type { MCPManager } from "../../mcp/manager";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { HistoryStorage } from "../../session/history-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { resolveResumableSession } from "../../session/session-listing";
+import { SessionManager } from "../../session/session-manager";
+import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
+import { discoverTitleSystemPromptFile, resolvePromptInput } from "../../system-prompt";
+import { isLowSignalTitleInput } from "../../tiny/text";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import { buildSessionAutocompleteProvider } from "../completions";
+import { loadAllExtensions } from "../components/extensions/state-manager";
+import { shouldSkipHistory } from "../controllers/input-controller";
 import { initializeExtensions } from "../runtime-init";
+import { applySettingEffects } from "../setting-effects";
+import {
+	getAvailableThemesWithPaths,
+	getThemeByName,
+	setTheme as setActiveTheme,
+	setThemeInstance,
+	type Theme,
+	theme,
+} from "../theme/theme";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import * as rpcAccounts from "./rpc-accounts";
+import * as rpcAgentControl from "./rpc-agent-control";
+import * as rpcAuthoring from "./rpc-authoring";
+import * as rpcBtw from "./rpc-btw";
+import * as rpcCollab from "./rpc-collab";
+import * as rpcDiagnostics from "./rpc-diagnostics";
+import { buildRpcKeybindings, readRpcPromptHistory } from "./rpc-editor-state";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
+import * as rpcIdle from "./rpc-idle";
 import { claimRpcInput } from "./rpc-input";
+import * as rpcMcp from "./rpc-mcp";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import * as rpcModelRoles from "./rpc-model-roles";
+import * as rpcRuntimeControl from "./rpc-runtime-control";
+import { buildRpcSessionView } from "./rpc-session-view";
+import { buildRpcSettingsSnapshot, validateRpcSettingValue } from "./rpc-settings";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
+import { buildRpcThemeSnapshot } from "./rpc-theme";
 import type {
 	RpcCommand,
+	RpcExtensionUICancelFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
@@ -51,10 +97,18 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcJsonValue,
+	RpcPlanDecisionResult,
+	RpcPlanModeSnapshot,
+	RpcProviderRequestObservationFrame,
 	RpcResponse,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
+	RpcWorkModeSnapshot,
 } from "./rpc-types";
+import * as rpcVoice from "./rpc-voice";
+import * as rpcWorkModes from "./rpc-work-modes";
+import { buildRpcRepoStatus, readRpcUsageReports } from "./rpc-workspace";
 
 // Re-export types for consumers
 export type * from "./rpc-types";
@@ -91,6 +145,7 @@ type RpcOutput = (
 	obj:
 		| RpcResponse
 		| RpcExtensionUIRequest
+		| RpcExtensionUICancelFrame
 		| RpcHostToolCallRequest
 		| RpcHostToolCancelRequest
 		| RpcHostUriRequest
@@ -100,15 +155,16 @@ type RpcOutput = (
 
 export type RpcSessionChangeCommand = Extract<
 	RpcCommand,
-	{ type: "new_session" } | { type: "switch_session" } | { type: "branch" }
+	{ type: "new_session" } | { type: "switch_session" } | { type: "branch" } | { type: "fork" }
 >;
 
 export type RpcSessionChangeResult =
 	| { type: "new_session"; data: { cancelled: boolean } }
 	| { type: "switch_session"; data: { cancelled: boolean } }
-	| { type: "branch"; data: { text: string; cancelled: boolean } };
+	| { type: "branch"; data: { text: string; cancelled: boolean } }
+	| { type: "fork"; data: { cancelled: boolean } };
 
-export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch">;
+export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
 export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
 export type RpcSkillCommandResult = { agentInvoked: true };
@@ -300,40 +356,68 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 	return false;
 }
 
+const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = {
+	bash: true,
+	python: true,
+	start_live: true,
+	start_stt: true,
+	toggle_stt: true,
+	start_collab_hosting: true,
+	join_collab_session: true,
+	ask_btw: true,
+	compact: true,
+	retry: true,
+	handoff: true,
+	approve_plan_proposal: true,
+	reject_plan_proposal: true,
+	begin_guided_goal: true,
+	answer_guided_goal: true,
+	prompt_agent: true,
+	generate_ttsr_rule: true,
+	mcp_add_server: true,
+	mcp_set_server_enabled: true,
+	mcp_reload: true,
+	mcp_reconnect_server: true,
+	mcp_unauth_server: true,
+	mcp_begin_reauth: true,
+	mcp_complete_reauth: true,
+	mcp_begin_smithery_login: true,
+	mcp_complete_smithery_login: true,
+	mcp_search_registry: true,
+	mcp_deploy_registry_result: true,
+};
+
 /**
  * Dispatch a single parsed frame from the RPC input stream.
  *
- * Bash commands are dispatched in the background so the caller can keep reading
- * subsequent frames while a shell command is still running. This lets a client
- * send `abort_bash` while a long-running `bash` is in flight. Response
- * correlation is preserved via each command's `id`; ordering across concurrent
- * commands is not guaranteed and clients MUST match on `id`.
+ * Commands that await cancellable work are dispatched in the background so
+ * the stdin reader can route their dedicated canceller through the serial
+ * queue while work is still running. Response correlation is preserved via
+ * each command's `id`; ordering across concurrent commands is not guaranteed
+ * and clients MUST match on `id`.
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
- *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`). Otherwise a promise that resolves once the response
- *   for the command has been emitted via `output`. Errors from `handleCommand`
- *   on non-`bash` commands propagate; the caller is expected to wrap them.
+ *   (extension UI response, host tool/URI frames) or background-dispatched.
+ *   Otherwise a promise that resolves once the response for the command has
+ *   been emitted via `output`. Errors from `handleCommand` on serial commands
+ *   propagate; the caller is expected to wrap them.
  */
 export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps): Promise<void> | undefined {
 	if (dispatchRpcControlFrame(parsed, deps)) return undefined;
 	// Regular RPC command. The transport contract states each remaining frame
-	// is an {@link RpcCommand}; `handleCommand`'s `default` arm surfaces
-	// unknown discriminants as an error response, so we do not shape-check
-	// the union here.
+	// is an {@link RpcCommand}; handleCommand's exhaustive fallback reports
+	// unknown discriminants at runtime, so we do not shape-check the union here.
 	const command = parsed as RpcCommand;
 
-	// `bash` can run for a long time. Dispatch it in the background so a
-	// subsequent `abort_bash` frame can be read and handled without waiting
-	// for the shell command to finish on its own. The response is emitted
-	// when `handleCommand` resolves; clients correlate via `command.id`.
-	if (command.type === "bash") {
+	// Only work with an explicit cancellation path bypasses the serial queue.
+	// Clients correlate concurrent responses via `command.id`.
+	if (BACKGROUND_RPC_COMMAND_TYPES[command.type] === true) {
 		const task = (async () => {
 			try {
 				deps.output(await deps.handleCommand(command));
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
-				deps.output(deps.errorResponse(command.id, "bash", message));
+				deps.output(deps.errorResponse(command.id, command.type, message));
 			}
 		})();
 		deps.trackBackgroundTask?.(task);
@@ -345,7 +429,7 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 	})();
 }
 
-/** Serializes ordinary RPC commands while allowing control frames to dispatch immediately. */
+/** Serializes ordered commands while allowing cancellable work and control frames to overtake the queue. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
@@ -363,7 +447,7 @@ export class RpcInputDispatcher {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 
 			const command = parsed as RpcCommand;
-			if (command.type === "bash") {
+			if (BACKGROUND_RPC_COMMAND_TYPES[command.type] === true) {
 				dispatchRpcInputFrame(command, this.#deps);
 				return;
 			}
@@ -379,7 +463,8 @@ export class RpcInputDispatcher {
 			});
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
+			const id = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : undefined;
+			this.#deps.output(this.#deps.errorResponse(id, "parse", `Failed to parse command: ${message}`));
 		}
 	}
 
@@ -407,11 +492,10 @@ export class RpcInputDispatcher {
  * Coordinates deferred shutdown with in-flight background input tasks.
  *
  * `pi.shutdown()` from an extension only *requests* shutdown; the process must
- * not exit while a background-dispatched command (`bash`, see
- * {@link dispatchRpcInputFrame}) still owes the client a response frame. The
- * coordinator tracks those tasks, re-checks the shutdown request whenever one
- * settles (covering a shutdown requested mid-bash with no follow-up client
- * frame), and drains every tracked task before invoking `performShutdown`.
+ * not exit while any background-dispatched command still owes the client a
+ * response frame. The coordinator tracks those tasks, re-checks the shutdown
+ * request whenever one settles, and drains every tracked task before invoking
+ * `performShutdown`.
  * The shutdown sequence is latched so concurrent triggers (input loop and
  * settling tasks) run it exactly once.
  */
@@ -488,8 +572,40 @@ export async function handleRpcSessionChange(
 			if (!result.cancelled) subagentRegistry?.clear();
 			return { type: "branch", data: { text: result.selectedText, cancelled: result.cancelled } };
 		}
+
+		case "fork": {
+			const cancelled = !(await session.fork());
+			if (!cancelled) subagentRegistry?.clear();
+			return { type: "fork", data: { cancelled } };
+		}
 	}
 	throw new Error("Unsupported RPC session change command");
+}
+
+function readRpcPersistedGoal(modeData: unknown): Goal | undefined {
+	if (!isRecord(modeData) || !isRecord(modeData.goal)) return undefined;
+	const value = modeData.goal;
+	if (
+		typeof value.id !== "string" ||
+		typeof value.objective !== "string" ||
+		typeof value.status !== "string" ||
+		typeof value.tokensUsed !== "number" ||
+		typeof value.timeUsedSeconds !== "number" ||
+		typeof value.createdAt !== "number" ||
+		typeof value.updatedAt !== "number"
+	) {
+		return undefined;
+	}
+	return {
+		id: value.id,
+		objective: value.objective,
+		status: value.status as Goal["status"],
+		tokenBudget: typeof value.tokenBudget === "number" ? value.tokenBudget : undefined,
+		tokensUsed: value.tokensUsed,
+		timeUsedSeconds: value.timeUsedSeconds,
+		createdAt: value.createdAt,
+		updatedAt: value.updatedAt,
+	};
 }
 
 function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
@@ -540,6 +656,135 @@ function isSubagentSubscriptionLevel(value: unknown): value is RpcSubagentSubscr
 	return value === "off" || value === "progress" || value === "events";
 }
 
+const RPC_REDACTED_CREDENTIAL = "[credential_redacted]";
+const RPC_URL_REDACTION_ORIGIN = "https://rpc-redaction.invalid";
+const RPC_SECRET_FIELD_NAMES: Record<string, true> = {
+	authorization: true,
+	"proxy-authorization": true,
+	cookie: true,
+	"set-cookie": true,
+	sig: true,
+	signature: true,
+};
+
+function isRpcSecretFieldName(name: string): boolean {
+	return SECRET_KEY_PATTERN.test(name) || RPC_SECRET_FIELD_NAMES[name.toLowerCase()] === true;
+}
+
+function redactRpcUrlSecrets(value: string): string {
+	const shape = URL.canParse(value)
+		? "absolute"
+		: value.startsWith("//")
+			? "scheme-relative"
+			: value.startsWith("?")
+				? "query"
+				: value.startsWith("/") || value.startsWith("./") || value.startsWith("../")
+					? "path"
+					: undefined;
+	if (!shape) return value;
+
+	let parsed: URL;
+	try {
+		parsed = new URL(value, RPC_URL_REDACTION_ORIGIN);
+	} catch {
+		return value;
+	}
+
+	let changed = false;
+	if (parsed.username) {
+		parsed.username = RPC_REDACTED_CREDENTIAL;
+		changed = true;
+	}
+	if (parsed.password) {
+		parsed.password = RPC_REDACTED_CREDENTIAL;
+		changed = true;
+	}
+
+	const query = [...parsed.searchParams.entries()];
+	if (query.some(([name]) => isRpcSecretFieldName(name))) {
+		parsed.search = "";
+		for (const [name, nested] of query) {
+			parsed.searchParams.append(name, isRpcSecretFieldName(name) ? RPC_REDACTED_CREDENTIAL : nested);
+		}
+		changed = true;
+	}
+	if (!changed) return value;
+
+	const serialized =
+		shape === "absolute"
+			? parsed.toString()
+			: shape === "scheme-relative"
+				? parsed.href.slice(parsed.protocol.length)
+				: shape === "query"
+					? `${parsed.search}${parsed.hash}`
+					: `${parsed.pathname}${parsed.search}${parsed.hash}`;
+	return serialized.replaceAll(encodeURIComponent(RPC_REDACTED_CREDENTIAL), RPC_REDACTED_CREDENTIAL);
+}
+
+/**
+ * Provider observations cross a process boundary, so apply every existing
+ * credential scrubber plus exact masking for credential settings and headers.
+ */
+function redactRpcProviderValue(session: AgentSession, value: RpcJsonValue): RpcJsonValue {
+	const restoreCredentialRedaction = session.settings.get("secrets.enabled");
+	let redacted: RpcJsonValue;
+	configureCredentialRedaction(true);
+	try {
+		redacted = redactSensitiveInObject(value).result as RpcJsonValue;
+	} finally {
+		configureCredentialRedaction(restoreCredentialRedaction);
+	}
+
+	const configuredCredentials: string[] = [];
+	for (const candidate of Object.keys(SETTINGS_SCHEMA)) {
+		const settingPath = candidate as SettingPath;
+		if (!isCredential(settingPath)) continue;
+		const settingValue: unknown = session.settings.get(settingPath);
+		if (typeof settingValue === "string" && settingValue.length > 0) configuredCredentials.push(settingValue);
+	}
+	const obfuscator = session.obfuscator;
+
+	const visit = (candidate: RpcJsonValue): RpcJsonValue => {
+		if (typeof candidate === "string") {
+			let text = redactRpcUrlSecrets(candidate);
+			for (const credential of configuredCredentials) {
+				text = text.replaceAll(credential, RPC_REDACTED_CREDENTIAL);
+			}
+			return obfuscator?.hasSecrets() ? obfuscator.obfuscate(text) : text;
+		}
+		if (Array.isArray(candidate)) return candidate.map(visit);
+		if (candidate === null || typeof candidate !== "object") return candidate;
+		const result: { [key: string]: RpcJsonValue } = {};
+		for (const [key, nested] of Object.entries(candidate)) {
+			result[key] = isRpcSecretFieldName(key) ? RPC_REDACTED_CREDENTIAL : visit(nested);
+		}
+		return result;
+	};
+	return visit(redacted);
+}
+
+function buildRpcProviderObservationFrame(
+	session: AgentSession,
+	observation: ExtensionProviderRequestObservation,
+): RpcProviderRequestObservationFrame {
+	if (observation.type === "context") {
+		return {
+			type: "provider_request_observation",
+			stage: "context",
+			requestId: observation.requestId,
+			messages: redactRpcProviderValue(session, observation.messages),
+			...(observation.serializationError ? { serializationError: observation.serializationError } : {}),
+		};
+	}
+	return {
+		type: "provider_request_observation",
+		stage: "before_provider_request",
+		requestId: observation.requestId,
+		payload: redactRpcProviderValue(session, observation.payload),
+		...(observation.serializationError ? { serializationError: observation.serializationError } : {}),
+	};
+}
+
 export function requestRpcEditor(
 	pendingRequests: Map<string, PendingExtensionRequest>,
 	output: RpcOutput,
@@ -553,8 +798,10 @@ export function requestRpcEditor(
 	const id = Snowflake.next() as string;
 	const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
 	let settled = false;
+	let timeoutId: NodeJS.Timeout | undefined;
 
 	const cleanup = () => {
+		clearTimeout(timeoutId);
 		dialogOptions?.signal?.removeEventListener("abort", onAbort);
 		pendingRequests.delete(id);
 	};
@@ -570,20 +817,26 @@ export function requestRpcEditor(
 		cleanup();
 		reject(error);
 	};
-	const onAbort = () => {
+	const cancel = (timedOut: boolean) => {
+		if (settled) return;
 		output({
-			type: "extension_ui_request",
-			id: Snowflake.next() as string,
-			method: "cancel",
+			type: "extension_ui_cancel",
 			targetId: id,
-		} as RpcExtensionUIRequest);
+			...(timedOut ? { timedOut: true } : {}),
+		} satisfies RpcExtensionUICancelFrame);
+		if (timedOut) dialogOptions?.onTimeout?.();
 		finish(undefined);
 	};
+	const onAbort = () => cancel(false);
 
 	dialogOptions?.signal?.addEventListener("abort", onAbort, { once: true });
+	if (dialogOptions?.timeout !== undefined) {
+		timeoutId = setTimeout(() => cancel(true), dialogOptions.timeout);
+	}
 	pendingRequests.set(id, {
 		resolve: response => {
 			if ("cancelled" in response && response.cancelled) {
+				if (response.timedOut) dialogOptions?.onTimeout?.();
 				finish(undefined);
 			} else if ("value" in response) {
 				finish(response.value);
@@ -600,9 +853,11 @@ export function requestRpcEditor(
 		title,
 		prefill,
 		promptStyle: editorOptions?.promptStyle,
-	} as RpcExtensionUIRequest);
+		timeout: dialogOptions?.timeout,
+	} satisfies RpcExtensionUIRequest);
 	return promise;
 }
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -612,6 +867,7 @@ export async function runRpcMode(
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
+	mcpManager?: MCPManager,
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -665,6 +921,80 @@ export async function runRpcMode(
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
+	const moduleErrorCode = (command: RpcCommand["type"], message: string): string => {
+		if (message.startsWith("Unknown controllable agent:")) return "unknown_agent";
+		if (
+			(command === "revive_agent" || command === "kill_agent" || command === "prompt_agent") &&
+			(message.includes("only parked agents") ||
+				message.includes("only running agents") ||
+				message.includes("revive it before sending"))
+		) {
+			return "invalid_agent_state";
+		}
+		if (message.includes("already exists")) return "already_exists";
+		if (message.includes("not an OMFG-authored rule")) return "not_writable";
+		if (
+			message.includes("is disabled") ||
+			message.includes("are disabled") ||
+			message.includes("backend is not active") ||
+			message.includes("TTSR is not active")
+		) {
+			return "capability_unavailable";
+		}
+		if (
+			message.startsWith("Exit ") ||
+			message.includes("current goal before starting") ||
+			message.includes("Resume or clear the current goal")
+		) {
+			return "mode_conflict";
+		}
+		if (
+			message.startsWith("No active") ||
+			message.startsWith("No paused") ||
+			message.startsWith("No plan proposal") ||
+			message.includes("is not active") ||
+			message.includes("is not awaiting") ||
+			message.includes("is not ready for review") ||
+			message.includes("already complete")
+		) {
+			return "invalid_state";
+		}
+		if (
+			message.includes("required") ||
+			message.includes("must not be empty") ||
+			message.includes("must be a positive integer") ||
+			message.startsWith("Invalid agent name:") ||
+			message.includes("does not match")
+		) {
+			return "invalid_request";
+		}
+		if (command === "build_ttsr_rule" || command === "register_ttsr_rule") return "invalid_rule";
+		if (command === "set_agent_definition") return "invalid_agent_definition";
+		return "operation_failed";
+	};
+
+	const moduleCommand = async <T extends RpcCommand["type"]>(
+		id: string | undefined,
+		command: T,
+		operation: () => Promise<object | null>,
+	): Promise<RpcResponse> => {
+		try {
+			return success(id, command, await operation());
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			return error(id, command, message, moduleErrorCode(command, message));
+		}
+	};
+	const mcpManagerCommand = async <T extends RpcCommand["type"]>(
+		id: string | undefined,
+		command: T,
+		operation: (manager: MCPManager) => Promise<object | null>,
+	): Promise<RpcResponse> => {
+		if (!mcpManager) {
+			return error(id, command, "MCP manager is unavailable in this RPC session", "mcp_unavailable");
+		}
+		return moduleCommand(id, command, () => operation(mcpManager));
+	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 
@@ -673,8 +1003,68 @@ export async function runRpcMode(
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const subagentRegistry = eventBus ? new RpcSubagentRegistry(eventBus, output) : undefined;
 
+	// Mid-flight MCP re-authentication. Without an installed handler the manager
+	// only logs and the tool call fails outright, so an RPC client could never
+	// recover a server whose token expired during a call. The handler blocks the
+	// call until the client answers `resolve_mcp_auth_challenge`.
+	const mcpAuthController = rpcDiagnostics.buildRpcMcpAuthHandler(challenge => {
+		output({ type: "mcp_auth_challenge", challenge });
+	});
+	mcpManager?.setAuthHandler(mcpAuthController.handler);
+
+	// Raw SSE snapshots are only forwarded between subscribe/unsubscribe so an
+	// idle client is not billed for every provider event.
+	let unsubscribeRawSse: (() => void) | undefined;
+	// Provider inputs are large and sensitive; no runner observer exists until a
+	// client explicitly subscribes.
+	let unsubscribeProviderRequestObservations: (() => void) | undefined;
+
+	const emitVoiceEvent: rpcVoice.RpcVoiceEventSink = event => {
+		output({ type: "voice_event", event });
+	};
+
+	// A live microphone or audio stream must not outlive the process; both
+	// teardown paths release it before the session is disposed.
+	const releaseVoice = async (): Promise<void> => {
+		try {
+			await rpcVoice.disposeRpcVoice(session);
+		} catch (voiceError) {
+			logger.error("RPC voice teardown failed", { error: String(voiceError) });
+		}
+	};
+
+	let disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+	let idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
+		output({ type: "idle_recap", recap });
+	});
+
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
+
+	let publishedEditorText = "";
+	const autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
+	const buildRpcAutocompleteProvider = () => {
+		let provider = buildSessionAutocompleteProvider(session);
+		for (const factory of autocompleteProviderFactories) {
+			try {
+				const wrapped = factory(provider);
+				if (
+					wrapped &&
+					typeof wrapped.getSuggestions === "function" &&
+					typeof wrapped.applyCompletion === "function"
+				) {
+					provider = wrapped;
+				} else {
+					logger.warn("Extension autocomplete provider factory returned an invalid provider; skipping it");
+				}
+			} catch (factoryError) {
+				logger.warn("Extension autocomplete provider factory threw; skipping it", {
+					error: String(factoryError),
+				});
+			}
+		}
+		return provider;
+	};
 
 	/**
 	 * Extension UI context that uses the RPC protocol.
@@ -682,7 +1072,7 @@ export async function runRpcMode(
 	class RpcExtensionUIContext implements ExtensionUIContext {
 		constructor(
 			private pendingRequests: Map<string, PendingExtensionRequest>,
-			private output: (obj: RpcResponse | RpcExtensionUIRequest | object) => void,
+			private output: RpcOutput,
 		) {}
 
 		/** Helper for dialog methods with signal/timeout support */
@@ -696,34 +1086,46 @@ export async function runRpcMode(
 
 			const id = Snowflake.next() as string;
 			const { promise, resolve, reject } = Promise.withResolvers<T>();
+			let settled = false;
 			let timeoutId: NodeJS.Timeout | undefined;
 
 			const cleanup = () => {
-				if (timeoutId) clearTimeout(timeoutId);
+				clearTimeout(timeoutId);
 				opts?.signal?.removeEventListener("abort", onAbort);
 				this.pendingRequests.delete(id);
 			};
-
-			const onAbort = () => {
+			const finish = (value: T) => {
+				if (settled) return;
+				settled = true;
 				cleanup();
-				resolve(defaultValue);
+				resolve(value);
 			};
+			const fail = (error: Error) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(error);
+			};
+			const cancel = (timedOut: boolean) => {
+				if (settled) return;
+				this.output({
+					type: "extension_ui_cancel",
+					targetId: id,
+					...(timedOut ? { timedOut: true } : {}),
+				} satisfies RpcExtensionUICancelFrame);
+				if (timedOut) opts?.onTimeout?.();
+				finish(defaultValue);
+			};
+			const onAbort = () => cancel(false);
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(() => {
-					opts.onTimeout?.();
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
+				timeoutId = setTimeout(() => cancel(true), opts.timeout);
 			}
 
 			this.pendingRequests.set(id, {
-				resolve: (response: RpcExtensionUIResponse) => {
-					cleanup();
-					resolve(parseResponse(response));
-				},
-				reject,
+				resolve: (response: RpcExtensionUIResponse) => finish(parseResponse(response)),
+				reject: fail,
 			});
 			this.output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 			return promise;
@@ -776,6 +1178,25 @@ export async function runRpcMode(
 			);
 		}
 
+		askDialog(
+			questions: ExtensionAskDialogQuestion[],
+			dialogOptions?: ExtensionUIDialogOptions,
+		): Promise<ExtensionAskDialogResult | undefined> {
+			return this.#createDialogPromise(
+				dialogOptions,
+				undefined,
+				{ method: "askDialog", questions, timeout: dialogOptions?.timeout },
+				response => {
+					if ("cancelled" in response && response.cancelled) {
+						if (response.timedOut) dialogOptions?.onTimeout?.();
+						return undefined;
+					}
+					if ("result" in response) return response.result;
+					return undefined;
+				},
+			);
+		}
+
 		onTerminalInput(): () => void {
 			// Raw terminal input not supported in RPC mode
 			return () => {};
@@ -803,8 +1224,13 @@ export async function runRpcMode(
 			} as RpcExtensionUIRequest);
 		}
 
-		setWorkingMessage(_message?: string): void {
-			// Not supported in RPC mode
+		setWorkingMessage(message?: string): void {
+			this.output({
+				type: "extension_ui_request",
+				id: Snowflake.next() as string,
+				method: "setWorkingMessage",
+				message,
+			} satisfies RpcExtensionUIRequest);
 		}
 
 		setWidget(key: string, content: unknown, options?: ExtensionWidgetOptions): void {
@@ -852,6 +1278,7 @@ export async function runRpcMode(
 		}
 
 		setEditorText(text: string): void {
+			publishedEditorText = text;
 			// Fire and forget - host can implement editor control
 			this.output({
 				type: "extension_ui_request",
@@ -861,10 +1288,13 @@ export async function runRpcMode(
 			} as RpcExtensionUIRequest);
 		}
 
+		/**
+		 * Synchronous snapshot contract: returns the latest host-published draft
+		 * (or server-issued setEditorText value). Host-local edits remain invisible
+		 * until the next publish_editor_text command.
+		 */
 		getEditorText(): string {
-			// Synchronous method can't wait for RPC response
-			// Host should track editor state locally if needed
-			return "";
+			return publishedEditorText;
 		}
 
 		async editor(
@@ -876,8 +1306,8 @@ export async function runRpcMode(
 			return requestRpcEditor(this.pendingRequests, this.output, title, prefill, dialogOptions, editorOptions);
 		}
 
-		addAutocompleteProvider(): void {
-			// Autocomplete provider composition is not supported in RPC mode
+		addAutocompleteProvider(factory: AutocompleteProviderFactory): void {
+			autocompleteProviderFactories.push(factory);
 		}
 
 		get theme(): Theme {
@@ -885,16 +1315,19 @@ export async function runRpcMode(
 		}
 
 		getAllThemes(): Promise<{ name: string; path: string | undefined }[]> {
-			return Promise.resolve([]);
+			return getAvailableThemesWithPaths();
 		}
 
-		getTheme(_name: string): Promise<Theme | undefined> {
-			return Promise.resolve(undefined);
+		getTheme(name: string): Promise<Theme | undefined> {
+			return getThemeByName(name);
 		}
 
-		setTheme(_theme: string | Theme): Promise<{ success: boolean; error?: string }> {
-			// Theme switching not supported in RPC mode
-			return Promise.resolve({ success: false, error: "Theme switching not supported in RPC mode" });
+		setTheme(themeOrName: string | Theme): Promise<{ success: boolean; error?: string }> {
+			if (typeof themeOrName !== "string") {
+				setThemeInstance(themeOrName);
+				return Promise.resolve({ success: true });
+			}
+			return setActiveTheme(themeOrName, false);
 		}
 
 		getToolsExpanded() {
@@ -917,6 +1350,55 @@ export async function runRpcMode(
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
 	setToolUIContext?.(rpcUiContext, true);
 
+	// A joined collab session replicates the remote host's events into our
+	// AgentSession; push them down the same stdout path a hosting client sees so
+	// guest and host clients stream identically.
+	const forwardCollabSessionEvent = (event: AgentSessionEvent): void => {
+		output(event);
+	};
+
+	// A remote host's select/editor ask arrives over the relay. Reuse the RPC
+	// extension-UI channel rather than inventing a second dialog protocol.
+	const requestCollabUi = async (request: CollabUiRequest, signal: AbortSignal): Promise<CollabUiResponseValue> => {
+		if (request.kind === "editor") {
+			return await requestRpcEditor(pendingExtensionRequests, output, request.title, request.prefill, {
+				signal,
+			});
+		}
+		return await rpcUiContext.select(request.title, request.options, {
+			signal,
+			initialIndex: request.initialIndex,
+			selectionMarker: request.selectionMarker,
+			checkedIndices: request.checkedIndices,
+			markableCount: request.markableCount,
+			helpText: request.helpText,
+		});
+	};
+
+	// Installed before extension init: an extension that writes a setting while loading
+	// would otherwise change it before anyone is listening, leaving the client stale.
+	const unsubscribeSettings = onSettingChanged((path, value) => {
+		output({ type: "settings_update", path, value: isCredential(path) ? null : (value ?? null) });
+	});
+
+	// Install forwarding before extension initialization: extensions can emit
+	// session events while their initialization hooks run.
+	session.subscribe(event => {
+		output(event);
+		// The TUI drives the vocalizer from its event controller; RPC has none, so
+		// speech would never happen without this. Never let it throw into the event path.
+		try {
+			rpcVoice.vocalizeRpcSessionEvent(session, event);
+		} catch (voiceError) {
+			logger.error("RPC voice vocalization failed", { error: String(voiceError) });
+		}
+		try {
+			rpcIdle.feedRpcIdleEvent(idleBehavior, event);
+		} catch (idleError) {
+			logger.error("RPC idle behavior failed", { error: String(idleError) });
+		}
+	});
+
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
 		reportSendError: (action, err) => {
@@ -934,12 +1416,10 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
-	session.subscribe(event => {
-		output(event);
-	});
-
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const emitAvailableCommandsUpdate = async () => {
+		output({ type: "available_commands_update", commands: await getAvailableCommands() });
+	};
 	const reloadPluginState = async () => {
 		const cwd = session.sessionManager.getCwd();
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
@@ -949,13 +1429,280 @@ export async function runRpcMode(
 		session.setSlashCommands(await loadSlashCommands({ cwd }));
 		await emitAvailableCommandsUpdate();
 	};
-	const emitAvailableCommandsUpdate = async () => {
-		output({ type: "available_commands_update", commands: await getAvailableCommands() });
+	const executeRpcBuiltinSlashCommand = (message: string) =>
+		executeAcpBuiltinSlashCommand(message, {
+			session,
+			sessionManager: session.sessionManager,
+			settings: session.settings,
+			cwd: session.sessionManager.getCwd(),
+			output: text => output({ type: "command_output", text }),
+			refreshCommands: emitAvailableCommandsUpdate,
+			reloadPlugins: reloadPluginState,
+			notifyTitleChanged: async () => {
+				output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
+			},
+			notifyConfigChanged: async () => {
+				output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+			},
+		});
+	const reconcileRpcCwd = async (previousCwd: string, targetCwd: string): Promise<void> => {
+		if (path.resolve(previousCwd) === path.resolve(targetCwd)) return;
+		const moveResult = await executeRpcBuiltinSlashCommand(`/move ${targetCwd}`);
+		if (moveResult === false || "prompt" in moveResult) {
+			throw new Error("The /move builtin could not reconcile the session working directory.");
+		}
+		if (path.resolve(session.sessionManager.getCwd()) !== path.resolve(targetCwd)) {
+			throw new Error(`Failed to move the session to ${targetCwd}.`);
+		}
+		const titlePromptSource = discoverTitleSystemPromptFile(targetCwd);
+		session.setTitleSystemPrompt(await resolvePromptInput(titlePromptSource, "title system prompt"));
+	};
+	const resolveRpcSessionReference = async (reference: string): Promise<string | undefined> => {
+		const normalized = reference.trim();
+		if (!normalized) return undefined;
+		if (path.isAbsolute(normalized)) return normalized;
+		const resumable = await resolveResumableSession(
+			normalized,
+			session.sessionManager.getCwd(),
+			session.sessionManager.getSessionDir(),
+			{ allowGlobalFallback: true },
+		);
+		if (resumable) return resumable.session.path;
+		const query = normalized.toLowerCase();
+		const localTitle = (
+			await SessionManager.list(session.sessionManager.getCwd(), session.sessionManager.getSessionDir())
+		).find(item => item.title?.toLowerCase().includes(query));
+		if (localTitle) return localTitle.path;
+		return (await SessionManager.listAll()).find(item => item.title?.toLowerCase().includes(query))?.path;
 	};
 	session.subscribeCommandMetadataChanged(() => {
 		void emitAvailableCommandsUpdate();
 	});
 	await emitAvailableCommandsUpdate();
+
+	const recordPromptHistory = (text: string): void => {
+		if (shouldSkipHistory(text)) return;
+		try {
+			void HistoryStorage.open()
+				.add(text, session.sessionManager.getCwd(), session.sessionId)
+				.catch(historyError => logger.error("HistoryStorage add failed", { error: String(historyError) }));
+		} catch (historyError) {
+			logger.warn("History storage unavailable", { error: String(historyError) });
+		}
+	};
+
+	const generateAndApplyTitle = async (
+		text: string,
+		onlyIfUnnamed: boolean,
+	): Promise<{ title: string | null; applied: boolean }> => {
+		if (onlyIfUnnamed && session.sessionManager.getSessionName()) return { title: null, applied: false };
+		const title = await session.generateTitle(text);
+		if (!title || (onlyIfUnnamed && session.sessionManager.getSessionName())) {
+			return { title, applied: false };
+		}
+		const applied = await session.setSessionName(title, "auto");
+		if (applied) {
+			output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
+		}
+		return { title, applied };
+	};
+
+	const maybeStartTitleGeneration = (text: string): void => {
+		const runner = session.extensionRunner;
+		const extensionCommandSpace = text.indexOf(" ");
+		const isLocalExtensionCommand =
+			text.startsWith("/") &&
+			runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
+				undefined;
+		if (
+			isLocalExtensionCommand ||
+			session.sessionManager.getSessionName() ||
+			$env.PI_NO_TITLE ||
+			isLowSignalTitleInput(text)
+		) {
+			return;
+		}
+		void generateAndApplyTitle(text, true).catch(titleError => {
+			logger.warn("title-generator: uncaught auto-title error", {
+				sessionId: session.sessionId,
+				reason: "uncaught-auto-title-error",
+				error: titleError instanceof Error ? titleError.message : String(titleError),
+			});
+		});
+	};
+
+	const resolveRpcModel = async (provider: string, modelId: string): Promise<Model | undefined> => {
+		let model = session
+			.getAvailableModels()
+			.find(candidate => candidate.provider === provider && candidate.id === modelId);
+		if (model) return model;
+		await session.modelRegistry.awaitBackgroundRefresh();
+		model = session
+			.getAvailableModels()
+			.find(candidate => candidate.provider === provider && candidate.id === modelId);
+		return model;
+	};
+
+	const routeCollabGuestCommand = (
+		requestId: string | undefined,
+		commandName: "prompt" | "steer" | "follow_up" | "abort" | "abort_and_prompt",
+		route: () => void,
+	): RpcResponse => {
+		try {
+			route();
+			return success(requestId, commandName);
+		} catch (routeError) {
+			const message = routeError instanceof Error ? routeError.message : String(routeError);
+			const code = routeError instanceof rpcCollab.RpcCollabGuestRoutingError ? routeError.code : "operation_failed";
+			return error(requestId, commandName, message, code);
+		}
+	};
+
+	const isRpcPlanPaused = (): boolean => session.sessionManager.buildSessionContext().mode === "plan_paused";
+	const withRpcPlanPauseState = (snapshot: rpcWorkModes.RpcPlanModeSnapshot): RpcPlanModeSnapshot => ({
+		...snapshot,
+		paused: isRpcPlanPaused(),
+	});
+	const readRpcPlanModeSnapshot = async (): Promise<RpcPlanModeSnapshot> =>
+		withRpcPlanPauseState(await rpcWorkModes.readRpcPlanModeState(session));
+	const buildRpcWorkModeSnapshot = async (): Promise<RpcWorkModeSnapshot> => {
+		const snapshot = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
+		return { ...snapshot, plan: withRpcPlanPauseState(snapshot.plan) };
+	};
+	const withRpcPlanDecisionState = (decision: rpcWorkModes.RpcPlanDecisionResult): RpcPlanDecisionResult => ({
+		...decision,
+		state: withRpcPlanPauseState(decision.state),
+	});
+	const pauseRpcPlanMode = async (): Promise<RpcPlanModeSnapshot> => {
+		const current = await readRpcPlanModeSnapshot();
+		if (current.paused) return current;
+		if (!current.enabled) throw new Error("Plan mode is not active.");
+		await rpcWorkModes.exitRpcPlanMode(session);
+		session.sessionManager.appendModeChange("plan_paused");
+		return readRpcPlanModeSnapshot();
+	};
+	const resumeRpcPlanMode = async (): Promise<RpcPlanModeSnapshot> => {
+		const current = await readRpcPlanModeSnapshot();
+		if (current.enabled) return current;
+		if (!current.paused) throw new Error("Plan mode is not paused.");
+		return withRpcPlanPauseState(await rpcWorkModes.enterRpcPlanMode(session));
+	};
+	const exitRpcPlanMode = async (): Promise<RpcPlanModeSnapshot> => {
+		if (isRpcPlanPaused()) {
+			session.sessionManager.appendModeChange("none");
+			return readRpcPlanModeSnapshot();
+		}
+		return withRpcPlanPauseState(await rpcWorkModes.exitRpcPlanMode(session));
+	};
+
+	const reconcileRpcWorkModes = async (honorPlanDefault: boolean): Promise<void> => {
+		const sessionContext = session.sessionManager.buildSessionContext();
+		rpcWorkModes.disposeRpcWorkModes(session);
+		session.setPlanModeState(undefined);
+		session.setGoalModeState(undefined);
+		session.setVibeModeState(undefined);
+
+		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
+			if (!session.settings.get("goal.enabled")) {
+				session.sessionManager.appendModeChange("none");
+				return;
+			}
+			const goal = readRpcPersistedGoal(sessionContext.modeData);
+			if (!goal) {
+				session.sessionManager.appendModeChange("none");
+				return;
+			}
+			session.setGoalModeState({
+				enabled: false,
+				mode: "active",
+				goal: { ...goal, status: "paused" },
+			});
+			await rpcWorkModes.resumeRpcGoal(session);
+			if (sessionContext.mode === "goal_paused") await rpcWorkModes.pauseRpcGoal(session);
+			return;
+		}
+
+		if (sessionContext.mode === "vibe") {
+			await rpcWorkModes.enterRpcVibeMode(session);
+			return;
+		}
+
+		if (sessionContext.mode === "plan_paused") {
+			if (!session.settings.get("plan.enabled")) session.sessionManager.appendModeChange("none");
+			return;
+		}
+
+		if (sessionContext.mode === "plan") {
+			if (!session.settings.get("plan.enabled")) {
+				session.sessionManager.appendModeChange("none");
+				return;
+			}
+			const planFilePath =
+				isRecord(sessionContext.modeData) && typeof sessionContext.modeData.planFilePath === "string"
+					? sessionContext.modeData.planFilePath
+					: undefined;
+			await rpcWorkModes.enterRpcPlanMode(session, planFilePath);
+			return;
+		}
+
+		const isFreshSession =
+			sessionContext.messages.length === 0 &&
+			!session.sessionManager.getEntries().some(entry => entry.type === "mode_change");
+		if (
+			honorPlanDefault &&
+			isFreshSession &&
+			session.settings.get("plan.defaultOnStartup") &&
+			session.settings.get("plan.enabled")
+		) {
+			await rpcWorkModes.enterRpcPlanMode(session);
+		}
+	};
+
+	const runReconciledRpcSessionTransition = async <T>(
+		freshSession: boolean,
+		transition: () => Promise<{ result: T; honorPlanDefault: boolean }>,
+	): Promise<T> => {
+		const previousCwd = session.sessionManager.getCwd();
+		if (freshSession) {
+			const current = await rpcWorkModes.buildRpcWorkModeSnapshot(session);
+			if (current.plan.enabled) await rpcWorkModes.exitRpcPlanMode(session);
+			else if (current.goal.goal) await rpcWorkModes.clearRpcGoal(session);
+			else if (current.vibe.enabled) await rpcWorkModes.exitRpcVibeMode(session);
+		} else if (session.getVibeModeState()?.enabled) {
+			await rpcWorkModes.exitRpcVibeMode(session);
+		}
+
+		await rpcCollab.disposeRpcCollab(session);
+		await releaseVoice();
+		disposeRuntimeControl();
+		idleBehavior.dispose();
+		rpcWorkModes.disposeRpcWorkModes(session);
+		session.setPlanModeState(undefined);
+		session.setGoalModeState(undefined);
+		session.setVibeModeState(undefined);
+
+		let honorPlanDefault = false;
+		try {
+			const outcome = await transition();
+			honorPlanDefault = outcome.honorPlanDefault;
+			return outcome.result;
+		} finally {
+			try {
+				await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
+			} finally {
+				try {
+					await reconcileRpcWorkModes(honorPlanDefault);
+				} finally {
+					disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+					idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
+						output({ type: "idle_recap", recap });
+					});
+				}
+			}
+		}
+	};
+
+	await reconcileRpcWorkModes(true);
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -973,30 +1720,38 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeCollabGuestCommand(id, "prompt", () =>
+						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+					);
+				}
+				let message = command.message.trim();
+				let images = command.images ? [...command.images] : undefined;
+				const runner = session.extensionRunner;
+				if (runner?.hasHandlers("input")) {
+					const inputResult = await runner.emitInput(message, images, "rpc");
+					if (inputResult?.handled) {
+						return success(id, "prompt", { agentInvoked: false });
+					}
+					if (inputResult?.text !== undefined) message = inputResult.text.trim();
+					if (inputResult?.images !== undefined) images = inputResult.images;
+				}
+				if (!message && !images?.length) {
+					return success(id, "prompt", { agentInvoked: false });
+				}
+
+				recordPromptHistory(message);
+				const skillResult = await tryRunRpcSkillCommand(session, message, command.streamingBehavior);
 				if (skillResult) {
 					return success(id, "prompt", skillResult);
 				}
-				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
-					session,
-					sessionManager: session.sessionManager,
-					settings: session.settings,
-					cwd: session.sessionManager.getCwd(),
-					output: text => output({ type: "command_output", text }),
-					refreshCommands: emitAvailableCommandsUpdate,
-					reloadPlugins: reloadPluginState,
-					notifyTitleChanged: async () => {
-						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
-					},
-					notifyConfigChanged: async () => {
-						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
-					},
-				});
+				const builtinResult = await executeRpcBuiltinSlashCommand(message);
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
+						maybeStartTitleGeneration(builtinResult.prompt);
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
 							output,
 							onError: promptError => output(error(id, "prompt", promptError.message)),
 							extensionUserMessageTracker,
@@ -1006,14 +1761,15 @@ export async function runRpcMode(
 					return success(id, "prompt", { agentInvoked: false });
 				}
 
+				maybeStartTitleGeneration(message);
 				// Don't await - events will stream
 				// Extension commands are executed immediately, file prompt templates are expanded
 				// If streaming and streamingBehavior specified, queues via steer/followUp
 				watchAndReportLocalOnlyPromptResult({
 					id,
 					startPrompt: () =>
-						session.prompt(command.message, {
-							images: command.images,
+						session.prompt(message, {
+							images,
 							streamingBehavior: command.streamingBehavior,
 						}),
 					output,
@@ -1024,21 +1780,40 @@ export async function runRpcMode(
 			}
 
 			case "steer": {
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeCollabGuestCommand(id, "steer", () =>
+						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+					);
+				}
 				await session.steer(command.message, command.images);
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeCollabGuestCommand(id, "follow_up", () =>
+						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+					);
+				}
 				await session.followUp(command.message, command.images);
 				return success(id, "follow_up");
 			}
 
 			case "abort": {
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeCollabGuestCommand(id, "abort", () => rpcCollab.sendRpcCollabGuestAbort(session));
+				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
 
 			case "abort_and_prompt": {
+				if (rpcCollab.isRpcCollabGuest(session)) {
+					return routeCollabGuestCommand(id, "abort_and_prompt", () => {
+						rpcCollab.sendRpcCollabGuestAbort(session);
+						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images);
+					});
+				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				session
 					.prompt(command.message, { images: command.images })
@@ -1046,10 +1821,107 @@ export async function runRpcMode(
 				return success(id, "abort_and_prompt");
 			}
 
+			case "ask_btw":
+				return moduleCommand(id, "ask_btw", () =>
+					rpcBtw.askRpcBtw(session, command.question, chunk =>
+						output({ type: "btw_output", id: command.id, chunk }),
+					),
+				);
+
+			case "get_last_btw_answer":
+				return moduleCommand(id, "get_last_btw_answer", async () => ({
+					answer: await rpcBtw.getRpcLastBtwAnswer(session),
+				}));
+
+			case "cancel_btw":
+				return moduleCommand(id, "cancel_btw", () => rpcBtw.cancelRpcBtw(session));
+
+			case "branch_btw":
+				return moduleCommand(id, "branch_btw", () => rpcBtw.branchRpcBtw(session));
+
+			case "complete": {
+				const provider = buildRpcAutocompleteProvider();
+				const result = await provider.getSuggestions(command.lines, command.cursor.line, command.cursor.column);
+				return success(
+					id,
+					"complete",
+					result
+						? {
+								items: result.items.map(item => ({
+									value: item.value,
+									label: item.label,
+									...(typeof item.description === "string" ? { description: item.description } : {}),
+								})),
+								prefix: result.prefix,
+							}
+						: { items: [], prefix: "" },
+				);
+			}
+
+			case "apply_completion": {
+				try {
+					const provider = buildRpcAutocompleteProvider();
+					const suggestions = await provider.getSuggestions(
+						command.lines,
+						command.cursor.line,
+						command.cursor.column,
+					);
+					if (!suggestions) throw new Error("Completion is no longer available");
+					const selected = suggestions.items.find(
+						candidate =>
+							candidate.value === command.item.value &&
+							candidate.label === command.item.label &&
+							candidate.description === command.item.description,
+					);
+					if (!selected) throw new Error("Selected completion is no longer available");
+					const applied = provider.applyCompletion(
+						command.lines,
+						command.cursor.line,
+						command.cursor.column,
+						selected,
+						suggestions.prefix,
+					);
+					return success(id, "apply_completion", {
+						lines: applied.lines,
+						cursor: { line: applied.cursorLine, column: applied.cursorCol },
+					});
+				} catch (err) {
+					return error(
+						id,
+						"apply_completion",
+						err instanceof Error ? err.message : String(err),
+						"stale_completion",
+					);
+				}
+			}
+
+			case "publish_editor_text": {
+				if (typeof command.text !== "string") {
+					return error(id, "publish_editor_text", "Editor text must be a string", "invalid_request");
+				}
+				publishedEditorText = command.text;
+				return success(id, "publish_editor_text");
+			}
+
 			case "new_session":
 			case "switch_session":
-			case "branch": {
-				const result = await handleRpcSessionChange(session, command, subagentRegistry);
+			case "branch":
+			case "fork": {
+				let resolvedCommand: RpcSessionChangeCommand = command;
+				if (command.type === "switch_session") {
+					const sessionPath = await resolveRpcSessionReference(command.sessionPath);
+					if (!sessionPath) {
+						return error(id, "switch_session", `Session "${command.sessionPath}" not found`, "unknown_session");
+					}
+					resolvedCommand = { ...command, sessionPath };
+				}
+				const result = await runReconciledRpcSessionTransition(command.type === "new_session", async () => {
+					const changed = await handleRpcSessionChange(session, resolvedCommand, subagentRegistry);
+					return {
+						result: changed,
+						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
+					};
+				});
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}
@@ -1064,6 +1936,10 @@ export async function runRpcMode(
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
+					isRetrying: session.isRetrying,
+					isBashRunning: session.isBashRunning,
+					isAborting: session.isAborting,
+					isGeneratingHandoff: session.isGeneratingHandoff,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
 					interruptMode: session.interruptMode,
@@ -1082,12 +1958,66 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					configWarnings: [...session.configWarnings],
+					skillWarnings: session.skillWarnings.map(warning => ({
+						skillPath: warning.skillPath,
+						message: warning.message,
+					})),
 				};
 				return success(id, "get_state", state);
 			}
 
 			case "get_available_commands": {
 				return success(id, "get_available_commands", { commands: await getAvailableCommands() });
+			}
+
+			case "get_settings": {
+				return success(id, "get_settings", await buildRpcSettingsSnapshot(session.settings));
+			}
+
+			case "set_setting": {
+				const validated = validateRpcSettingValue(command.path, command.value);
+				if (!validated.ok) return error(id, "set_setting", validated.error, validated.code);
+				const path = command.path as SettingPath;
+				session.settings.set(path, validated.value as never);
+				await session.settings.flush();
+				try {
+					await applySettingEffects(session, command.path, validated.value, mcpManager);
+				} catch (err) {
+					return error(
+						id,
+						"set_setting",
+						`Setting saved but effect failed: ${err instanceof Error ? err.message : String(err)}`,
+						"effect_failed",
+					);
+				}
+				return success(id, "set_setting", {
+					path: command.path,
+					value: isCredential(path) ? null : validated.value,
+					configured: session.settings.isConfigured(path),
+				});
+			}
+
+			case "get_extensions": {
+				const disabledIds = session.settings.get("disabledExtensions") ?? [];
+				const extensions = await loadAllExtensions(command.cwd ?? session.sessionManager.getCwd(), disabledIds);
+				return success(id, "get_extensions", {
+					extensions: extensions.map(({ raw: _raw, ...rest }) => rest),
+				});
+			}
+
+			case "get_repo_status": {
+				return success(
+					id,
+					"get_repo_status",
+					await buildRpcRepoStatus(command.cwd ?? session.sessionManager.getCwd(), {
+						includePr: command.includePr ?? false,
+					}),
+				);
+			}
+
+			case "get_usage_reports": {
+				return success(id, "get_usage_reports", { reports: await readRpcUsageReports(session) });
 			}
 
 			case "set_todos": {
@@ -1109,6 +2039,29 @@ export async function runRpcMode(
 				} catch (err) {
 					return error(id, "set_host_uri_schemes", err instanceof Error ? err.message : String(err));
 				}
+			}
+
+			case "subscribe_provider_request_observations": {
+				const runner = session.extensionRunner;
+				if (!runner) {
+					return error(
+						id,
+						"subscribe_provider_request_observations",
+						"Extension runner is unavailable",
+						"extensions_unavailable",
+					);
+				}
+				unsubscribeProviderRequestObservations?.();
+				unsubscribeProviderRequestObservations = runner.onProviderRequestObservation(observation => {
+					output(buildRpcProviderObservationFrame(session, observation));
+				});
+				return success(id, "subscribe_provider_request_observations", { subscribed: true });
+			}
+
+			case "unsubscribe_provider_request_observations": {
+				unsubscribeProviderRequestObservations?.();
+				unsubscribeProviderRequestObservations = undefined;
+				return success(id, "unsubscribe_provider_request_observations", { subscribed: false });
 			}
 
 			case "set_subagent_subscription": {
@@ -1150,36 +2103,363 @@ export async function runRpcMode(
 			}
 
 			// =================================================================
+			// Work modes
+			// =================================================================
+
+			case "enter_plan_mode":
+				return moduleCommand(id, "enter_plan_mode", async () =>
+					withRpcPlanPauseState(
+						await rpcWorkModes.enterRpcPlanMode(session, command.planFilePath, command.workflow),
+					),
+				);
+
+			case "pause_plan_mode":
+				return moduleCommand(id, "pause_plan_mode", pauseRpcPlanMode);
+
+			case "resume_plan_mode":
+				return moduleCommand(id, "resume_plan_mode", resumeRpcPlanMode);
+
+			case "exit_plan_mode":
+				return moduleCommand(id, "exit_plan_mode", exitRpcPlanMode);
+
+			case "get_plan_mode_state":
+				return moduleCommand(id, "get_plan_mode_state", readRpcPlanModeSnapshot);
+
+			case "submit_plan_review":
+				return moduleCommand(id, "submit_plan_review", () =>
+					rpcWorkModes.submitRpcPlanReview(session, command.title),
+				);
+
+			case "approve_plan_proposal": {
+				let executionModel: Model | undefined;
+				if (command.executionModel) {
+					executionModel = await resolveRpcModel(command.executionModel.provider, command.executionModel.modelId);
+					if (!executionModel) {
+						return error(
+							id,
+							"approve_plan_proposal",
+							`Model not found: ${command.executionModel.provider}/${command.executionModel.modelId}`,
+							"model_not_found",
+						);
+					}
+				}
+				return moduleCommand(id, "approve_plan_proposal", async () =>
+					withRpcPlanDecisionState(
+						await rpcWorkModes.approveRpcPlanProposal(
+							session,
+							command.editedContent,
+							command.strategy,
+							executionModel,
+							command.thinkingLevel,
+						),
+					),
+				);
+			}
+
+			case "reject_plan_proposal":
+				return moduleCommand(id, "reject_plan_proposal", async () =>
+					withRpcPlanDecisionState(await rpcWorkModes.rejectRpcPlanProposal(session, command.feedback)),
+				);
+
+			case "create_goal":
+				return moduleCommand(id, "create_goal", () =>
+					rpcWorkModes.createRpcGoal(session, command.objective, command.tokenBudget),
+				);
+
+			case "pause_goal":
+				return moduleCommand(id, "pause_goal", () => rpcWorkModes.pauseRpcGoal(session));
+
+			case "resume_goal":
+				return moduleCommand(id, "resume_goal", () => rpcWorkModes.resumeRpcGoal(session));
+
+			case "switch_goal":
+				return moduleCommand(id, "switch_goal", () =>
+					rpcWorkModes.switchRpcGoal(session, command.objective, command.tokenBudget),
+				);
+
+			case "clear_goal":
+				return moduleCommand(id, "clear_goal", () => rpcWorkModes.clearRpcGoal(session));
+
+			case "set_goal_budget":
+				return moduleCommand(id, "set_goal_budget", () =>
+					rpcWorkModes.setRpcGoalBudget(session, command.tokenBudget),
+				);
+
+			case "get_goal_state":
+				return moduleCommand(id, "get_goal_state", () => rpcWorkModes.readRpcGoalState(session));
+
+			case "begin_guided_goal":
+				return moduleCommand(id, "begin_guided_goal", () =>
+					rpcWorkModes.beginRpcGuidedGoal(session, command.initialObjective),
+				);
+
+			case "answer_guided_goal":
+				return moduleCommand(id, "answer_guided_goal", () =>
+					rpcWorkModes.answerRpcGuidedGoal(session, command.answer),
+				);
+
+			case "accept_guided_goal":
+				return moduleCommand(id, "accept_guided_goal", () =>
+					rpcWorkModes.acceptRpcGuidedGoal(session, command.objective),
+				);
+
+			case "cancel_guided_goal":
+				return moduleCommand(id, "cancel_guided_goal", () => rpcWorkModes.cancelRpcGuidedGoal(session));
+
+			case "get_guided_goal_state":
+				return moduleCommand(id, "get_guided_goal_state", () => rpcWorkModes.readRpcGuidedGoalState(session));
+
+			case "enter_vibe_mode":
+				return moduleCommand(id, "enter_vibe_mode", () => rpcWorkModes.enterRpcVibeMode(session));
+
+			case "exit_vibe_mode":
+				return moduleCommand(id, "exit_vibe_mode", () => rpcWorkModes.exitRpcVibeMode(session));
+
+			case "get_vibe_mode_state":
+				return moduleCommand(id, "get_vibe_mode_state", () => rpcWorkModes.readRpcVibeModeState(session));
+
+			case "get_work_mode_state":
+				return moduleCommand(id, "get_work_mode_state", buildRpcWorkModeSnapshot);
+
+			// =================================================================
+			// Runtime control
+			// =================================================================
+
+			case "enable_loop":
+				return moduleCommand(id, "enable_loop", () =>
+					rpcRuntimeControl.enableRpcLoop(
+						session,
+						command.prompt,
+						command.action,
+						command.count,
+						command.durationMs,
+					),
+				);
+
+			case "disable_loop":
+				return moduleCommand(id, "disable_loop", () => rpcRuntimeControl.disableRpcLoop(session));
+
+			case "get_loop_state":
+				return moduleCommand(id, "get_loop_state", () => rpcRuntimeControl.readRpcLoopState(session));
+
+			case "cancel_loop_iteration":
+				return moduleCommand(id, "cancel_loop_iteration", () => rpcRuntimeControl.cancelRpcLoopIteration(session));
+
+			case "pause_agents":
+				return moduleCommand(id, "pause_agents", () => rpcRuntimeControl.pauseRpcAgents(session));
+
+			case "resume_agents":
+				return moduleCommand(id, "resume_agents", () => rpcRuntimeControl.resumeRpcAgents(session));
+
+			case "get_pause_state":
+				return moduleCommand(id, "get_pause_state", () => rpcRuntimeControl.readRpcPauseState(session));
+
+			case "get_session_tree":
+				return moduleCommand(id, "get_session_tree", () => rpcRuntimeControl.readRpcSessionTree(session));
+
+			// =================================================================
+			// Agent control
+			// =================================================================
+
+			case "get_controllable_agents":
+				return moduleCommand(id, "get_controllable_agents", () =>
+					rpcAgentControl.listRpcControllableAgents(session),
+				);
+
+			case "revive_agent":
+				return moduleCommand(id, "revive_agent", () => rpcAgentControl.reviveRpcAgent(session, command.agentId));
+
+			case "kill_agent":
+				return moduleCommand(id, "kill_agent", () => rpcAgentControl.killRpcAgent(session, command.agentId));
+
+			case "prompt_agent":
+				return moduleCommand(id, "prompt_agent", () =>
+					rpcAgentControl.promptRpcAgent(session, command.agentId, command.text),
+				);
+
+			case "spawn_background_agent":
+				return moduleCommand(id, "spawn_background_agent", () =>
+					rpcAgentControl.spawnRpcBackgroundAgent(session, command.work, mcpManager),
+				);
+
+			// =================================================================
+			// Authoring
+			// =================================================================
+
+			case "get_advisor_config":
+				return moduleCommand(id, "get_advisor_config", () =>
+					rpcAuthoring.readRpcAdvisorConfig(session, command.scope),
+				);
+
+			case "set_advisor_config":
+				return moduleCommand(id, "set_advisor_config", () =>
+					rpcAuthoring.writeRpcAdvisorConfig(session, command.scope, command.instructions, command.advisors),
+				);
+
+			case "generate_ttsr_rule":
+				return moduleCommand(id, "generate_ttsr_rule", () =>
+					rpcAuthoring.generateRpcTtsrRule(
+						session,
+						command.complaint,
+						command.feedback,
+						command.previousRule,
+						event => output({ type: "ttsr_generation_event", id, event }),
+					),
+				);
+
+			case "build_ttsr_rule":
+				return moduleCommand(id, "build_ttsr_rule", () =>
+					rpcAuthoring.buildRpcTtsrRule(
+						session,
+						command.name,
+						command.description,
+						command.conditions,
+						command.scopes,
+						command.body,
+					),
+				);
+
+			case "register_ttsr_rule":
+				return moduleCommand(id, "register_ttsr_rule", () =>
+					rpcAuthoring.registerRpcTtsrRule(
+						session,
+						command.scope,
+						command.name,
+						command.description,
+						command.conditions,
+						command.scopes,
+						command.body,
+						command.overwrite,
+					),
+				);
+
+			case "get_ttsr_rules":
+				return moduleCommand(id, "get_ttsr_rules", () => rpcAuthoring.listRpcTtsrRules(session));
+
+			case "remove_ttsr_rule":
+				return moduleCommand(id, "remove_ttsr_rule", () =>
+					rpcAuthoring.removeRpcTtsrRule(session, command.name, command.deletePersisted),
+				);
+
+			case "get_agent_definitions":
+				return moduleCommand(id, "get_agent_definitions", () => rpcAuthoring.listRpcAgentDefinitions(session));
+
+			case "get_agent_definition":
+				return moduleCommand(id, "get_agent_definition", () =>
+					rpcAuthoring.readRpcAgentDefinition(session, command.name, command.scope),
+				);
+
+			case "set_agent_definition":
+				return moduleCommand(id, "set_agent_definition", () =>
+					rpcAuthoring.writeRpcAgentDefinition(
+						session,
+						command.scope,
+						command.name,
+						command.content,
+						command.overwrite,
+					),
+				);
+
+			case "delete_agent_definition":
+				return moduleCommand(id, "delete_agent_definition", () =>
+					rpcAuthoring.deleteRpcAgentDefinition(session, command.scope, command.name),
+				);
+
+			case "get_mental_models":
+				return moduleCommand(id, "get_mental_models", () =>
+					rpcAuthoring.listRpcMentalModels(session, command.detail),
+				);
+
+			case "get_mental_model":
+				return moduleCommand(id, "get_mental_model", () =>
+					rpcAuthoring.readRpcMentalModel(session, command.mentalModelId, command.detail),
+				);
+
+			case "create_mental_model":
+				return moduleCommand(id, "create_mental_model", () =>
+					rpcAuthoring.createRpcMentalModel(
+						session,
+						command.name,
+						command.sourceQuery,
+						command.mentalModelId,
+						command.tags,
+						command.maxTokens,
+						command.mode,
+						command.refreshAfterConsolidation,
+					),
+				);
+
+			case "refresh_mental_model":
+				return moduleCommand(id, "refresh_mental_model", () =>
+					rpcAuthoring.refreshRpcMentalModel(session, command.mentalModelId),
+				);
+
+			case "refresh_auto_mental_models":
+				return moduleCommand(id, "refresh_auto_mental_models", () =>
+					rpcAuthoring.refreshRpcAutoMentalModels(session),
+				);
+
+			case "get_mental_model_history":
+				return moduleCommand(id, "get_mental_model_history", () =>
+					rpcAuthoring.readRpcMentalModelHistory(session, command.mentalModelId),
+				);
+
+			case "seed_mental_models":
+				return moduleCommand(id, "seed_mental_models", () => rpcAuthoring.seedRpcMentalModels(session));
+
+			case "delete_mental_model":
+				return moduleCommand(id, "delete_mental_model", () =>
+					rpcAuthoring.deleteRpcMentalModel(session, command.mentalModelId),
+				);
+
+			case "reload_mental_models":
+				return moduleCommand(id, "reload_mental_models", () => rpcAuthoring.reloadRpcMentalModels(session));
+
+			// =================================================================
+			// Presentation
+			// =================================================================
+
+			case "get_theme": {
+				return success(id, "get_theme", await buildRpcThemeSnapshot());
+			}
+
+			case "get_keybindings": {
+				return success(id, "get_keybindings", { keybindings: await buildRpcKeybindings() });
+			}
+
+			case "get_session_view": {
+				return success(id, "get_session_view", buildRpcSessionView(session));
+			}
+
+			// =================================================================
 			// Model
 			// =================================================================
 
-			case "set_model": {
-				let models = session.getAvailableModels();
-				let model = models.find(m => m.provider === command.provider && m.id === command.modelId);
+			case "set_model":
+			case "set_model_temporary": {
+				const model = await resolveRpcModel(command.provider, command.modelId);
 				if (!model) {
-					// Model not in the current catalog. Wait for in-flight
-					// background discovery before declaring it missing: on cold
-					// start, discovery-backed providers (proxy / ollama / etc.)
-					// populate seconds after session ready. Models already in
-					// the bundled catalog skip this await entirely so the RPC
-					// queue is not stalled behind unrelated discovery.
-					await session.modelRegistry.awaitBackgroundRefresh();
-					models = session.getAvailableModels();
-					model = models.find(m => m.provider === command.provider && m.id === command.modelId);
+					return error(id, command.type, `Model not found: ${command.provider}/${command.modelId}`);
 				}
-				if (!model) {
-					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
+				if (command.type === "set_model_temporary") {
+					await session.setModelTemporary(model, command.thinkingLevel, { ephemeral: command.ephemeral });
+				} else {
+					await session.setModel(model);
 				}
-				await session.setModel(model);
-				return success(id, "set_model", model);
+				return success(id, command.type, model);
 			}
 
 			case "cycle_model": {
-				const result = await session.cycleModel();
+				const result = await session.cycleModel(command.direction);
 				if (!result) {
 					return success(id, "cycle_model", null);
 				}
 				return success(id, "cycle_model", result);
+			}
+
+			case "cycle_role_models": {
+				const result = await session.cycleRoleModels(command.roleOrder, command.direction);
+				return success(id, "cycle_role_models", result ?? null);
 			}
 
 			case "get_available_models": {
@@ -1187,6 +2467,19 @@ export async function runRpcMode(
 				const models = session.getAvailableModels();
 				return success(id, "get_available_models", { models });
 			}
+
+			case "get_model_roles":
+				return moduleCommand(id, "get_model_roles", () => rpcModelRoles.readRpcModelRoles(session));
+
+			case "set_model_role":
+				return moduleCommand(id, "set_model_role", () =>
+					rpcModelRoles.setRpcModelRole(session, command.role, command.model, command.scope),
+				);
+
+			case "clear_model_role":
+				return moduleCommand(id, "clear_model_role", () =>
+					rpcModelRoles.clearRpcModelRole(session, command.role, command.scope),
+				);
 
 			// =================================================================
 			// Thinking
@@ -1224,6 +2517,18 @@ export async function runRpcMode(
 				return success(id, "set_interrupt_mode");
 			}
 
+			case "get_queued_messages": {
+				return success(id, "get_queued_messages", session.getRestorableQueuedMessages());
+			}
+
+			case "pop_queued_message": {
+				return success(id, "pop_queued_message", { message: session.popLastQueuedMessage() ?? null });
+			}
+
+			case "clear_queue": {
+				return success(id, "clear_queue", session.clearQueue());
+			}
+
 			// =================================================================
 			// Compaction
 			// =================================================================
@@ -1242,6 +2547,10 @@ export async function runRpcMode(
 			// Retry
 			// =================================================================
 
+			case "retry": {
+				return success(id, "retry", { retried: await session.retry() });
+			}
+
 			case "set_auto_retry": {
 				session.setAutoRetryEnabled(command.enabled);
 				return success(id, "set_auto_retry");
@@ -1257,13 +2566,43 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "bash": {
-				const result = await session.executeBash(command.command);
+				const result = await session.executeBash(
+					command.command,
+					chunk => output({ type: "exec_output", source: "bash", id: command.id, chunk }),
+					{
+						excludeFromContext: command.excludeFromContext,
+						useUserShell: command.useUserShell ?? true,
+					},
+				);
+				if (
+					command.followCwd &&
+					!result.cancelled &&
+					result.exitCode === 0 &&
+					result.workingDir &&
+					path.isAbsolute(result.workingDir)
+				) {
+					await reconcileRpcCwd(session.sessionManager.getCwd(), result.workingDir);
+				}
 				return success(id, "bash", result);
 			}
 
 			case "abort_bash": {
 				session.abortBash();
 				return success(id, "abort_bash");
+			}
+
+			case "python": {
+				const result = await session.executePython(
+					command.code,
+					chunk => output({ type: "exec_output", source: "python", id: command.id, chunk }),
+					{ excludeFromContext: command.excludeFromContext },
+				);
+				return success(id, "python", result);
+			}
+
+			case "abort_python": {
+				session.abortEval();
+				return success(id, "abort_python");
 			}
 
 			// =================================================================
@@ -1273,6 +2612,121 @@ export async function runRpcMode(
 			case "get_session_stats": {
 				const stats = session.getSessionStats();
 				return success(id, "get_session_stats", stats);
+			}
+
+			case "get_sessions": {
+				const currentCwd = session.sessionManager.getCwd();
+				const cwd = command.cwd ?? currentCwd;
+				const sessionDir =
+					command.cwd === undefined || path.resolve(cwd) === path.resolve(currentCwd)
+						? session.sessionManager.getSessionDir()
+						: undefined;
+				let sessions =
+					command.scope === "all" ? await SessionManager.listAll() : await SessionManager.list(cwd, sessionDir);
+				const query = command.query?.trim().toLowerCase();
+				if (query) {
+					sessions = sessions.filter(item =>
+						`${item.title ?? ""}\n${item.firstMessage}\n${item.cwd}\n${item.id}\n${item.allMessagesText}`
+							.toLowerCase()
+							.includes(query),
+					);
+				}
+				sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+				const total = sessions.length;
+				const limit = Math.max(1, Math.min(1000, command.limit ?? 100));
+				return success(id, "get_sessions", {
+					sessions: sessions.slice(0, limit).map(item => ({
+						path: item.path,
+						id: item.id,
+						cwd: item.cwd,
+						title: item.title,
+						parentSessionPath: item.parentSessionPath,
+						created: item.created.toISOString(),
+						modified: item.modified.toISOString(),
+						messageCount: item.messageCount,
+						size: item.size,
+						firstMessage: item.firstMessage,
+						status: item.status,
+					})),
+					total,
+				});
+			}
+
+			case "delete_session": {
+				const target = path.resolve(command.sessionPath);
+				const activeSessionFile = session.sessionManager.getSessionFile();
+				const active = activeSessionFile !== undefined && target === path.resolve(activeSessionFile);
+				if (active) {
+					try {
+						if (session.isCompacting) {
+							session.abortCompaction();
+							while (session.isCompacting) await Bun.sleep(10);
+						}
+						const deleted = await runReconciledRpcSessionTransition(true, async () => {
+							const created = await session.newSession({ drop: true });
+							if (created) subagentRegistry?.clear();
+							return { result: created, honorPlanDefault: created };
+						});
+						if (!deleted) {
+							return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
+						}
+						await emitAvailableCommandsUpdate();
+						return success(id, "delete_session", { sessionPath: command.sessionPath });
+					} catch (err) {
+						return error(id, "delete_session", err instanceof Error ? err.message : String(err));
+					}
+				}
+				// `deleteSessionWithArtifacts` unlinks the file and recursively removes the
+				// sibling artifacts directory derived from its name, so an arbitrary path is a
+				// destructive primitive. Only accept a path the session listing actually owns.
+				const known = (await SessionManager.listAll()).some(item => path.resolve(item.path) === target);
+				if (!known) {
+					return error(
+						id,
+						"delete_session",
+						`Not a known session file: ${command.sessionPath}`,
+						"unknown_session",
+					);
+				}
+				try {
+					await new FileSessionStorage().deleteSessionWithArtifacts(command.sessionPath);
+					return success(id, "delete_session", { sessionPath: command.sessionPath });
+				} catch (err) {
+					return error(id, "delete_session", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "get_prompt_history": {
+				return success(id, "get_prompt_history", {
+					entries: await readRpcPromptHistory({
+						cwd: command.cwd ?? session.sessionManager.getCwd(),
+						query: command.query,
+						limit: command.limit,
+					}),
+				});
+			}
+
+			case "navigate_tree": {
+				const result = await session.navigateTree(command.targetId, {
+					summarize: command.summarize,
+					customInstructions: command.customInstructions,
+					allowAskReopen: command.allowAskReopen,
+					reanswerAskResult: command.reanswerAskResult,
+				});
+				return success(id, "navigate_tree", {
+					...(result.editorText === undefined ? {} : { editorText: result.editorText }),
+					cancelled: result.cancelled,
+					...(result.aborted === undefined ? {} : { aborted: result.aborted }),
+					...(result.reopenAsk === undefined ? {} : { reopenAsk: result.reopenAsk }),
+					...(result.askReanswerCommitted === undefined
+						? {}
+						: { askReanswerCommitted: result.askReanswerCommitted }),
+				});
+			}
+
+			case "resume_after_ask_reanswer": {
+				session.resumeAfterAskReanswer();
+				return success(id, "resume_after_ask_reanswer");
 			}
 
 			case "export_html": {
@@ -1300,6 +2754,10 @@ export async function runRpcMode(
 					return error(id, "set_session_name", "Session name cannot be empty");
 				}
 				return success(id, "set_session_name");
+			}
+
+			case "generate_title": {
+				return success(id, "generate_title", await generateAndApplyTitle(command.text, false));
 			}
 
 			case "handoff": {
@@ -1353,15 +2811,8 @@ export async function runRpcMode(
 			// Login
 			// =================================================================
 
-			case "get_login_providers": {
-				const providers = getOAuthProviders().map(provider => ({
-					id: provider.id,
-					name: provider.name,
-					available: provider.available,
-					authenticated: session.modelRegistry.authStorage.hasAuth(provider.id),
-				}));
-				return success(id, "get_login_providers", { providers });
-			}
+			case "get_login_providers":
+				return moduleCommand(id, "get_login_providers", () => rpcAccounts.readRpcLoginProviders(session));
 
 			case "login": {
 				const knownProvider = getOAuthProviders().find(p => p.id === command.providerId);
@@ -1369,14 +2820,9 @@ export async function runRpcMode(
 					return error(id, "login", `Unknown OAuth provider: ${command.providerId}`);
 				}
 				const uiCtx = new RpcExtensionUIContext(pendingExtensionRequests, output);
-				// Track whether onAuth has fired. Providers that require interactive
-				// input before a browser URL cannot be satisfied headlessly; after
-				// onAuth, prompt input is the pasted OAuth code/redirect URL path.
-				let authEmitted = false;
 				try {
 					await session.modelRegistry.authStorage.login(command.providerId, {
 						onAuth: info => {
-							authEmitted = true;
 							output({
 								type: "extension_ui_request",
 								id: Snowflake.next() as string,
@@ -1390,16 +2836,6 @@ export async function runRpcMode(
 							uiCtx.notify(message, "info");
 						},
 						onPrompt: async prompt => {
-							if (!authEmitted) {
-								// onPrompt called before any auth URL — provider requires
-								// interactive input that cannot be satisfied headlessly.
-								return Promise.reject(
-									new Error(
-										`Provider '${command.providerId}' requires interactive prompts ` +
-											"which are not supported in RPC mode. Use the terminal UI to log in.",
-									),
-								);
-							}
 							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
 						},
 					});
@@ -1413,15 +2849,278 @@ export async function runRpcMode(
 				}
 			}
 
-			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+			case "logout":
+			case "remove_login_account": {
+				if (!Number.isSafeInteger(command.credentialId) || command.credentialId < 1) {
+					const message =
+						command.type === "logout"
+							? "logout now requires a positive credentialId; use remove_provider_credentials to remove every account"
+							: "credentialId must be a positive integer";
+					return error(id, command.type, message, "credential_id_required");
+				}
+				return moduleCommand(id, command.type, () =>
+					rpcAccounts.removeRpcLoginAccount(session, command.providerId, command.credentialId),
+				);
 			}
+
+			case "remove_provider_credentials":
+				return moduleCommand(id, "remove_provider_credentials", () =>
+					rpcAccounts.removeRpcProviderCredentials(session, command.providerId),
+				);
+
+			// =================================================================
+			// MCP
+			// =================================================================
+
+			case "mcp_add_server":
+				return mcpManagerCommand(id, "mcp_add_server", manager =>
+					rpcMcp.addRpcMCPServer(session, manager, command.name, command.config, command.scope),
+				);
+
+			case "mcp_remove_server":
+				return mcpManagerCommand(id, "mcp_remove_server", manager =>
+					rpcMcp.removeRpcMCPServer(session, manager, command.name, command.scope),
+				);
+
+			case "mcp_set_server_enabled":
+				return mcpManagerCommand(id, "mcp_set_server_enabled", manager =>
+					rpcMcp.setRpcMCPServerEnabled(session, manager, command.name, command.enabled),
+				);
+
+			case "mcp_reload":
+				return mcpManagerCommand(id, "mcp_reload", manager => rpcMcp.reloadRpcMCP(session, manager));
+
+			case "mcp_reconnect_server":
+				return mcpManagerCommand(id, "mcp_reconnect_server", manager =>
+					rpcMcp.reconnectRpcMCPServer(session, manager, command.name),
+				);
+
+			case "mcp_unauth_server":
+				return mcpManagerCommand(id, "mcp_unauth_server", manager =>
+					rpcMcp.unauthRpcMCPServer(session, manager, command.name),
+				);
+
+			case "mcp_begin_reauth":
+				return mcpManagerCommand(id, "mcp_begin_reauth", manager =>
+					rpcMcp.beginRpcMCPReauth(session, manager, command.name),
+				);
+
+			case "mcp_complete_reauth":
+				return mcpManagerCommand(id, "mcp_complete_reauth", manager =>
+					rpcMcp.completeRpcMCPReauth(session, manager, command.flowId, command.completion),
+				);
+
+			case "mcp_cancel_reauth": {
+				if (!mcpManager) {
+					return error(
+						id,
+						"mcp_cancel_reauth",
+						"MCP manager is unavailable in this RPC session",
+						"mcp_unavailable",
+					);
+				}
+				try {
+					await rpcMcp.cancelRpcMCPReauth(session, command.flowId);
+					return success(id, "mcp_cancel_reauth");
+				} catch (err) {
+					return error(id, "mcp_cancel_reauth", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "mcp_begin_smithery_login":
+				return mcpManagerCommand(id, "mcp_begin_smithery_login", () => rpcMcp.beginRpcMCPSmitheryLogin());
+
+			case "mcp_complete_smithery_login":
+				return mcpManagerCommand(id, "mcp_complete_smithery_login", () =>
+					rpcMcp.completeRpcMCPSmitheryLogin(command.sessionId, command.apiKey),
+				);
+
+			case "mcp_logout_smithery":
+				return mcpManagerCommand(id, "mcp_logout_smithery", () => rpcMcp.logoutRpcMCPSmithery());
+
+			case "mcp_search_registry":
+				return mcpManagerCommand(id, "mcp_search_registry", () =>
+					rpcMcp.searchRpcMCPRegistry(command.query, command.limit, command.semantic),
+				);
+
+			case "mcp_deploy_registry_result":
+				return mcpManagerCommand(id, "mcp_deploy_registry_result", manager =>
+					rpcMcp.deployRpcMCPRegistryResult(
+						session,
+						manager,
+						command.result,
+						command.scope,
+						command.name,
+						command.values,
+					),
+				);
+
+			// =================================================================
+			// Diagnostics
+			// =================================================================
+
+			case "start_cpu_profile":
+				return moduleCommand(id, "start_cpu_profile", async () => {
+					await rpcDiagnostics.startRpcCpuProfile(session);
+					return null;
+				});
+
+			case "stop_cpu_profile":
+				return moduleCommand(id, "stop_cpu_profile", () => rpcDiagnostics.stopRpcCpuProfile(session));
+
+			case "create_heap_profile":
+				return moduleCommand(id, "create_heap_profile", () => rpcDiagnostics.createRpcHeapProfile(session));
+
+			case "create_support_bundle":
+				return moduleCommand(id, "create_support_bundle", () => rpcDiagnostics.createRpcSupportBundle(session));
+
+			case "create_work_profile":
+				return moduleCommand(id, "create_work_profile", () => rpcDiagnostics.createRpcWorkProfile(session));
+
+			case "get_recent_logs":
+				return moduleCommand(id, "get_recent_logs", () =>
+					rpcDiagnostics.readRpcRecentLogs(session, command.maxLines, command.olderDays),
+				);
+
+			case "get_raw_sse":
+				return moduleCommand(id, "get_raw_sse", () => rpcDiagnostics.readRpcRawSseSnapshot(session));
+
+			case "subscribe_raw_sse": {
+				unsubscribeRawSse ??= rpcDiagnostics.subscribeRpcRawSse(session, snapshot => {
+					output({ type: "raw_sse_update", snapshot });
+				});
+				return success(id, "subscribe_raw_sse", { subscribed: true });
+			}
+
+			case "unsubscribe_raw_sse": {
+				unsubscribeRawSse?.();
+				unsubscribeRawSse = undefined;
+				return success(id, "unsubscribe_raw_sse", { subscribed: false });
+			}
+
+			case "start_inspector":
+				return moduleCommand(id, "start_inspector", () => rpcDiagnostics.startRpcInspector(session));
+
+			case "get_system_info":
+				return moduleCommand(id, "get_system_info", () => rpcDiagnostics.readRpcSystemInfo(session));
+
+			case "get_startup_warnings":
+				return moduleCommand(id, "get_startup_warnings", () => rpcDiagnostics.readRpcStartupWarnings(session));
+
+			case "get_artifacts_directory":
+				return moduleCommand(id, "get_artifacts_directory", () => rpcDiagnostics.getRpcArtifactsDirectory(session));
+
+			case "clear_artifact_cache":
+				return moduleCommand(id, "clear_artifact_cache", () =>
+					rpcDiagnostics.clearRpcArtifactCache(session, command.daysOld),
+				);
+
+			case "get_mcp_auth_challenges":
+				return moduleCommand(id, "get_mcp_auth_challenges", async () => ({
+					challenges: rpcDiagnostics.readPendingRpcMcpAuthChallenges(mcpAuthController),
+				}));
+
+			case "resolve_mcp_auth_challenge":
+				return moduleCommand(id, "resolve_mcp_auth_challenge", async () => ({
+					resolved: rpcDiagnostics.resolveRpcMcpAuthChallenge(
+						mcpAuthController,
+						command.challengeId,
+						command.config,
+					),
+				}));
+
+			// =================================================================
+			// Voice
+			// =================================================================
+
+			case "start_live":
+				return moduleCommand(id, "start_live", () =>
+					rpcVoice.startRpcLive(session, emitVoiceEvent, { voice: command.voice }),
+				);
+
+			case "stop_live":
+				return moduleCommand(id, "stop_live", () => rpcVoice.stopRpcLive(session));
+
+			case "get_live_status":
+				return moduleCommand(id, "get_live_status", () => rpcVoice.getRpcLiveStatus(session));
+
+			case "toggle_live_mute":
+				return moduleCommand(id, "toggle_live_mute", () => rpcVoice.toggleRpcLiveMute(session));
+
+			case "start_stt":
+				return moduleCommand(id, "start_stt", () => rpcVoice.startRpcStt(session, emitVoiceEvent));
+
+			case "stop_stt":
+				return moduleCommand(id, "stop_stt", () => rpcVoice.stopRpcStt(session));
+
+			case "toggle_stt":
+				return moduleCommand(id, "toggle_stt", () => rpcVoice.toggleRpcStt(session, emitVoiceEvent));
+
+			case "get_stt_status":
+				return moduleCommand(id, "get_stt_status", () => rpcVoice.getRpcSttStatus(session));
+
+			case "speak_text":
+				return moduleCommand(id, "speak_text", () => rpcVoice.speakRpcText(session, command.text));
+
+			case "clear_speech":
+				return moduleCommand(id, "clear_speech", () => rpcVoice.clearRpcSpeech(session));
+
+			case "duck_speech":
+				return moduleCommand(id, "duck_speech", () => rpcVoice.duckRpcSpeech(session));
+
+			case "unduck_speech":
+				return moduleCommand(id, "unduck_speech", () => rpcVoice.unduckRpcSpeech(session));
+
+			case "get_speech_status":
+				return moduleCommand(id, "get_speech_status", () => rpcVoice.getRpcSpeechStatus(session));
+
+			case "set_speech_settings":
+				return moduleCommand(id, "set_speech_settings", () =>
+					rpcVoice.applyRpcSpeechSettings(session, { enabled: command.enabled, mode: command.mode }),
+				);
+
+			// =================================================================
+			// Collaboration
+			// =================================================================
+
+			case "start_collab_hosting":
+				return moduleCommand(id, "start_collab_hosting", () =>
+					rpcCollab.startRpcCollabHosting(session, command.relayUrl, eventBus),
+				);
+
+			case "stop_collab_hosting":
+				return moduleCommand(id, "stop_collab_hosting", async () => {
+					await rpcCollab.stopRpcCollabHosting(session);
+					return null;
+				});
+
+			case "get_collab_status":
+				return moduleCommand(id, "get_collab_status", () => rpcCollab.getRpcCollabStatus(session));
+
+			case "join_collab_session":
+				return moduleCommand(id, "join_collab_session", () =>
+					rpcCollab.joinRpcCollabSession(
+						session,
+						command.link,
+						eventBus,
+						forwardCollabSessionEvent,
+						requestCollabUi,
+					),
+				);
+
+			case "leave_collab_session":
+				return moduleCommand(id, "leave_collab_session", async () => {
+					await rpcCollab.leaveRpcCollabSession(session);
+					return null;
+				});
 		}
+		const exhaustive: never = command;
+		const unhandled = exhaustive as { type?: string; id?: string };
+		return error(unhandled.id, unhandled.type ?? "unknown", `Unknown command: ${unhandled.type}`);
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
-	// process while a background-dispatched bash still owes the client its
+	// process while a background-dispatched command still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
@@ -1432,7 +3131,17 @@ export async function runRpcMode(
 			// the process exits. dispose() also emits `session_shutdown`, so we
 			// must NOT emit it separately here or the event fires twice. Skipping
 			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
+			unsubscribeSettings();
+			unsubscribeRawSse?.();
+			unsubscribeProviderRequestObservations?.();
+			disposeRuntimeControl();
+			idleBehavior.dispose();
+			rpcWorkModes.disposeRpcWorkModes(session);
+			await rpcCollab.disposeRpcCollab(session);
+			await releaseVoice();
 			await session.dispose();
+			// See the EOF path: queued frames must reach stdout before the process dies.
+			await stdoutQueue;
 			process.exit(0);
 		},
 	});
@@ -1454,10 +3163,10 @@ export async function runRpcMode(
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
-	// ordinary commands serialize through inputDispatcher, and bash remains
-	// background-dispatched so abort_bash can overtake it. Frames are read
-	// line-by-line and parsed here (not via readJsonl) so a single malformed
-	// line is reported as an error frame and the loop keeps running instead of
+	// ordered commands serialize through inputDispatcher, and explicitly
+	// cancellable work runs in the background so its canceller can overtake it.
+	// Frames are read line-by-line and parsed here (not via readJsonl)
+	// so a single malformed line is reported and the loop keeps running instead of
 	// throwing out of the generator and killing the whole process (issue #5194).
 	const decoder = new TextDecoder();
 	for await (const line of readLines(input ?? Bun.stdin.stream())) {
@@ -1482,10 +3191,21 @@ export async function runRpcMode(
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
 	subagentRegistry?.dispose();
+	unsubscribeSettings();
+	unsubscribeRawSse?.();
+	unsubscribeProviderRequestObservations?.();
+	disposeRuntimeControl();
+	idleBehavior.dispose();
+	rpcWorkModes.disposeRpcWorkModes(session);
+	await rpcCollab.disposeRpcCollab(session);
+	await releaseVoice();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
 	// immediately.
 	await session.dispose();
+	// Frames handed to `writeFrames` are only queued; exiting without awaiting the
+	// queue drops already-produced responses and `exec_output` chunks mid-flight.
+	await stdoutQueue;
 	process.exit(0);
 }

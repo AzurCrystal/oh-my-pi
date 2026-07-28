@@ -10,8 +10,11 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
+import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
-import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { AgentSessionEvent, RoleModelCycleResult, SessionStats } from "../../session/agent-session";
+import type { ConfiguredThinkingLevel } from "../../thinking";
+import type { TodoPhase } from "../../tools/todo";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -20,25 +23,122 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import type {
+	MCPAddScope,
+	MCPServerConfig,
+	MentalModelDetail,
+	MentalModelMode,
+	RpcAdvisorConfig,
+	RpcAdvisorConfigSnapshot,
+	RpcAgentControlResult,
+	RpcAgentDefinition,
+	RpcAgentDefinitionDeleteResult,
+	RpcAgentDefinitionDocument,
+	RpcAuthoringScope,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
+	RpcBackgroundAgent,
+	RpcBtwAnswer,
+	RpcBtwAskResult,
+	RpcBtwBranchResult,
+	RpcBtwOutputFrame,
+	RpcCollabLinks,
+	RpcCollabStatus,
 	RpcCommand,
+	RpcCompletionApplied,
+	RpcCompletionItem,
+	RpcCompletionResult,
+	RpcControllableAgent,
+	RpcDiagnosticArtifact,
+	RpcExecOutputFrame,
+	RpcExtension,
+	RpcExtensionUICancelFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcGenerateTitleResult,
+	RpcGoalModeSnapshot,
+	RpcGuidedGoalSnapshot,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcHostUriCancelRequest,
+	RpcHostUriRequest,
+	RpcHostUriResult,
+	RpcHostUriSchemeDefinition,
+	RpcIdleRecapFrame,
+	RpcInspectorEndpoint,
+	RpcKeybinding,
+	RpcLiveStatus,
+	RpcLoginProvider,
+	RpcLoopAction,
+	RpcLoopState,
+	RpcMCPOAuthBegin,
+	RpcMCPOAuthResult,
+	RpcMCPRegistrySearchResult,
+	RpcMCPReloadResult,
+	RpcMCPServerResult,
+	RpcMCPSmitheryLoginBegin,
+	RpcMCPSmitheryLoginResult,
+	RpcMcpAuthChallenge,
+	RpcMcpAuthChallengeFrame,
+	RpcMentalModel,
+	RpcMentalModelBulkRefresh,
+	RpcMentalModelDeleteResult,
+	RpcMentalModelHistory,
+	RpcMentalModelList,
+	RpcMentalModelOperation,
+	RpcMentalModelRefreshOperation,
+	RpcMentalModelReloadResult,
+	RpcMentalModelSeedResult,
+	RpcModelRoleScope,
+	RpcModelRolesSnapshot,
+	RpcNavigateTreeOptions,
+	RpcNavigateTreeResult,
+	RpcPauseResult,
+	RpcPauseState,
+	RpcPlanDecisionResult,
+	RpcPlanFinalizationStrategy,
+	RpcPlanModeSnapshot,
+	RpcPlanProposalSnapshot,
+	RpcPromptHistoryEntry,
+	RpcProviderRequestObservationFrame,
+	RpcQueuedMessages,
+	RpcRawSseSnapshot,
+	RpcRawSseUpdateFrame,
+	RpcRecentLogs,
+	RpcRepoStatus,
 	RpcResponse,
+	RpcSessionListEntry,
 	RpcSessionState,
+	RpcSessionTreeSnapshot,
+	RpcSessionView,
+	RpcSettingsSnapshot,
+	RpcSettingsUpdateFrame,
+	RpcSpeechSettings,
+	RpcSpeechStatus,
+	RpcStartupWarnings,
+	RpcSttStatus,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
 	RpcSubagentMessagesResult,
 	RpcSubagentProgressFrame,
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
+	RpcSystemInfo,
+	RpcThemeSnapshot,
+	RpcTtsrGeneratedCandidate,
+	RpcTtsrGenerationEventFrame,
+	RpcTtsrRegistration,
+	RpcTtsrRemoval,
+	RpcTtsrRule,
+	RpcTtsrRuleDraft,
+	RpcVibeModeSnapshot,
+	RpcVoiceEventFrame,
+	RpcWorkModeSnapshot,
+	SmitherySearchResult,
+	UsageReport,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -74,6 +174,33 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcExecOutputListener = (frame: RpcExecOutputFrame) => void;
+export type RpcBtwOutputListener = (frame: RpcBtwOutputFrame) => void;
+export type RpcIdleRecapListener = (frame: RpcIdleRecapFrame) => void;
+export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
+export type RpcRawSseUpdateListener = (frame: RpcRawSseUpdateFrame) => void;
+export type RpcMcpAuthChallengeListener = (frame: RpcMcpAuthChallengeFrame) => void;
+export type RpcTtsrGenerationEventListener = (frame: RpcTtsrGenerationEventFrame) => void;
+export type RpcVoiceEventListener = (frame: RpcVoiceEventFrame) => void;
+export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcExtensionUICancelListener = (frame: RpcExtensionUICancelFrame) => void;
+export type RpcProviderRequestObservationListener = (frame: RpcProviderRequestObservationFrame) => void;
+
+export interface RpcClientHostUriContext {
+	signal: AbortSignal;
+}
+
+export interface RpcClientHostUriReadResult {
+	content: string;
+	contentType?: "text/markdown" | "application/json" | "text/plain";
+	notes?: string[];
+	immutable?: boolean;
+}
+
+export type RpcClientHostUriHandler = (
+	request: RpcHostUriRequest,
+	context: RpcClientHostUriContext,
+) => string | RpcClientHostUriReadResult | void | Promise<string | RpcClientHostUriReadResult | void>;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -129,6 +256,7 @@ const sessionEventTypes = new Set<AgentSessionEvent["type"]>([
 	"notice",
 	"thinking_level_changed",
 	"goal_updated",
+	"context_message_added",
 ]);
 
 function isRpcResponse(value: unknown): value is RpcResponse {
@@ -187,6 +315,38 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+function isRpcExecOutputFrame(value: unknown): value is RpcExecOutputFrame {
+	return isRecord(value) && value.type === "exec_output" && typeof value.chunk === "string";
+}
+
+function isRpcBtwOutputFrame(value: unknown): value is RpcBtwOutputFrame {
+	return isRecord(value) && value.type === "btw_output" && typeof value.chunk === "string";
+}
+
+function isRpcIdleRecapFrame(value: unknown): value is RpcIdleRecapFrame {
+	return isRecord(value) && value.type === "idle_recap" && typeof value.recap === "string";
+}
+
+function isRpcSettingsUpdateFrame(value: unknown): value is RpcSettingsUpdateFrame {
+	return isRecord(value) && value.type === "settings_update" && typeof value.path === "string";
+}
+
+function isRpcRawSseUpdateFrame(value: unknown): value is RpcRawSseUpdateFrame {
+	return isRecord(value) && value.type === "raw_sse_update" && isRecord(value.snapshot);
+}
+
+function isRpcMcpAuthChallengeFrame(value: unknown): value is RpcMcpAuthChallengeFrame {
+	return isRecord(value) && value.type === "mcp_auth_challenge" && isRecord(value.challenge);
+}
+
+function isRpcVoiceEventFrame(value: unknown): value is RpcVoiceEventFrame {
+	return isRecord(value) && value.type === "voice_event" && isRecord(value.event);
+}
+
+function isRpcTtsrGenerationEventFrame(value: unknown): value is RpcTtsrGenerationEventFrame {
+	return isRecord(value) && value.type === "ttsr_generation_event" && isRecord(value.event);
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -203,6 +363,39 @@ function isRpcHostToolCancelRequest(value: unknown): value is RpcHostToolCancelR
 	return value.type === "host_tool_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
 }
 
+function isRpcHostUriRequest(value: unknown): value is RpcHostUriRequest {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "host_uri_request" &&
+		typeof value.id === "string" &&
+		(value.operation === "read" || value.operation === "write") &&
+		typeof value.url === "string" &&
+		(value.content === undefined || typeof value.content === "string")
+	);
+}
+
+function isRpcHostUriCancelRequest(value: unknown): value is RpcHostUriCancelRequest {
+	if (!isRecord(value)) return false;
+	return value.type === "host_uri_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
+}
+
+function isRpcExtensionUiCancelFrame(value: unknown): value is RpcExtensionUICancelFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "extension_ui_cancel" &&
+		typeof value.targetId === "string" &&
+		(value.timedOut === undefined || typeof value.timedOut === "boolean")
+	);
+}
+
+function isRpcProviderRequestObservationFrame(value: unknown): value is RpcProviderRequestObservationFrame {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "provider_request_observation" &&
+		(value.stage === "context" || value.stage === "before_provider_request") &&
+		typeof value.requestId === "number"
+	);
+}
 function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest {
 	if (!isRecord(value)) return false;
 	return value.type === "extension_ui_request" && typeof value.id === "string" && typeof value.method === "string";
@@ -250,13 +443,25 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#execOutputListeners = new Set<RpcExecOutputListener>();
+	#btwOutputListeners = new Set<RpcBtwOutputListener>();
+	#idleRecapListeners = new Set<RpcIdleRecapListener>();
+	#settingsUpdateListeners = new Set<RpcSettingsUpdateListener>();
+	#rawSseUpdateListeners = new Set<RpcRawSseUpdateListener>();
+	#mcpAuthChallengeListeners = new Set<RpcMcpAuthChallengeListener>();
+	#ttsrGenerationEventListeners = new Set<RpcTtsrGenerationEventListener>();
+	#voiceEventListeners = new Set<RpcVoiceEventListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
+	#pendingHostUriRequests = new Map<string, { controller: AbortController }>();
+	#hostUriHandler: RpcClientHostUriHandler | undefined;
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
+	#extensionUiCancelListeners = new Set<RpcExtensionUICancelListener>();
+	#providerRequestObservationListeners = new Set<RpcProviderRequestObservationListener>();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -321,6 +526,8 @@ export class RpcClient {
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			for (const pendingRequest of this.#pendingHostUriRequests.values()) pendingRequest.controller.abort(error);
+			this.#pendingHostUriRequests.clear();
 
 			try {
 				child.kill();
@@ -448,6 +655,10 @@ export class RpcClient {
 			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
+		for (const pendingRequest of this.#pendingHostUriRequests.values()) {
+			pendingRequest.controller.abort(error);
+		}
+		this.#pendingHostUriRequests.clear();
 		return this.#waitForExit(child);
 	}
 
@@ -529,6 +740,88 @@ export class RpcClient {
 	}
 
 	/**
+	 * Subscribe to incremental bash and Python execution output emitted by the RPC server.
+	 */
+	onExecOutput(listener: RpcExecOutputListener): () => void {
+		this.#execOutputListeners.add(listener);
+		return () => this.#execOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to incremental text from `/btw` side turns. */
+	onBtwOutput(listener: RpcBtwOutputListener): () => void {
+		this.#btwOutputListeners.add(listener);
+		return () => this.#btwOutputListeners.delete(listener);
+	}
+
+	/** Subscribe to recaps produced after the configured RPC idle period. */
+	onIdleRecap(listener: RpcIdleRecapListener): () => void {
+		this.#idleRecapListeners.add(listener);
+		return () => this.#idleRecapListeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to effective setting changes emitted by the RPC server.
+	 */
+	onSettingsUpdate(listener: RpcSettingsUpdateListener): () => void {
+		this.#settingsUpdateListeners.add(listener);
+		return () => this.#settingsUpdateListeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to raw SSE snapshots. Call {@link subscribeRawSse} to make the server emit them.
+	 */
+	onRawSseUpdate(listener: RpcRawSseUpdateListener): () => void {
+		this.#rawSseUpdateListeners.add(listener);
+		return () => this.#rawSseUpdateListeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to mid-flight MCP re-authentication challenges. The blocked tool call
+	 * only resumes once {@link resolveMcpAuthChallenge} answers the challenge id.
+	 */
+	onMcpAuthChallenge(listener: RpcMcpAuthChallengeListener): () => void {
+		this.#mcpAuthChallengeListeners.add(listener);
+		return () => this.#mcpAuthChallengeListeners.delete(listener);
+	}
+
+	/** Subscribe to streaming `/omfg` rule-generation drafts. */
+	onTtsrGenerationEvent(listener: RpcTtsrGenerationEventListener): () => void {
+		this.#ttsrGenerationEventListeners.add(listener);
+		return () => this.#ttsrGenerationEventListeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to live-session and speech-to-text activity emitted by the RPC server.
+	 */
+	onVoiceEvent(listener: RpcVoiceEventListener): () => void {
+		this.#voiceEventListeners.add(listener);
+		return () => this.#voiceEventListeners.delete(listener);
+	}
+
+	/** Subscribe to extension UI requests, including rich ask dialogs and OAuth prompts. */
+	onExtensionUiRequest(listener: RpcExtensionUIRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => this.#extensionUiListeners.delete(listener);
+	}
+
+	/** Subscribe to server-side cancellation of pending extension UI dialogs. */
+	onExtensionUiCancel(listener: RpcExtensionUICancelListener): () => void {
+		this.#extensionUiCancelListeners.add(listener);
+		return () => this.#extensionUiCancelListeners.delete(listener);
+	}
+
+	/** Observe redacted provider inputs after {@link subscribeProviderRequestObservations}. */
+	onProviderRequestObservation(listener: RpcProviderRequestObservationListener): () => void {
+		this.#providerRequestObservationListeners.add(listener);
+		return () => this.#providerRequestObservationListeners.delete(listener);
+	}
+
+	/** Answer a request received through {@link onExtensionUiRequest}. */
+	respondToExtensionUi(response: RpcExtensionUIResponse): void {
+		this.#writeFrame(response);
+	}
+
+	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
 	getStderr(): string {
@@ -575,11 +868,59 @@ export class RpcClient {
 		await this.#send({ type: "abort" });
 	}
 
+	/** Ask an ephemeral side question without adding it to the main transcript. */
+	async askBtw(question: string): Promise<RpcBtwAskResult> {
+		const response = await this.#send({ type: "ask_btw", question }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Return the last completed, non-empty `/btw` answer. */
+	async getLastBtwAnswer(): Promise<RpcBtwAnswer | null> {
+		const response = await this.#send({ type: "get_last_btw_answer" });
+		return this.#getData<{ answer: RpcBtwAnswer | null }>(response).answer;
+	}
+
+	/** Cancel an in-flight `/btw` side turn. */
+	async cancelBtw(): Promise<boolean> {
+		const response = await this.#send({ type: "cancel_btw" });
+		return this.#getData<{ cancelled: boolean }>(response).cancelled;
+	}
+
+	/** Branch the retained `/btw` answer into the main session. */
+	async branchBtw(): Promise<RpcBtwBranchResult> {
+		const response = await this.#send({ type: "branch_btw" }, 600_000);
+		return this.#getData(response);
+	}
+
 	/**
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
 	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
 		await this.#send({ type: "abort_and_prompt", message, images });
+	}
+
+	/** Get completions for the current editor state. */
+	async complete(lines: string[], cursor: { line: number; column: number }): Promise<RpcCompletionResult> {
+		const response = await this.#send({ type: "complete", lines, cursor });
+		return this.#getData(response);
+	}
+
+	/** Apply a completion previously returned by {@link complete}. */
+	async applyCompletion(
+		lines: string[],
+		cursor: { line: number; column: number },
+		item: RpcCompletionItem,
+	): Promise<RpcCompletionApplied> {
+		const response = await this.#send({ type: "apply_completion", lines, cursor, item });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Publish the host editor's current draft for synchronous extension reads.
+	 * Publish again after each host-local edit that extensions should observe.
+	 */
+	async publishEditorText(text: string): Promise<void> {
+		await this.#send({ type: "publish_editor_text", text });
 	}
 
 	/**
@@ -592,12 +933,53 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 
+	/** Fork the active session with its complete transcript and artifacts. */
+	async fork(): Promise<{ cancelled: boolean }> {
+		const response = await this.#send({ type: "fork" });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Get current session state.
 	 */
 	async getState(): Promise<RpcSessionState> {
 		const response = await this.#send({ type: "get_state" });
 		return this.#getData(response);
+	}
+
+	/** Replace the session todo phases. */
+	async setTodos(phases: TodoPhase[]): Promise<TodoPhase[]> {
+		const response = await this.#send({ type: "set_todos", phases });
+		return this.#getData<{ todoPhases: TodoPhase[] }>(response).todoPhases;
+	}
+
+	/** Replace the host-owned URI schemes exposed to the RPC session. */
+	async setHostUriSchemes(schemes: RpcHostUriSchemeDefinition[]): Promise<string[]> {
+		const response = await this.#send({ type: "set_host_uri_schemes", schemes });
+		return this.#getData<{ schemes: string[] }>(response).schemes;
+	}
+
+	/**
+	 * Register the handler that satisfies requests for schemes announced through
+	 * {@link setHostUriSchemes}. Replacing or disposing it affects future requests.
+	 */
+	registerHostUriHandler(handler: RpcClientHostUriHandler): () => void {
+		this.#hostUriHandler = handler;
+		return () => {
+			if (this.#hostUriHandler === handler) this.#hostUriHandler = undefined;
+		};
+	}
+
+	/** Start redacted provider context/request observation. Servers default to off. */
+	async subscribeProviderRequestObservations(): Promise<void> {
+		const response = await this.#send({ type: "subscribe_provider_request_observations" });
+		this.#getData(response);
+	}
+
+	/** Stop provider context/request observation and release the server observer. */
+	async unsubscribeProviderRequestObservations(): Promise<void> {
+		const response = await this.#send({ type: "unsubscribe_provider_request_observations" });
+		this.#getData(response);
 	}
 
 	/**
@@ -634,6 +1016,36 @@ export class RpcClient {
 		return this.#getData<RpcSubagentMessagesResult>(response);
 	}
 
+	/** List task subagents that can be controlled through the shared agent registry. */
+	async getControllableAgents(): Promise<RpcControllableAgent[]> {
+		const response = await this.#send({ type: "get_controllable_agents" });
+		return this.#getData(response);
+	}
+
+	/** Revive a parked task subagent. */
+	async reviveAgent(agentId: string): Promise<RpcControllableAgent> {
+		const response = await this.#send({ type: "revive_agent", agentId });
+		return this.#getData(response);
+	}
+
+	/** Abort and release a running task subagent. */
+	async killAgent(agentId: string): Promise<RpcAgentControlResult> {
+		const response = await this.#send({ type: "kill_agent", agentId });
+		return this.#getData(response);
+	}
+
+	/** Send a steering prompt to a live task subagent. */
+	async promptAgent(agentId: string, text: string): Promise<RpcControllableAgent> {
+		const response = await this.#send({ type: "prompt_agent", agentId, text }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Dispatch the canonical background `/tan` workflow. */
+	async spawnBackgroundAgent(work: string): Promise<RpcBackgroundAgent> {
+		const response = await this.#send({ type: "spawn_background_agent", work });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Set model by provider and ID.
 	 */
@@ -642,15 +1054,40 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 
+	/** Select a model for this session without updating persisted model settings. */
+	async setModelTemporary(
+		provider: string,
+		modelId: string,
+		options?: { thinkingLevel?: ConfiguredThinkingLevel; ephemeral?: boolean },
+	): Promise<Model> {
+		const response = await this.#send({
+			type: "set_model_temporary",
+			provider,
+			modelId,
+			...(options?.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
+			...(options?.ephemeral !== undefined ? { ephemeral: options.ephemeral } : {}),
+		});
+		return this.#getData(response);
+	}
+
 	/**
 	 * Cycle to next model.
 	 */
-	async cycleModel(): Promise<{
+	async cycleModel(direction?: "forward" | "backward"): Promise<{
 		model: { provider: string; id: string };
 		thinkingLevel: ThinkingLevel | undefined;
 		isScoped: boolean;
 	} | null> {
-		const response = await this.#send({ type: "cycle_model" });
+		const response = await this.#send({ type: "cycle_model", direction });
+		return this.#getData(response);
+	}
+
+	/** Cycle through the configured model roles in the supplied order. */
+	async cycleRoleModels(
+		roleOrder: string[],
+		direction?: "forward" | "backward",
+	): Promise<RoleModelCycleResult | null> {
+		const response = await this.#send({ type: "cycle_role_models", roleOrder, direction });
 		return this.#getData(response);
 	}
 
@@ -662,12 +1099,466 @@ export class RpcClient {
 		return this.#getData<{ models: ModelInfo[] }>(response).models;
 	}
 
+	/** Read effective model roles with their settings-layer provenance. */
+	async getModelRoles(): Promise<RpcModelRolesSnapshot> {
+		const response = await this.#send({ type: "get_model_roles" });
+		return this.#getData(response);
+	}
+
+	/** Persist one model role in the global or project settings layer. */
+	async setModelRole(role: string, model: string, scope: RpcModelRoleScope): Promise<RpcModelRolesSnapshot> {
+		const response = await this.#send({ type: "set_model_role", role, model, scope });
+		return this.#getData(response);
+	}
+
+	/** Clear one model role from the global or project settings layer. */
+	async clearModelRole(role: string, scope: RpcModelRoleScope): Promise<RpcModelRolesSnapshot> {
+		const response = await this.#send({ type: "clear_model_role", role, scope });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Get list of available slash commands.
 	 */
 	async getAvailableCommands(): Promise<RpcAvailableSlashCommand[]> {
 		const response = await this.#send({ type: "get_available_commands" });
 		return this.#getData<{ commands: RpcAvailableSlashCommand[] }>(response).commands;
+	}
+
+	/**
+	 * Get the complete settings schema and effective values.
+	 */
+	async getSettings(): Promise<RpcSettingsSnapshot> {
+		const response = await this.#send({ type: "get_settings" });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Set a setting value.
+	 */
+	async setSetting(path: string, value: unknown): Promise<{ path: string; value: unknown; configured: boolean }> {
+		const response = await this.#send({ type: "set_setting", path, value });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Get loaded extensions without their raw configuration.
+	 */
+	async getExtensions(options?: { cwd?: string }): Promise<RpcExtension[]> {
+		const response = await this.#send({
+			type: "get_extensions",
+			...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+		});
+		return this.#getData<{ extensions: RpcExtension[] }>(response).extensions;
+	}
+
+	/** Get the active theme's resolved colors, symbols, and contrast metadata. */
+	async getTheme(): Promise<RpcThemeSnapshot> {
+		const response = await this.#send({ type: "get_theme" });
+		return this.#getData(response);
+	}
+
+	/** Get the effective terminal keybindings and their descriptions. */
+	async getKeybindings(): Promise<RpcKeybinding[]> {
+		const response = await this.#send({ type: "get_keybindings" });
+		return this.#getData<{ keybindings: RpcKeybinding[] }>(response).keybindings;
+	}
+
+	/** Get repository status for a working directory. PR lookup is opt-in. */
+	async getRepoStatus(options?: { cwd?: string; includePr?: boolean }): Promise<RpcRepoStatus> {
+		const response = await this.#send({
+			type: "get_repo_status",
+			...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+			...(options?.includePr !== undefined ? { includePr: options.includePr } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/** Get provider usage reports for the active session. */
+	async getUsageReports(): Promise<UsageReport[]> {
+		const response = await this.#send({ type: "get_usage_reports" });
+		return this.#getData<{ reports: UsageReport[] }>(response).reports;
+	}
+
+	/** Get session-owned presentation state used by status surfaces. */
+	async getSessionView(): Promise<RpcSessionView> {
+		const response = await this.#send({ type: "get_session_view" });
+		return this.#getData(response);
+	}
+
+	/** Enter plan mode. */
+	async enterPlanMode(
+		planFilePath?: string,
+		workflow: "parallel" | "iterative" = "parallel",
+	): Promise<RpcPlanModeSnapshot> {
+		const response = await this.#send({ type: "enter_plan_mode", planFilePath, workflow });
+		return this.#getData(response);
+	}
+
+	/** Pause plan mode while preserving the persisted paused state. */
+	async pausePlanMode(): Promise<RpcPlanModeSnapshot> {
+		const response = await this.#send({ type: "pause_plan_mode" });
+		return this.#getData(response);
+	}
+
+	/** Resume a paused plan mode. */
+	async resumePlanMode(): Promise<RpcPlanModeSnapshot> {
+		const response = await this.#send({ type: "resume_plan_mode" });
+		return this.#getData(response);
+	}
+
+	/** Exit plan mode. */
+	async exitPlanMode(): Promise<RpcPlanModeSnapshot> {
+		const response = await this.#send({ type: "exit_plan_mode" });
+		return this.#getData(response);
+	}
+
+	/** Read plan-mode state. */
+	async getPlanModeState(): Promise<RpcPlanModeSnapshot> {
+		const response = await this.#send({ type: "get_plan_mode_state" });
+		return this.#getData(response);
+	}
+
+	/** Prepare the current plan for host review. */
+	async submitPlanReview(title = ""): Promise<RpcPlanProposalSnapshot> {
+		const response = await this.#send({ type: "submit_plan_review", title });
+		return this.#getData(response);
+	}
+
+	/** Approve and begin executing the pending plan proposal. */
+	async approvePlanProposal(options?: {
+		editedContent?: string;
+		strategy?: RpcPlanFinalizationStrategy;
+		executionModel?: { provider: string; modelId: string };
+		thinkingLevel?: ConfiguredThinkingLevel;
+	}): Promise<RpcPlanDecisionResult> {
+		const response = await this.#send({ type: "approve_plan_proposal", ...options }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Reject the pending plan proposal, optionally prompting for refinement. */
+	async rejectPlanProposal(feedback = ""): Promise<RpcPlanDecisionResult> {
+		const response = await this.#send({ type: "reject_plan_proposal", feedback }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Create and activate a goal. */
+	async createGoal(objective: string, tokenBudget?: number): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "create_goal", objective, tokenBudget });
+		return this.#getData(response);
+	}
+
+	/** Pause the active goal. */
+	async pauseGoal(): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "pause_goal" });
+		return this.#getData(response);
+	}
+
+	/** Resume the paused goal. */
+	async resumeGoal(): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "resume_goal" });
+		return this.#getData(response);
+	}
+
+	/** Replace the active goal. */
+	async switchGoal(objective: string, tokenBudget?: number): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "switch_goal", objective, tokenBudget });
+		return this.#getData(response);
+	}
+
+	/** Clear the current goal. */
+	async clearGoal(): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "clear_goal" });
+		return this.#getData(response);
+	}
+
+	/** Set or clear the active goal's token budget. */
+	async setGoalBudget(tokenBudget: number | null): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "set_goal_budget", tokenBudget });
+		return this.#getData(response);
+	}
+
+	/** Read goal-mode state. */
+	async getGoalState(): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "get_goal_state" });
+		return this.#getData(response);
+	}
+
+	/** Start the guided goal-definition flow. */
+	async beginGuidedGoal(initialObjective: string): Promise<RpcGuidedGoalSnapshot> {
+		const response = await this.#send({ type: "begin_guided_goal", initialObjective }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Answer the current guided-goal question. */
+	async answerGuidedGoal(answer: string): Promise<RpcGuidedGoalSnapshot> {
+		const response = await this.#send({ type: "answer_guided_goal", answer }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Accept the reviewed guided objective and create its goal. */
+	async acceptGuidedGoal(objective: string): Promise<RpcGoalModeSnapshot> {
+		const response = await this.#send({ type: "accept_guided_goal", objective });
+		return this.#getData(response);
+	}
+
+	/** Cancel the guided goal-definition flow. */
+	async cancelGuidedGoal(): Promise<RpcGuidedGoalSnapshot> {
+		const response = await this.#send({ type: "cancel_guided_goal" });
+		return this.#getData(response);
+	}
+
+	/** Read guided-goal state. */
+	async getGuidedGoalState(): Promise<RpcGuidedGoalSnapshot> {
+		const response = await this.#send({ type: "get_guided_goal_state" });
+		return this.#getData(response);
+	}
+
+	/** Enter vibe mode. */
+	async enterVibeMode(): Promise<RpcVibeModeSnapshot> {
+		const response = await this.#send({ type: "enter_vibe_mode" });
+		return this.#getData(response);
+	}
+
+	/** Exit vibe mode. */
+	async exitVibeMode(): Promise<RpcVibeModeSnapshot> {
+		const response = await this.#send({ type: "exit_vibe_mode" });
+		return this.#getData(response);
+	}
+
+	/** Read vibe-mode state. */
+	async getVibeModeState(): Promise<RpcVibeModeSnapshot> {
+		const response = await this.#send({ type: "get_vibe_mode_state" });
+		return this.#getData(response);
+	}
+
+	/** Read the combined plan, goal, guided-goal, and vibe state. */
+	async getWorkModeState(): Promise<RpcWorkModeSnapshot> {
+		const response = await this.#send({ type: "get_work_mode_state" });
+		return this.#getData(response);
+	}
+
+	/** Enable automatic loop resubmission. */
+	async enableLoop(
+		prompt: string,
+		options?: { action?: RpcLoopAction; count?: number; durationMs?: number },
+	): Promise<RpcLoopState> {
+		const response = await this.#send({ type: "enable_loop", prompt, ...options });
+		return this.#getData(response);
+	}
+
+	/** Disable automatic loop resubmission. */
+	async disableLoop(): Promise<RpcLoopState> {
+		const response = await this.#send({ type: "disable_loop" });
+		return this.#getData(response);
+	}
+
+	/** Read automatic loop state. */
+	async getLoopState(): Promise<RpcLoopState> {
+		const response = await this.#send({ type: "get_loop_state" });
+		return this.#getData(response);
+	}
+
+	/** Cancel the active loop iteration and pause future repeats. */
+	async cancelLoopIteration(): Promise<RpcLoopState> {
+		const response = await this.#send({ type: "cancel_loop_iteration" });
+		return this.#getData(response);
+	}
+
+	/** Pause process-wide agent execution. */
+	async pauseAgents(): Promise<RpcPauseResult> {
+		const response = await this.#send({ type: "pause_agents" });
+		return this.#getData(response);
+	}
+
+	/** Resume process-wide agent execution. */
+	async resumeAgents(): Promise<RpcPauseResult> {
+		const response = await this.#send({ type: "resume_agents" });
+		return this.#getData(response);
+	}
+
+	/** Read process-wide pause state. */
+	async getPauseState(): Promise<RpcPauseState> {
+		const response = await this.#send({ type: "get_pause_state" });
+		return this.#getData(response);
+	}
+
+	/** Read the session tree; returned node ids are valid navigateTree targets. */
+	async getSessionTree(): Promise<RpcSessionTreeSnapshot> {
+		const response = await this.#send({ type: "get_session_tree" });
+		return this.#getData(response);
+	}
+
+	/** Read one project or user advisor configuration. */
+	async getAdvisorConfig(scope: RpcAuthoringScope): Promise<RpcAdvisorConfigSnapshot> {
+		const response = await this.#send({ type: "get_advisor_config", scope });
+		return this.#getData(response);
+	}
+
+	/** Save one advisor configuration and apply the merged roster. */
+	async setAdvisorConfig(
+		scope: RpcAuthoringScope,
+		instructions: string | null,
+		advisors: RpcAdvisorConfig[],
+	): Promise<RpcAdvisorConfigSnapshot> {
+		const response = await this.#send({ type: "set_advisor_config", scope, instructions, advisors });
+		return this.#getData(response);
+	}
+
+	/** Build and validate a TTSR rule without persisting it. */
+	async buildTtsrRule(
+		name: string,
+		description: string,
+		conditions: string[],
+		scopes: string[],
+		body: string,
+	): Promise<RpcTtsrRuleDraft> {
+		const response = await this.#send({ type: "build_ttsr_rule", name, description, conditions, scopes, body });
+		return this.#getData(response);
+	}
+
+	/** Generate an `/omfg` TTSR rule candidate, optionally amending a previous draft. */
+	async generateTtsrRule(
+		complaint: string,
+		options?: { feedback?: string; previousRule?: string },
+	): Promise<RpcTtsrGeneratedCandidate> {
+		const response = await this.#send({ type: "generate_ttsr_rule", complaint, ...options }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Persist and install a TTSR rule. */
+	async registerTtsrRule(
+		scope: RpcAuthoringScope,
+		name: string,
+		description: string,
+		conditions: string[],
+		scopes: string[],
+		body: string,
+		overwrite: boolean,
+	): Promise<RpcTtsrRegistration> {
+		const response = await this.#send({
+			type: "register_ttsr_rule",
+			scope,
+			name,
+			description,
+			conditions,
+			scopes,
+			body,
+			overwrite,
+		});
+		return this.#getData(response);
+	}
+
+	/** List TTSR rules compiled into the live session. */
+	async getTtsrRules(): Promise<RpcTtsrRule[]> {
+		const response = await this.#send({ type: "get_ttsr_rules" });
+		return this.#getData(response);
+	}
+
+	/** Remove a live TTSR rule and optionally its persisted OMFG file. */
+	async removeTtsrRule(name: string, deletePersisted: boolean): Promise<RpcTtsrRemoval> {
+		const response = await this.#send({ type: "remove_ttsr_rule", name, deletePersisted });
+		return this.#getData(response);
+	}
+
+	/** List effective task-agent definitions. */
+	async getAgentDefinitions(): Promise<RpcAgentDefinition[]> {
+		const response = await this.#send({ type: "get_agent_definitions" });
+		return this.#getData(response);
+	}
+
+	/** Read an effective or scope-specific task-agent definition. */
+	async getAgentDefinition(name: string, scope: RpcAuthoringScope | null): Promise<RpcAgentDefinitionDocument | null> {
+		const response = await this.#send({ type: "get_agent_definition", name, scope });
+		return this.#getData(response);
+	}
+
+	/** Create or replace a project or user task-agent definition. */
+	async setAgentDefinition(
+		scope: RpcAuthoringScope,
+		name: string,
+		content: string,
+		overwrite: boolean,
+	): Promise<RpcAgentDefinitionDocument> {
+		const response = await this.#send({ type: "set_agent_definition", scope, name, content, overwrite });
+		return this.#getData(response);
+	}
+
+	/** Delete a project or user task-agent definition. */
+	async deleteAgentDefinition(scope: RpcAuthoringScope, name: string): Promise<RpcAgentDefinitionDeleteResult> {
+		const response = await this.#send({ type: "delete_agent_definition", scope, name });
+		return this.#getData(response);
+	}
+
+	/** List mental models on the active Hindsight bank. */
+	async getMentalModels(detail: MentalModelDetail): Promise<RpcMentalModelList> {
+		const response = await this.#send({ type: "get_mental_models", detail });
+		return this.#getData(response);
+	}
+
+	/** Read one mental model. */
+	async getMentalModel(mentalModelId: string, detail: MentalModelDetail): Promise<RpcMentalModel | null> {
+		const response = await this.#send({ type: "get_mental_model", mentalModelId, detail });
+		return this.#getData(response);
+	}
+
+	/** Create one mental model. */
+	async createMentalModel(
+		name: string,
+		sourceQuery: string,
+		mentalModelId: string | null,
+		tags: string[] | null,
+		maxTokens: number | null,
+		mode: MentalModelMode | null,
+		refreshAfterConsolidation: boolean | null,
+	): Promise<RpcMentalModelOperation> {
+		const response = await this.#send({
+			type: "create_mental_model",
+			name,
+			sourceQuery,
+			mentalModelId,
+			tags,
+			maxTokens,
+			mode,
+			refreshAfterConsolidation,
+		});
+		return this.#getData(response);
+	}
+
+	/** Queue a refresh for one mental model. */
+	async refreshMentalModel(mentalModelId: string): Promise<RpcMentalModelRefreshOperation> {
+		const response = await this.#send({ type: "refresh_mental_model", mentalModelId });
+		return this.#getData(response);
+	}
+
+	/** Queue refreshes for all mental models configured for automatic refresh. */
+	async refreshAutoMentalModels(): Promise<RpcMentalModelBulkRefresh> {
+		const response = await this.#send({ type: "refresh_auto_mental_models" });
+		return this.#getData(response);
+	}
+
+	/** Read one mental model and its content history. */
+	async getMentalModelHistory(mentalModelId: string): Promise<RpcMentalModelHistory | null> {
+		const response = await this.#send({ type: "get_mental_model_history", mentalModelId });
+		return this.#getData(response);
+	}
+
+	/** Seed built-in mental models for the active bank scope. */
+	async seedMentalModels(): Promise<RpcMentalModelSeedResult> {
+		const response = await this.#send({ type: "seed_mental_models" });
+		return this.#getData(response);
+	}
+
+	/** Delete one mental model and refresh the live prompt cache. */
+	async deleteMentalModel(mentalModelId: string): Promise<RpcMentalModelDeleteResult> {
+		const response = await this.#send({ type: "delete_mental_model", mentalModelId });
+		return this.#getData(response);
+	}
+
+	/** Reload the active bank's mental-model prompt block. */
+	async reloadMentalModels(): Promise<RpcMentalModelReloadResult> {
+		const response = await this.#send({ type: "reload_mental_models" });
+		return this.#getData(response);
 	}
 
 	/**
@@ -699,6 +1590,29 @@ export class RpcClient {
 		await this.#send({ type: "set_follow_up_mode", mode });
 	}
 
+	/** Set whether new prompts interrupt immediately or wait for the active turn. */
+	async setInterruptMode(mode: "immediate" | "wait"): Promise<void> {
+		await this.#send({ type: "set_interrupt_mode", mode });
+	}
+
+	/** Read user-restorable steering and follow-up messages, including images. */
+	async getQueuedMessages(): Promise<RpcQueuedMessages> {
+		const response = await this.#send({ type: "get_queued_messages" });
+		return this.#getData(response);
+	}
+
+	/** Remove and return the most recently queued user message. */
+	async popQueuedMessage(): Promise<RpcQueuedMessages["steering"][number] | null> {
+		const response = await this.#send({ type: "pop_queued_message" });
+		return this.#getData<{ message: RpcQueuedMessages["steering"][number] | null }>(response).message;
+	}
+
+	/** Clear all user-restorable steering and follow-up messages. */
+	async clearQueue(): Promise<RpcQueuedMessages> {
+		const response = await this.#send({ type: "clear_queue" });
+		return this.#getData(response);
+	}
+
 	/**
 	 * Compact session context.
 	 */
@@ -728,11 +1642,26 @@ export class RpcClient {
 		await this.#send({ type: "abort_retry" });
 	}
 
+	/** Retry the most recent failed assistant turn. */
+	async retry(): Promise<boolean> {
+		const response = await this.#send({ type: "retry" });
+		return this.#getData<{ retried: boolean }>(response).retried;
+	}
+
 	/**
 	 * Execute a bash command.
 	 */
-	async bash(command: string): Promise<BashResult> {
-		const response = await this.#send({ type: "bash", command });
+	async bash(
+		command: string,
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; followCwd?: boolean },
+	): Promise<BashResult> {
+		const response = await this.#send({
+			type: "bash",
+			command,
+			...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
+			...(options?.useUserShell !== undefined ? { useUserShell: options.useUserShell } : {}),
+			...(options?.followCwd !== undefined ? { followCwd: options.followCwd } : {}),
+		});
 		return this.#getData(response);
 	}
 
@@ -741,6 +1670,66 @@ export class RpcClient {
 	 */
 	async abortBash(): Promise<void> {
 		await this.#send({ type: "abort_bash" });
+	}
+
+	/**
+	 * Execute Python code.
+	 */
+	async python(code: string, options?: { excludeFromContext?: boolean }): Promise<PythonResult> {
+		const response = await this.#send({
+			type: "python",
+			code,
+			...(options?.excludeFromContext !== undefined ? { excludeFromContext: options.excludeFromContext } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/**
+	 * Abort running Python code.
+	 */
+	async abortPython(): Promise<void> {
+		await this.#send({ type: "abort_python" });
+	}
+
+	/**
+	 * List persisted sessions.
+	 */
+	async getSessions(opts?: {
+		scope?: "cwd" | "all";
+		query?: string;
+		limit?: number;
+		cwd?: string;
+	}): Promise<{ sessions: RpcSessionListEntry[]; total: number }> {
+		const response = await this.#send({
+			type: "get_sessions",
+			...(opts?.scope !== undefined ? { scope: opts.scope } : {}),
+			...(opts?.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts?.query !== undefined ? { query: opts.query } : {}),
+			...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/**
+	 * Delete a persisted inactive session.
+	 */
+	async deleteSession(sessionPath: string): Promise<void> {
+		await this.#send({ type: "delete_session", sessionPath });
+	}
+
+	/** Read project-scoped prompt history unless another cwd is supplied. */
+	async getPromptHistory(options?: {
+		cwd?: string;
+		query?: string;
+		limit?: number;
+	}): Promise<RpcPromptHistoryEntry[]> {
+		const response = await this.#send({
+			type: "get_prompt_history",
+			...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+			...(options?.query !== undefined ? { query: options.query } : {}),
+			...(options?.limit !== undefined ? { limit: options.limit } : {}),
+		});
+		return this.#getData<{ entries: RpcPromptHistoryEntry[] }>(response).entries;
 	}
 
 	/**
@@ -768,11 +1757,11 @@ export class RpcClient {
 	}
 
 	/**
-	 * Switch to a different session file.
+	 * Switch sessions by absolute path, session-id prefix, filename prefix, or partial title.
 	 * @returns Object with `cancelled: true` if an extension cancelled the switch
 	 */
-	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
-		const response = await this.#send({ type: "switch_session", sessionPath });
+	async switchSession(sessionReference: string): Promise<{ cancelled: boolean }> {
+		const response = await this.#send({ type: "switch_session", sessionPath: sessionReference });
 		return this.#getData(response);
 	}
 
@@ -782,6 +1771,28 @@ export class RpcClient {
 	 */
 	async branch(entryId: string): Promise<{ text: string; cancelled: boolean }> {
 		const response = await this.#send({ type: "branch", entryId });
+		return this.#getData(response);
+	}
+
+	/** Navigate within the active session tree without creating a new session file. */
+	async navigateTree(targetId: string, options: RpcNavigateTreeOptions = {}): Promise<RpcNavigateTreeResult> {
+		const response = await this.#send({ type: "navigate_tree", targetId, ...options });
+		return this.#getData(response);
+	}
+
+	/** Resume the agent after a committed ask-tool re-answer tree navigation. */
+	async resumeAfterAskReanswer(): Promise<void> {
+		await this.#send({ type: "resume_after_ask_reanswer" });
+	}
+
+	/** Set the active session's user-visible name. */
+	async setSessionName(name: string): Promise<void> {
+		await this.#send({ type: "set_session_name", name });
+	}
+
+	/** Generate and apply an automatic title for the active session. */
+	async generateTitle(text: string): Promise<RpcGenerateTitleResult> {
+		const response = await this.#send({ type: "generate_title", text });
 		return this.#getData(response);
 	}
 
@@ -842,21 +1853,18 @@ export class RpcClient {
 		return this.#getData<{ messages: AgentMessage[] }>(response).messages;
 	}
 
-	/**
-	 * Get list of OAuth providers available for login, with their current authentication status.
-	 */
-	async getLoginProviders(): Promise<Array<{ id: string; name: string; available: boolean; authenticated: boolean }>> {
+	/** Get OAuth providers and their redacted per-account credential metadata. */
+	async getLoginProviders(): Promise<RpcLoginProvider[]> {
 		const response = await this.#send({ type: "get_login_providers" });
-		return this.#getData<{
-			providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }>;
-		}>(response).providers;
+		return this.#getData<{ providers: RpcLoginProvider[] }>(response).providers;
 	}
 
 	/**
 	 * Trigger OAuth login for the given provider.
-	 * The server will emit an `open_url` extension_ui_request for the auth URL.
-	 * Providers that require pasted-code completion may then emit an `input`
-	 * extension_ui_request; pass `onManualCodeInput` to satisfy it.
+	 * Providers may emit an `input` extension_ui_request before any auth URL
+	 * (for endpoint/domain setup) or after it (for pasted-code completion).
+	 * Pass `onManualCodeInput` to answer either form, or handle the generic
+	 * request through {@link onExtensionUiRequest}.
 	 * Resolves when login completes or rejects on failure.
 	 *
 	 * @param onOpenUrl Called when the server emits the auth URL. The host must
@@ -906,6 +1914,372 @@ export class RpcClient {
 		} finally {
 			if (listener) this.#extensionUiListeners.delete(listener);
 		}
+	}
+
+	/** Legacy per-account logout name. A credential id is required; sibling accounts are preserved. */
+	async logout(
+		providerId: string,
+		credentialId: number,
+	): Promise<{ providerId: string; credentialId: number; removed: boolean }> {
+		const response = await this.#send({ type: "logout", providerId, credentialId });
+		return this.#getData(response);
+	}
+
+	/** Remove exactly one stored OAuth account. */
+	async removeLoginAccount(
+		providerId: string,
+		credentialId: number,
+	): Promise<{ providerId: string; credentialId: number; removed: boolean }> {
+		const response = await this.#send({ type: "remove_login_account", providerId, credentialId });
+		return this.#getData(response);
+	}
+
+	/** Destructively remove every stored credential for one provider. */
+	async removeProviderCredentials(providerId: string): Promise<{ providerId: string }> {
+		const response = await this.#send({ type: "remove_provider_credentials", providerId });
+		return this.#getData(response);
+	}
+
+	// =========================================================================
+	// MCP
+	// =========================================================================
+
+	/** Add a configured MCP server and connect it to the live manager. */
+	async addMcpServer(name: string, config: MCPServerConfig, scope: MCPAddScope): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_add_server", name, config, scope }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Remove a configured MCP server and its live tools. */
+	async removeMcpServer(name: string, scope: MCPAddScope): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_remove_server", name, scope });
+		return this.#getData(response);
+	}
+
+	/** Enable or disable an MCP server in persistence and the live manager. */
+	async setMcpServerEnabled(name: string, enabled: boolean): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_set_server_enabled", name, enabled }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Rediscover every MCP server and refresh live tools. */
+	async reloadMcp(): Promise<RpcMCPReloadResult> {
+		const response = await this.#send({ type: "mcp_reload" }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Reconnect one MCP server and replace its live tools. */
+	async reconnectMcpServer(name: string): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_reconnect_server", name }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Remove managed OAuth credentials and reload one MCP server. */
+	async unauthMcpServer(name: string): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_unauth_server", name }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Begin proactive MCP OAuth and return the URL for the host to open. */
+	async beginMcpReauth(name: string): Promise<RpcMCPOAuthBegin> {
+		const response = await this.#send({ type: "mcp_begin_reauth", name }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Submit an OAuth completion or await the callback for a pending MCP flow. */
+	async completeMcpReauth(flowId: string, completion?: string): Promise<RpcMCPOAuthResult> {
+		const response = await this.#send({ type: "mcp_complete_reauth", flowId, completion }, 600_000);
+		return this.#getData(response);
+	}
+
+	/** Cancel a pending proactive MCP OAuth flow. */
+	async cancelMcpReauth(flowId: string): Promise<void> {
+		const response = await this.#send({ type: "mcp_cancel_reauth", flowId });
+		this.#getData(response);
+	}
+
+	/** Begin Smithery authorization and return the client-facing login details. */
+	async beginMcpSmitheryLogin(): Promise<RpcMCPSmitheryLoginBegin> {
+		const response = await this.#send({ type: "mcp_begin_smithery_login" }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Poll Smithery authorization or complete it with a supplied API key. */
+	async completeMcpSmitheryLogin(sessionId: string, apiKey?: string): Promise<RpcMCPSmitheryLoginResult> {
+		const response = await this.#send({ type: "mcp_complete_smithery_login", sessionId, apiKey }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Remove the cached Smithery credential. */
+	async logoutMcpSmithery(): Promise<{ removed: boolean }> {
+		const response = await this.#send({ type: "mcp_logout_smithery" });
+		return this.#getData(response);
+	}
+
+	/** Search the Smithery MCP registry. */
+	async searchMcpRegistry(query: string, limit?: number, semantic?: boolean): Promise<RpcMCPRegistrySearchResult> {
+		const response = await this.#send({ type: "mcp_search_registry", query, limit, semantic }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Configure and deploy one Smithery result into the live MCP manager. */
+	async deployMcpRegistryResult(
+		result: SmitherySearchResult,
+		scope: MCPAddScope,
+		name: string | undefined,
+		values: Record<string, string>,
+	): Promise<RpcMCPServerResult> {
+		const response = await this.#send({ type: "mcp_deploy_registry_result", result, scope, values, name }, 120_000);
+		return this.#getData(response);
+	}
+
+	// =========================================================================
+	// Diagnostics
+	// =========================================================================
+
+	/** Start CPU profiling. Fails when a profile is already running. */
+	async startCpuProfile(): Promise<void> {
+		const response = await this.#send({ type: "start_cpu_profile" });
+		this.#getData(response);
+	}
+
+	/** Stop CPU profiling and write a report bundle. */
+	async stopCpuProfile(): Promise<RpcDiagnosticArtifact> {
+		const response = await this.#send({ type: "stop_cpu_profile" }, 300_000);
+		return this.#getData(response);
+	}
+
+	/** Write a report bundle containing a heap snapshot. */
+	async createHeapProfile(): Promise<RpcDiagnosticArtifact> {
+		const response = await this.#send({ type: "create_heap_profile" }, 300_000);
+		return this.#getData(response);
+	}
+
+	/** Write a support bundle with the session transcript, settings, and raw SSE log. */
+	async createSupportBundle(): Promise<RpcDiagnosticArtifact> {
+		const response = await this.#send({ type: "create_support_bundle" }, 300_000);
+		return this.#getData(response);
+	}
+
+	/** Write a report bundle containing the native work profile. */
+	async createWorkProfile(): Promise<RpcDiagnosticArtifact> {
+		const response = await this.#send({ type: "create_work_profile" }, 300_000);
+		return this.#getData(response);
+	}
+
+	/** Read the tail of the debug log, optionally including rotated days. */
+	async getRecentLogs(options?: { maxLines?: number; olderDays?: number }): Promise<RpcRecentLogs> {
+		const response = await this.#send({
+			type: "get_recent_logs",
+			...(options?.maxLines !== undefined ? { maxLines: options.maxLines } : {}),
+			...(options?.olderDays !== undefined ? { olderDays: options.olderDays } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/** Read the current raw SSE debug buffer. */
+	async getRawSse(): Promise<RpcRawSseSnapshot> {
+		const response = await this.#send({ type: "get_raw_sse" });
+		return this.#getData(response);
+	}
+
+	/** Start pushing `raw_sse_update` frames; observe them with {@link onRawSseUpdate}. */
+	async subscribeRawSse(): Promise<void> {
+		const response = await this.#send({ type: "subscribe_raw_sse" });
+		this.#getData(response);
+	}
+
+	/** Stop pushing `raw_sse_update` frames. */
+	async unsubscribeRawSse(): Promise<void> {
+		const response = await this.#send({ type: "unsubscribe_raw_sse" });
+		this.#getData(response);
+	}
+
+	/** Start (or return) the remote V8 inspector endpoint. */
+	async startInspector(): Promise<RpcInspectorEndpoint> {
+		const response = await this.#send({ type: "start_inspector" });
+		return this.#getData(response);
+	}
+
+	/** Read host OS, CPU, memory, and runtime versions. */
+	async getSystemInfo(): Promise<RpcSystemInfo> {
+		const response = await this.#send({ type: "get_system_info" });
+		return this.#getData(response);
+	}
+
+	/** Read config and skill warnings collected during startup. */
+	async getStartupWarnings(): Promise<RpcStartupWarnings> {
+		const response = await this.#send({ type: "get_startup_warnings" });
+		return this.#getData(response);
+	}
+
+	/** Read the artifacts directory belonging to the active session. */
+	async getArtifactsDirectory(): Promise<RpcDiagnosticArtifact> {
+		const response = await this.#send({ type: "get_artifacts_directory" });
+		return this.#getData(response);
+	}
+
+	/** Remove artifact directories older than `daysOld` (default 30). */
+	async clearArtifactCache(daysOld?: number): Promise<{ removed: number }> {
+		const response = await this.#send({
+			type: "clear_artifact_cache",
+			...(daysOld !== undefined ? { daysOld } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/** List MCP auth challenges still waiting for an answer. */
+	async getMcpAuthChallenges(): Promise<RpcMcpAuthChallenge[]> {
+		const response = await this.#send({ type: "get_mcp_auth_challenges" });
+		return this.#getData<{ challenges: RpcMcpAuthChallenge[] }>(response).challenges;
+	}
+
+	/**
+	 * Answer a pending MCP auth challenge. Omit `config` to fail the blocked call.
+	 * Resolves `false` when the challenge id is unknown or already answered.
+	 */
+	async resolveMcpAuthChallenge(challengeId: string, config?: MCPServerConfig): Promise<boolean> {
+		const response = await this.#send({
+			type: "resolve_mcp_auth_challenge",
+			challengeId,
+			...(config !== undefined ? { config } : {}),
+		});
+		return this.#getData<{ resolved: boolean }>(response).resolved;
+	}
+
+	// =========================================================================
+	// Voice
+	// =========================================================================
+
+	/** Start the realtime voice session; observe activity with {@link onVoiceEvent}. */
+	async startLive(options?: { voice?: string }): Promise<RpcLiveStatus> {
+		const response = await this.#send({
+			type: "start_live",
+			...(options?.voice !== undefined ? { voice: options.voice } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/** Stop the realtime voice session and drain its transport. */
+	async stopLive(): Promise<RpcLiveStatus> {
+		const response = await this.#send({ type: "stop_live" });
+		return this.#getData(response);
+	}
+
+	/** Read realtime voice phase, levels, transcript, and terminal error. */
+	async getLiveStatus(): Promise<RpcLiveStatus> {
+		const response = await this.#send({ type: "get_live_status" });
+		return this.#getData(response);
+	}
+
+	/** Toggle the microphone while keeping the realtime session connected. */
+	async toggleLiveMute(): Promise<RpcLiveStatus> {
+		const response = await this.#send({ type: "toggle_live_mute" });
+		return this.#getData(response);
+	}
+
+	/** Start microphone transcription; observe transcripts with {@link onVoiceEvent}. */
+	async startStt(): Promise<RpcSttStatus> {
+		const response = await this.#send({ type: "start_stt" });
+		return this.#getData(response);
+	}
+
+	/** Stop recording and wait for the final transcript. */
+	async stopStt(): Promise<RpcSttStatus> {
+		const response = await this.#send({ type: "stop_stt" });
+		return this.#getData(response);
+	}
+
+	/** Push-to-talk toggle matching the interactive shortcut. */
+	async toggleStt(): Promise<RpcSttStatus> {
+		const response = await this.#send({ type: "toggle_stt" });
+		return this.#getData(response);
+	}
+
+	/** Read microphone/transcription state. */
+	async getSttStatus(): Promise<RpcSttStatus> {
+		const response = await this.#send({ type: "get_stt_status" });
+		return this.#getData(response);
+	}
+
+	/** Speak explicit text through the harness speakers. */
+	async speakText(text: string): Promise<RpcSpeechStatus> {
+		const response = await this.#send({ type: "speak_text", text });
+		return this.#getData(response);
+	}
+
+	/** Stop playback, synthesis, and pending speech rewrites. */
+	async clearSpeech(): Promise<RpcSpeechStatus> {
+		const response = await this.#send({ type: "clear_speech" });
+		return this.#getData(response);
+	}
+
+	/** Lower speech playback volume while the user is speaking. */
+	async duckSpeech(): Promise<RpcSpeechStatus> {
+		const response = await this.#send({ type: "duck_speech" });
+		return this.#getData(response);
+	}
+
+	/** Restore speech playback volume. */
+	async unduckSpeech(): Promise<RpcSpeechStatus> {
+		const response = await this.#send({ type: "unduck_speech" });
+		return this.#getData(response);
+	}
+
+	/** Read effective speech settings and playback activity. */
+	async getSpeechStatus(): Promise<RpcSpeechStatus> {
+		const response = await this.#send({ type: "get_speech_status" });
+		return this.#getData(response);
+	}
+
+	/** Persist the speech settings controlling automatic and explicit vocalization. */
+	async setSpeechSettings(patch: RpcSpeechSettings): Promise<RpcSpeechStatus> {
+		const response = await this.#send({
+			type: "set_speech_settings",
+			...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+			...(patch.mode !== undefined ? { mode: patch.mode } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	// =========================================================================
+	// Collaboration
+	// =========================================================================
+
+	/** Share the active session through the configured collaboration relay. */
+	async startCollabHosting(relayUrl?: string): Promise<RpcCollabLinks> {
+		const response = await this.#send({
+			type: "start_collab_hosting",
+			...(relayUrl !== undefined ? { relayUrl } : {}),
+		});
+		return this.#getData(response);
+	}
+
+	/** Stop sharing the active session. */
+	async stopCollabHosting(): Promise<void> {
+		const response = await this.#send({ type: "stop_collab_hosting" });
+		this.#getData(response);
+	}
+
+	/** Read the collaboration role, links, and participants. */
+	async getCollabStatus(): Promise<RpcCollabStatus> {
+		const response = await this.#send({ type: "get_collab_status" });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Join a shared session. The host's events arrive through {@link onSessionEvent}
+	 * and its dialogs through the extension-UI channel, exactly as for a hosting client.
+	 */
+	async joinCollabSession(link: string): Promise<RpcCollabStatus> {
+		const response = await this.#send({ type: "join_collab_session", link }, 120_000);
+		return this.#getData(response);
+	}
+
+	/** Leave a guest session, or stop hosting when called by the host. */
+	async leaveCollabSession(): Promise<void> {
+		const response = await this.#send({ type: "leave_collab_session" });
+		this.#getData(response);
 	}
 
 	/**
@@ -1014,6 +2388,11 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcHostUriRequest(data)) {
+			void this.#handleHostUriRequest(data);
+			return;
+		}
+
 		if (isRpcExtensionUiRequest(data)) {
 			for (const listener of this.#extensionUiListeners) {
 				listener(data);
@@ -1021,8 +2400,20 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcExtensionUiCancelFrame(data)) {
+			for (const listener of this.#extensionUiCancelListeners) {
+				listener(data);
+			}
+			return;
+		}
+
 		if (isRpcHostToolCancelRequest(data)) {
 			this.#pendingHostToolCalls.get(data.targetId)?.controller.abort();
+			return;
+		}
+
+		if (isRpcHostUriCancelRequest(data)) {
+			this.#pendingHostUriRequests.get(data.targetId)?.controller.abort();
 			return;
 		}
 
@@ -1050,6 +2441,69 @@ export class RpcClient {
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
+			}
+			return;
+		}
+
+		if (isRpcExecOutputFrame(data)) {
+			for (const listener of this.#execOutputListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcBtwOutputFrame(data)) {
+			for (const listener of this.#btwOutputListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcIdleRecapFrame(data)) {
+			for (const listener of this.#idleRecapListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcSettingsUpdateFrame(data)) {
+			for (const listener of this.#settingsUpdateListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcRawSseUpdateFrame(data)) {
+			for (const listener of this.#rawSseUpdateListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcMcpAuthChallengeFrame(data)) {
+			for (const listener of this.#mcpAuthChallengeListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcVoiceEventFrame(data)) {
+			for (const listener of this.#voiceEventListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcTtsrGenerationEventFrame(data)) {
+			for (const listener of this.#ttsrGenerationEventListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcProviderRequestObservationFrame(data)) {
+			for (const listener of this.#providerRequestObservationListeners) {
+				listener(data);
 			}
 			return;
 		}
@@ -1165,8 +2619,74 @@ export class RpcClient {
 		}
 	}
 
+	async #handleHostUriRequest(request: RpcHostUriRequest): Promise<void> {
+		const handler = this.#hostUriHandler;
+		if (!handler) {
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: "No host URI handler is registered",
+			} satisfies RpcHostUriResult);
+			return;
+		}
+
+		const controller = new AbortController();
+		this.#pendingHostUriRequests.set(request.id, { controller });
+		try {
+			const result = await handler(request, { signal: controller.signal });
+			if (controller.signal.aborted) return;
+			if (request.operation === "write") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id } satisfies RpcHostUriResult);
+				return;
+			}
+			if (typeof result === "string") {
+				this.#writeFrame({ type: "host_uri_result", id: request.id, content: result } satisfies RpcHostUriResult);
+				return;
+			}
+			if (!isRecord(result) || typeof result.content !== "string") {
+				throw new Error("Host URI read handlers must return a string or an object with string content");
+			}
+			if (
+				result.contentType !== undefined &&
+				result.contentType !== "text/markdown" &&
+				result.contentType !== "application/json" &&
+				result.contentType !== "text/plain"
+			) {
+				throw new Error(`Unsupported host URI content type: ${String(result.contentType)}`);
+			}
+			if (
+				result.notes !== undefined &&
+				(!Array.isArray(result.notes) || !result.notes.every(note => typeof note === "string"))
+			) {
+				throw new Error("Host URI result notes must be an array of strings");
+			}
+			if (result.immutable !== undefined && typeof result.immutable !== "boolean") {
+				throw new Error("Host URI result immutable must be a boolean");
+			}
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				content: result.content,
+				...(result.contentType === undefined ? {} : { contentType: result.contentType }),
+				...(result.notes === undefined ? {} : { notes: result.notes }),
+				...(result.immutable === undefined ? {} : { immutable: result.immutable }),
+			} satisfies RpcHostUriResult);
+		} catch (error) {
+			if (controller.signal.aborted) return;
+			this.#writeFrame({
+				type: "host_uri_result",
+				id: request.id,
+				isError: true,
+				error: error instanceof Error ? error.message : String(error),
+			} satisfies RpcHostUriResult);
+		} finally {
+			this.#pendingHostUriRequests.delete(request.id);
+		}
+	}
+
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate | RpcHostUriResult,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {
