@@ -742,6 +742,39 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
 		});
+
+		it("preserves a setting changed while an unrelated save awaits the file lock", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const firstSaveEntered = Promise.withResolvers<void>();
+			const releaseFirstSave = Promise.withResolvers<void>();
+			const withFileLock = fileLock.withFileLock;
+			let saveCount = 0;
+			vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+				saveCount += 1;
+				if (saveCount === 1) {
+					firstSaveEntered.resolve();
+					await releaseFirstSave.promise;
+				}
+				return withFileLock(filePath, fn, options);
+			});
+
+			settings.set("setupVersion", 1);
+			const firstFlush = settings.flush();
+			await firstSaveEntered.promise;
+
+			settings.set("theme.dark", "titanium");
+			releaseFirstSave.resolve();
+			await firstFlush;
+			await settings.flush();
+
+			expect(saveCount).toBe(2);
+			expect(settings.get("setupVersion")).toBe(1);
+			expect(settings.get("theme.dark")).toBe("titanium");
+			expect(await readSettings()).toEqual({
+				setupVersion: 1,
+				theme: { dark: "titanium" },
+			});
+		});
 	});
 
 	describe("model role overrides", () => {

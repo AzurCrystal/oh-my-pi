@@ -112,7 +112,7 @@ const SETTING_PATH_SEGMENTS: Record<SettingPath, readonly string[]> = Object.fro
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed.
  */
-function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
+function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
@@ -348,7 +348,7 @@ export class Settings {
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
 
 	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	#modified = new Set<SettingPath>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
@@ -1974,7 +1974,7 @@ export class Settings {
 
 				// Apply only our modified whole-value paths
 				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
+					const segments = SETTING_PATH_SEGMENTS[modPath];
 					const value = getByPath(this.#global, segments);
 					setByPath(current, segments, value);
 				}
@@ -2012,6 +2012,13 @@ export class Settings {
 						}
 					}
 					setByPath(current, ["modelRoles"], mergedRoles);
+				}
+
+				// Preserve paths changed while this save awaited I/O. They stay
+				// modified so their queued save still persists the latest value.
+				for (const pendingPath of this.#modified) {
+					const segments = SETTING_PATH_SEGMENTS[pendingPath];
+					setByPath(current, segments, getByPath(this.#global, segments));
 				}
 
 				// Update our global with any external changes we preserved
