@@ -41,7 +41,11 @@ export class RpcCollabGuestRoutingError extends Error {
 	}
 }
 
-type RpcCollabContext = CollabHostContext & CollabGuestContext;
+type RpcCollabContext = CollabHostContext &
+	CollabGuestContext & {
+		collabHostStart?: Promise<CollabHost>;
+		disposed?: boolean;
+	};
 
 const contexts = new WeakMap<AgentSession, RpcCollabContext>();
 
@@ -94,6 +98,16 @@ function writableGuest(session: AgentSession): CollabGuestLink {
 	return guest;
 }
 
+async function ownedHost(context: RpcCollabContext | undefined): Promise<CollabHost | undefined> {
+	if (!context) return undefined;
+	if (context.collabHost) return context.collabHost;
+	try {
+		return await context.collabHostStart;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Whether this session is currently a collaboration guest replica. */
 export function isRpcCollabGuest(session: AgentSession): boolean {
 	return contexts.get(session)?.collabGuest !== undefined;
@@ -119,21 +133,36 @@ export async function startRpcCollabHosting(
 	eventBus?: EventBus,
 ): Promise<RpcCollabLinks> {
 	const context = getContext(session, eventBus);
+	if (context.disposed) throw new Error("Collaboration session is shutting down");
 	if (context.collabGuest) throw new Error("Already in a collab session as a guest; leave first");
 	if (context.collabHost) return links(context.collabHost);
+	if (context.collabHostStart) return links(await context.collabHostStart);
 
 	const urls = resolveCollabUrls(session.settings, relayUrl);
 	if (!urls) throw new Error("No collaboration relay configured");
 
 	const host = new CollabHost(context);
-	await host.start(urls.relayUrl, urls.webUrl);
-	context.collabHost = host;
-	return links(host);
+	const startup = (async () => {
+		try {
+			await host.start(urls.relayUrl, urls.webUrl);
+			context.collabHost = host;
+			return host;
+		} catch (error) {
+			await host.stop("host startup failed");
+			throw error;
+		}
+	})();
+	context.collabHostStart = startup;
+	try {
+		return links(await startup);
+	} finally {
+		if (context.collabHostStart === startup) context.collabHostStart = undefined;
+	}
 }
 
 /** Stop sharing the current session. No-op when the session is not hosting. */
 export async function stopRpcCollabHosting(session: AgentSession): Promise<void> {
-	await contexts.get(session)?.collabHost?.stop("host stopped");
+	await (await ownedHost(contexts.get(session)))?.stop("host stopped");
 }
 
 /** Read the collaboration role, links, and participant display names. */
@@ -174,7 +203,8 @@ export async function joinRpcCollabSession(
 	onUiRequest?: (request: CollabUiRequest, signal: AbortSignal) => Promise<CollabUiResponseValue>,
 ): Promise<RpcCollabStatus> {
 	const context = getContext(session, eventBus);
-	if (context.collabHost) throw new Error("Stop hosting before joining a collab session");
+	if (context.disposed) throw new Error("Collaboration session is shutting down");
+	if (context.collabHost || context.collabHostStart) throw new Error("Stop hosting before joining a collab session");
 	if (context.collabGuest) throw new Error("Already in a collab session; leave first");
 	context.handleEvent = onEvent;
 	context.handleUiRequest = onUiRequest;
@@ -190,20 +220,20 @@ export async function leaveRpcCollabSession(session: AgentSession): Promise<void
 		await context.collabGuest.leave("left");
 		return;
 	}
-	await context?.collabHost?.stop("host stopped");
+	await (await ownedHost(context))?.stop("host stopped");
 }
 
 /** Dispose every collaboration relay owned by this session. No-op when inactive. */
 export async function disposeRpcCollab(session: AgentSession): Promise<void> {
 	const context = contexts.get(session);
 	if (!context) return;
+	context.disposed = true;
 	const guest = context.collabGuest;
-	const host = context.collabHost;
 	try {
 		await guest?.leave("session ended");
 	} finally {
 		try {
-			await host?.stop("session ended");
+			await (await ownedHost(context))?.stop("session ended");
 		} finally {
 			contexts.delete(session);
 		}
