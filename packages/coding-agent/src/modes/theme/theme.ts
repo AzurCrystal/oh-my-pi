@@ -31,217 +31,8 @@ export type SymbolPreset = "unicode" | "nerd" | "ascii";
 /**
  * All available symbol keys organized by category.
  */
-export type SymbolKey =
-	// Status Indicators
-	| "status.success"
-	| "status.error"
-	| "status.warning"
-	| "status.info"
-	| "status.pending"
-	| "status.disabled"
-	| "status.enabled"
-	| "status.running"
-	| "status.shadowed"
-	| "status.aborted"
-	| "status.done"
-	// Navigation
-	| "nav.cursor"
-	| "nav.selected"
-	| "nav.expand"
-	| "nav.collapse"
-	| "nav.back"
-	// Tree Connectors
-	| "tree.branch"
-	| "tree.last"
-	| "tree.vertical"
-	| "tree.horizontal"
-	| "tree.hook"
-	// Box Drawing - Rounded
-	| "boxRound.topLeft"
-	| "boxRound.topRight"
-	| "boxRound.bottomLeft"
-	| "boxRound.bottomRight"
-	| "boxRound.horizontal"
-	| "boxRound.vertical"
-	// Box Drawing - Sharp
-	| "boxSharp.topLeft"
-	| "boxSharp.topRight"
-	| "boxSharp.bottomLeft"
-	| "boxSharp.bottomRight"
-	| "boxSharp.horizontal"
-	| "boxSharp.vertical"
-	| "boxSharp.cross"
-	| "boxSharp.teeDown"
-	| "boxSharp.teeUp"
-	| "boxSharp.teeRight"
-	| "boxSharp.teeLeft"
-	// Separators
-	| "sep.powerline"
-	| "sep.powerlineThin"
-	| "sep.powerlineLeft"
-	| "sep.powerlineRight"
-	| "sep.powerlineThinLeft"
-	| "sep.powerlineThinRight"
-	| "sep.block"
-	| "sep.space"
-	| "sep.asciiLeft"
-	| "sep.asciiRight"
-	| "sep.dot"
-	| "sep.slash"
-	| "sep.pipe"
-	// Icons
-	| "icon.model"
-	| "icon.plan"
-	| "icon.prewalk"
-	| "icon.goal"
-	| "icon.pause"
-	| "icon.loop"
-	| "icon.folder"
-	| "icon.worktree"
-	| "icon.search"
-	| "icon.scratchFolder"
-	| "icon.file"
-	| "icon.git"
-	| "icon.branch"
-	| "icon.pr"
-	| "icon.tokens"
-	| "icon.context"
-	| "icon.cost"
-	| "icon.time"
-	| "icon.pi"
-	| "icon.ghost"
-	| "icon.agents"
-	| "icon.job"
-	| "icon.cache"
-	| "icon.cacheMiss"
-	| "icon.input"
-	| "icon.output"
-	| "icon.throughput"
-	| "icon.host"
-	| "icon.session"
-	| "icon.package"
-	| "icon.warning"
-	| "icon.rewind"
-	| "icon.auto"
-	| "icon.fast"
-	| "icon.extensionSkill"
-	| "icon.extensionTool"
-	| "icon.extensionSlashCommand"
-	| "icon.extensionMcp"
-	| "icon.extensionRule"
-	| "icon.extensionHook"
-	| "icon.extensionPrompt"
-	| "icon.extensionContextFile"
-	| "icon.extensionInstruction"
-	// STT
-	| "icon.mic"
-	// Compaction divider
-	| "icon.camera"
-	// Thinking Levels
-	| "thinking.minimal"
-	| "thinking.low"
-	| "thinking.medium"
-	| "thinking.high"
-	| "thinking.xhigh"
-	| "thinking.max"
-	| "thinking.autoPending"
-	// Checkboxes
-	| "checkbox.checked"
-	| "checkbox.unchecked"
-	// Radio (single-choice)
-	| "radio.selected"
-	| "radio.unselected"
-	// Text Formatting
-	| "format.bullet"
-	| "format.dash"
-	| "format.bracketLeft"
-	| "format.bracketRight"
-	// Markdown-specific
-	| "md.quoteBorder"
-	| "md.hrChar"
-	| "md.bullet"
-	| "md.colorSwatch"
-	// Advisor note rail
-	| "advisor.rail"
-	// Language/file type icons
-	| "lang.default"
-	| "lang.typescript"
-	| "lang.javascript"
-	| "lang.python"
-	| "lang.rust"
-	| "lang.go"
-	| "lang.java"
-	| "lang.c"
-	| "lang.cpp"
-	| "lang.csharp"
-	| "lang.ruby"
-	| "lang.julia"
-	| "lang.php"
-	| "lang.swift"
-	| "lang.kotlin"
-	| "lang.shell"
-	| "lang.html"
-	| "lang.css"
-	| "lang.json"
-	| "lang.yaml"
-	| "lang.markdown"
-	| "lang.sql"
-	| "lang.docker"
-	| "lang.lua"
-	| "lang.text"
-	| "lang.env"
-	| "lang.toml"
-	| "lang.xml"
-	| "lang.ini"
-	| "lang.conf"
-	| "lang.log"
-	| "lang.csv"
-	| "lang.tsv"
-	| "lang.image"
-	| "lang.pdf"
-	| "lang.archive"
-	| "lang.binary"
-	// Settings tab icons
-	| "tab.appearance"
-	| "tab.model"
-	| "tab.interaction"
-	| "tab.context"
-	| "tab.files"
-	| "tab.shell"
-	| "tab.tools"
-	| "tab.memory"
-	| "tab.tasks"
-	| "tab.providers"
-	// Tool identity icons
-	| "tool.write"
-	| "tool.edit"
-	| "tool.bash"
-	| "tool.ssh"
-	| "tool.lsp"
-	| "tool.gh"
-	| "tool.webSearch"
-	| "tool.exa"
-	| "tool.browser"
-	| "tool.eval"
-	| "tool.debug"
-	| "tool.mcp"
-	| "tool.job"
-	| "tool.launch"
-	| "tool.task"
-	| "tool.todo"
-	| "tool.memory"
-	| "tool.ask"
-	| "tool.resolve"
-	| "tool.review"
-	| "tool.inspectImage"
-	| "tool.goal"
-	| "tool.irc"
-	| "tool.delete"
-	| "tool.move";
 
-type SymbolMap = Record<SymbolKey, string>;
-
-const UNICODE_SYMBOLS: SymbolMap = {
+const UNICODE_SYMBOLS = {
 	// Status
 	"status.success": "✔",
 	"status.error": "✘",
@@ -448,7 +239,13 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"tool.irc": "✉",
 	"tool.delete": "🗑",
 	"tool.move": "➜",
-};
+} as const;
+
+export type SymbolKey = keyof typeof UNICODE_SYMBOLS;
+type SymbolMap = Record<SymbolKey, string>;
+
+/** Every symbol key supported by all presets and theme overrides. */
+export const SYMBOL_KEYS: readonly SymbolKey[] = Object.freeze(Object.keys(UNICODE_SYMBOLS)) as readonly SymbolKey[];
 
 const NERD_SYMBOLS: SymbolMap = {
 	// Status Indicators
@@ -1252,21 +1049,28 @@ const THEME_COLOR_RECORD = {
 	statusLineSubagents: true,
 } satisfies Record<ThemeColor, true>;
 
-const VALID_THEME_COLORS: ReadonlySet<string> = new Set(Object.keys(THEME_COLOR_RECORD));
+/** Every semantic foreground color token. */
+export const THEME_COLOR_KEYS: readonly ThemeColor[] = Object.freeze(
+	Object.keys(THEME_COLOR_RECORD),
+) as readonly ThemeColor[];
 
 /** Check if a string is a valid ThemeColor value */
 export function isValidThemeColor(color: string): color is ThemeColor {
-	return VALID_THEME_COLORS.has(color);
+	return Object.hasOwn(THEME_COLOR_RECORD, color);
 }
 
-export type ThemeBg =
-	| "selectedBg"
-	| "userMessageBg"
-	| "customMessageBg"
-	| "toolPendingBg"
-	| "toolSuccessBg"
-	| "toolErrorBg"
-	| "statusLineBg";
+/** Every semantic background color token. */
+export const THEME_BG_KEYS = [
+	"selectedBg",
+	"userMessageBg",
+	"customMessageBg",
+	"toolPendingBg",
+	"toolSuccessBg",
+	"toolErrorBg",
+	"statusLineBg",
+] as const;
+
+export type ThemeBg = (typeof THEME_BG_KEYS)[number];
 
 type ColorMode = "truecolor" | "256color";
 
@@ -1465,19 +1269,18 @@ const LANG_BRAND_COLORS: Partial<Record<SymbolKey, string>> = {
  * Resolve a theme color value (hex string or 256-color index) to a CSS hex string.
  * Empty string represents the default terminal color.
  */
-function resolveToHex(value: string | number, isLight: boolean): string {
+function resolveToHex(value: string | number): string | null {
 	if (typeof value === "number") return ansi256ToHex(value);
-	if (value === "") return isLight ? "#000000" : "#e5e5e7";
-	return value;
+	return value || null;
 }
 
 export class Theme {
 	#fgColors: Record<ThemeColor, string>;
 	#bgColors: Record<ThemeBg, string>;
 	/** Resolved hex strings for foreground colors — populated at construction. */
-	readonly #hexFgColors: Record<ThemeColor, string>;
+	readonly #hexFgColors: Record<ThemeColor, string | null>;
 	/** Resolved hex strings for background colors — populated at construction. */
-	readonly #hexBgColors: Record<ThemeBg, string>;
+	readonly #hexBgColors: Record<ThemeBg, string | null>;
 	#symbols: SymbolMap;
 	#spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>>;
 	/**
@@ -1500,19 +1303,18 @@ export class Theme {
 	) {
 		this.statusLineLuminance = colorLuma(bgColors.statusLineBg);
 		this.#statusLineContrastLuminance = relativeLuminance(bgColors.statusLineBg);
-		const slIsLight = this.statusLineLuminance !== undefined && this.statusLineLuminance > 0.5;
 
 		this.#fgColors = {} as Record<ThemeColor, string>;
-		this.#hexFgColors = {} as Record<ThemeColor, string>;
+		this.#hexFgColors = {} as Record<ThemeColor, string | null>;
 		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
 			this.#fgColors[key] = fgAnsi(value, mode);
-			this.#hexFgColors[key] = resolveToHex(value, slIsLight);
+			this.#hexFgColors[key] = resolveToHex(value);
 		}
 		this.#bgColors = {} as Record<ThemeBg, string>;
-		this.#hexBgColors = {} as Record<ThemeBg, string>;
+		this.#hexBgColors = {} as Record<ThemeBg, string | null>;
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.#bgColors[key] = bgAnsi(value, mode);
-			this.#hexBgColors[key] = resolveToHex(value, slIsLight);
+			this.#hexBgColors[key] = resolveToHex(value);
 		}
 		// Build symbol map from preset + overrides
 		const baseSymbols = SYMBOL_PRESETS[symbolPreset];
@@ -1546,7 +1348,19 @@ export class Theme {
 	getColorHex(color: ThemeColor): string {
 		const hex = this.#hexFgColors[color];
 		if (hex === undefined) throw new Error(`Unknown theme color: ${color}`);
-		return hex || (this.isLight ? "#000000" : "#e5e5e7");
+		return hex ?? (this.isLight ? "#000000" : "#e5e5e7");
+	}
+
+	/** Every semantic color token, preserving the terminal default as `null`. */
+	getResolvedColorMap(): Record<string, string | null> {
+		const colors: Record<string, string | null> = { ...this.#hexFgColors, ...this.#hexBgColors };
+		for (const key of THEME_COLOR_KEYS) {
+			if (!(key in colors)) colors[key] = key === "thinkingMax" ? (colors.thinkingXhigh ?? null) : null;
+		}
+		for (const key of THEME_BG_KEYS) {
+			if (!(key in colors)) colors[key] = null;
+		}
+		return colors;
 	}
 
 	/**
@@ -2681,30 +2495,38 @@ function resolveThemeExportColors(themeJson: ThemeJson): {
  * Get resolved theme colors as CSS-compatible hex strings.
  * Used by HTML export to generate CSS custom properties.
  */
-export async function getResolvedThemeColors(themeName?: string): Promise<Record<string, string>> {
+export async function getResolvedThemeColors(themeName?: string): Promise<Record<string, string>>;
+export async function getResolvedThemeColors(
+	themeName: string | undefined,
+	options: { preserveTerminalDefault: true; activeTheme?: Theme },
+): Promise<Record<string, string | null>>;
+export async function getResolvedThemeColors(
+	themeName?: string,
+	options?: { preserveTerminalDefault: true; activeTheme?: Theme },
+): Promise<Record<string, string | null>> {
 	const name = themeName ?? getDefaultTheme();
-	const themeJson = await loadThemeJson(name);
-	const exportColors = resolveThemeExportColors(themeJson);
-	const resolved = resolveThemeColors(themeJson.colors, themeJson.vars);
+	let exportColors: { pageBg?: string; cardBg?: string; infoBg?: string } = {};
+	let resolved: Record<string, string | null>;
+	if (options?.activeTheme) {
+		resolved = options.activeTheme.getResolvedColorMap();
+	} else {
+		const themeJson = await loadThemeJson(name);
+		exportColors = resolveThemeExportColors(themeJson);
+		resolved = createTheme(themeJson).getResolvedColorMap();
+	}
+
+	if (options?.preserveTerminalDefault) return resolved;
 
 	// Empty foreground tokens use the terminal default color. In HTML export,
 	// that default must contrast the export surface, not the TUI status line:
 	// custom light themes can still export dark transcript cards when they omit
 	// `export`, because generateThemeVars derives those cards from userMessageBg.
 	const defaultText = getHtmlDefaultTextForSurface(
-		exportColors.cardBg ?? exportColors.pageBg ?? resolved.userMessageBg,
+		exportColors.cardBg ?? exportColors.pageBg ?? resolved.userMessageBg ?? undefined,
 	);
-
 	const cssColors: Record<string, string> = {};
 	for (const [key, value] of Object.entries(resolved)) {
-		if (typeof value === "number") {
-			cssColors[key] = ansi256ToHex(value);
-		} else if (value === "") {
-			// Empty means default terminal color - use sensible fallback for HTML
-			cssColors[key] = defaultText;
-		} else {
-			cssColors[key] = value;
-		}
+		cssColors[key] = value ?? defaultText;
 	}
 	return cssColors;
 }
