@@ -432,6 +432,11 @@ export class SelectorController {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				break;
+			case "inspect_image.mode":
+				void this.ctx.session.applyInspectImageModeChange().catch(err => {
+					this.ctx.showError(`Failed to apply vision mode: ${err}`);
+				});
+				break;
 
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
@@ -1019,7 +1024,7 @@ export class SelectorController {
 					}
 
 					this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-					this.ctx.editor.setText(result.selectedText);
+					this.ctx.editor.setDraft(result.selectedText, result.selectedImages);
 					done();
 					this.ctx.showStatus("Branched to new session");
 				},
@@ -1194,7 +1199,7 @@ export class SelectorController {
 						this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
-							this.ctx.editor.setText(result.editorText);
+							this.ctx.editor.setDraft(result.editorText, result.editorImages);
 						}
 						this.ctx.showStatus("Navigated to selected point");
 

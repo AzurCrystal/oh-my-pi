@@ -633,14 +633,7 @@ function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostTo
 	});
 }
 
-function parseValueDialogResponse(
-	response: RpcExtensionUIResponse,
-	dialogOptions: ExtensionUIDialogOptions | undefined,
-): string | undefined {
-	if ("cancelled" in response && response.cancelled) {
-		if (response.timedOut) dialogOptions?.onTimeout?.();
-		return undefined;
-	}
+function parseValueDialogResponse(response: RpcExtensionUIResponse): string | undefined {
 	if ("value" in response) return response.value;
 	return undefined;
 }
@@ -793,19 +786,45 @@ export function requestRpcEditor(
 	dialogOptions?: ExtensionUIDialogOptions,
 	editorOptions?: { promptStyle?: boolean },
 ): Promise<string | undefined> {
-	if (dialogOptions?.signal?.aborted) return Promise.resolve(undefined);
+	return requestRpcDialog(
+		pendingRequests,
+		output,
+		dialogOptions,
+		undefined,
+		{
+			method: "editor",
+			title,
+			prefill,
+			promptStyle: editorOptions?.promptStyle,
+			timeout: dialogOptions?.timeout,
+		},
+		parseValueDialogResponse,
+	);
+}
+
+/** Sends an RPC extension dialog and cancels the remote presentation on abort or timeout. */
+export function requestRpcDialog<T>(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	opts: ExtensionUIDialogOptions | undefined,
+	defaultValue: T,
+	request: Record<string, unknown>,
+	parseResponse: (response: RpcExtensionUIResponse) => T,
+): Promise<T> {
+	if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
 
 	const id = Snowflake.next() as string;
-	const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
 	let settled = false;
+	let timeoutNotified = false;
 	let timeoutId: NodeJS.Timeout | undefined;
 
 	const cleanup = () => {
 		clearTimeout(timeoutId);
-		dialogOptions?.signal?.removeEventListener("abort", onAbort);
+		opts?.signal?.removeEventListener("abort", onAbort);
 		pendingRequests.delete(id);
 	};
-	const finish = (value: string | undefined) => {
+	const finish = (value: T) => {
 		if (settled) return;
 		settled = true;
 		cleanup();
@@ -817,47 +836,50 @@ export function requestRpcEditor(
 		cleanup();
 		reject(error);
 	};
+	const notifyTimeout = () => {
+		if (timeoutNotified) return;
+		timeoutNotified = true;
+		opts?.onTimeout?.();
+	};
 	const cancel = (timedOut: boolean) => {
 		if (settled) return;
-		output({
-			type: "extension_ui_cancel",
-			targetId: id,
-			...(timedOut ? { timedOut: true } : {}),
-		} satisfies RpcExtensionUICancelFrame);
-		if (timedOut) dialogOptions?.onTimeout?.();
-		finish(undefined);
+		try {
+			output({
+				type: "extension_ui_cancel",
+				targetId: id,
+				...(timedOut ? { timedOut: true } : {}),
+			} satisfies RpcExtensionUICancelFrame);
+		} finally {
+			finish(defaultValue);
+			if (timedOut) notifyTimeout();
+		}
 	};
 	const onAbort = () => cancel(false);
 
-	dialogOptions?.signal?.addEventListener("abort", onAbort, { once: true });
-	if (dialogOptions?.timeout !== undefined) {
-		timeoutId = setTimeout(() => cancel(true), dialogOptions.timeout);
+	opts?.signal?.addEventListener("abort", onAbort, { once: true });
+	if (opts?.timeout !== undefined) {
+		timeoutId = setTimeout(() => cancel(true), opts.timeout);
 	}
+
 	pendingRequests.set(id, {
 		resolve: response => {
+			if (settled) return;
 			if ("cancelled" in response && response.cancelled) {
-				if (response.timedOut) dialogOptions?.onTimeout?.();
-				finish(undefined);
-			} else if ("value" in response) {
-				finish(response.value);
-			} else {
-				finish(undefined);
+				finish(defaultValue);
+				if (response.timedOut) notifyTimeout();
+				return;
+			}
+			try {
+				finish(parseResponse(response));
+			} catch (error) {
+				fail(error instanceof Error ? error : new Error(String(error)));
 			}
 		},
 		reject: fail,
 	});
-	output({
-		type: "extension_ui_request",
-		id,
-		method: "editor",
-		title,
-		prefill,
-		promptStyle: editorOptions?.promptStyle,
-		timeout: dialogOptions?.timeout,
-	} satisfies RpcExtensionUIRequest);
+	if (!settled) output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
-
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -1075,68 +1097,14 @@ export async function runRpcMode(
 			private output: RpcOutput,
 		) {}
 
-		/** Helper for dialog methods with signal/timeout support */
-		#createDialogPromise<T>(
-			opts: ExtensionUIDialogOptions | undefined,
-			defaultValue: T,
-			request: Record<string, unknown>,
-			parseResponse: (response: RpcExtensionUIResponse) => T,
-		): Promise<T> {
-			if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
-
-			const id = Snowflake.next() as string;
-			const { promise, resolve, reject } = Promise.withResolvers<T>();
-			let settled = false;
-			let timeoutId: NodeJS.Timeout | undefined;
-
-			const cleanup = () => {
-				clearTimeout(timeoutId);
-				opts?.signal?.removeEventListener("abort", onAbort);
-				this.pendingRequests.delete(id);
-			};
-			const finish = (value: T) => {
-				if (settled) return;
-				settled = true;
-				cleanup();
-				resolve(value);
-			};
-			const fail = (error: Error) => {
-				if (settled) return;
-				settled = true;
-				cleanup();
-				reject(error);
-			};
-			const cancel = (timedOut: boolean) => {
-				if (settled) return;
-				this.output({
-					type: "extension_ui_cancel",
-					targetId: id,
-					...(timedOut ? { timedOut: true } : {}),
-				} satisfies RpcExtensionUICancelFrame);
-				if (timedOut) opts?.onTimeout?.();
-				finish(defaultValue);
-			};
-			const onAbort = () => cancel(false);
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(() => cancel(true), opts.timeout);
-			}
-
-			this.pendingRequests.set(id, {
-				resolve: (response: RpcExtensionUIResponse) => finish(parseResponse(response)),
-				reject: fail,
-			});
-			this.output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
-			return promise;
-		}
-
 		select(
 			title: string,
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{
@@ -1145,23 +1113,18 @@ export async function runRpcMode(
 					options: options.map(getExtensionUISelectOptionLabel),
 					timeout: dialogOptions?.timeout,
 				},
-				response => parseValueDialogResponse(response, dialogOptions),
+				parseValueDialogResponse,
 			);
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				false,
 				{ method: "confirm", title, message, timeout: dialogOptions?.timeout },
-				response => {
-					if ("cancelled" in response && response.cancelled) {
-						if (response.timedOut) dialogOptions?.onTimeout?.();
-						return false;
-					}
-					if ("confirmed" in response) return response.confirmed;
-					return false;
-				},
+				response => ("confirmed" in response ? response.confirmed : false),
 			);
 		}
 
@@ -1170,11 +1133,13 @@ export async function runRpcMode(
 			placeholder?: string,
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{ method: "input", title, placeholder, timeout: dialogOptions?.timeout },
-				response => parseValueDialogResponse(response, dialogOptions),
+				parseValueDialogResponse,
 			);
 		}
 
@@ -1182,18 +1147,13 @@ export async function runRpcMode(
 			questions: ExtensionAskDialogQuestion[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<ExtensionAskDialogResult | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{ method: "askDialog", questions, timeout: dialogOptions?.timeout },
-				response => {
-					if ("cancelled" in response && response.cancelled) {
-						if (response.timedOut) dialogOptions?.onTimeout?.();
-						return undefined;
-					}
-					if ("result" in response) return response.result;
-					return undefined;
-				},
+				response => ("result" in response ? response.result : undefined),
 			);
 		}
 
