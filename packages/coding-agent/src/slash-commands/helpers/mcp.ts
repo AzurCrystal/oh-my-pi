@@ -1,23 +1,43 @@
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../mcp/client";
-import {
-	addMCPServer,
-	readDisabledServers,
-	readMCPConfigFile,
-	removeMCPServer,
-	setServerDisabled,
-	updateMCPServer,
-} from "../../mcp/config-writer";
+import { addMCPServer, readDisabledServers, readMCPConfigFile } from "../../mcp/config-writer";
 import { MCPManager } from "../../mcp/manager";
 import { getSmitheryApiKey } from "../../mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../mcp/smithery-registry";
 import type { MCPServerConfig, MCPServerConnection } from "../../mcp/types";
+import {
+	activateMCPServerTools,
+	addMCPServerRuntime,
+	reconnectMCPRuntime,
+	reloadMCPRuntime,
+	removeMCPServerRuntime,
+	setMCPServerEnabledRuntime,
+} from "../../modes/controllers/mcp-command-controller";
 import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, usage } from "./parse";
 
 type AcpMcpScope = "user" | "project";
+
+function requireLiveMCPManager(): MCPManager {
+	const manager = MCPManager.instance();
+	if (!manager) throw new Error("MCP manager not available in this process.");
+	return manager;
+}
+
+async function waitForLiveMCPServer(runtime: SlashCommandRuntime, manager: MCPManager, name: string): Promise<void> {
+	if (manager.getConnectionStatus(name) === "connecting") {
+		try {
+			await Promise.race([manager.waitForConnection(name), Bun.sleep(10_000)]);
+		} catch {
+			// The manager's state remains the source of truth.
+		}
+	}
+	if (manager.getConnectionStatus(name) === "connected") {
+		await runtime.session.refreshMCPTools(manager.getTools());
+	}
+}
 
 interface ParsedMcpAddArgs {
 	name?: string;
@@ -316,10 +336,31 @@ async function handleAddCommand(rest: string, runtime: SlashCommandRuntime): Pro
 	if (!parsed.name) return usage(MCP_ADD_USAGE, runtime);
 	const config = buildMcpServerConfig(parsed);
 	if (!config) return usage(MCP_ADD_USAGE, runtime);
+	const manager = MCPManager.instance();
+	if (!manager) {
+		try {
+			await addMCPServer(getMCPConfigPath(parsed.scope, runtime.cwd), parsed.name, config);
+			await runtime.output(
+				`Added MCP server "${parsed.name}" (${parsed.scope}). Live runtime unavailable; restart required.`,
+			);
+			return commandConsumed();
+		} catch (err) {
+			return usage(`Failed to add server: ${errorMessage(err)}`, runtime);
+		}
+	}
 	try {
-		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd);
-		await addMCPServer(filePath, parsed.name, config);
-		await runtime.output(`Added MCP server "${parsed.name}" (${parsed.scope}).`);
+		const result = await addMCPServerRuntime(
+			{ session: runtime.session, mcpManager: manager },
+			parsed.name,
+			config,
+			parsed.scope,
+		);
+		await waitForLiveMCPServer(runtime, manager, parsed.name);
+		if (manager.getConnectionStatus(parsed.name) === "connected") {
+			await activateMCPServerTools({ session: runtime.session, mcpManager: manager }, parsed.name);
+		}
+		const failures = result.errors.size > 0 ? ` (${result.errors.size} connection error(s))` : "";
+		await runtime.output(`Added MCP server "${parsed.name}" (${parsed.scope}); live runtime reloaded${failures}.`);
 		return commandConsumed();
 	} catch (err) {
 		return usage(`Failed to add server: ${errorMessage(err)}`, runtime);
@@ -340,20 +381,13 @@ async function handleSmitherySearchCommand(rest: string, runtime: SlashCommandRu
 			await runtime.output(`No Smithery results found for "${parsed.keyword}".`);
 			return commandConsumed();
 		}
-		await runtime.output(
-			results
-				.map(
-					result =>
-						`${result.display.displayName} (${result.name})${result.display.description ? ` — ${result.display.description}` : ""}`,
-				)
-				.join("\n"),
-		);
+		await runtime.output(JSON.stringify({ scope: parsed.scope, results }, null, 2));
 		return commandConsumed();
 	} catch (err) {
 		const message = errorMessage(err);
 		if (AIError.is(AIError.classify(err), AIError.Flag.AuthFailed)) {
 			return usage(
-				"Smithery authentication required. Run /mcp smithery-login in the TUI client or add an API key to ~/.omp/agent/smithery.json.",
+				"Smithery authentication required. Use the RPC Smithery login flow or configure an API key.",
 				runtime,
 			);
 		}
@@ -425,29 +459,12 @@ async function handleEnableDisableCommand(
 	if (!name) return usage(`Usage: /mcp ${verb} <name>`, runtime);
 	const enabled = verb === "enable";
 	try {
-		const userPath = getMCPConfigPath("user", runtime.cwd);
-		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		const [userConfig, projectConfig] = await Promise.all([
-			readMCPConfigFile(userPath),
-			readMCPConfigFile(projectPath),
-		]);
-		if (projectConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(projectPath, name, { ...projectConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (project config).`);
-			return commandConsumed();
-		}
-		if (userConfig.mcpServers?.[name] !== undefined) {
-			await updateMCPServer(userPath, name, { ...userConfig.mcpServers[name], enabled } as MCPServerConfig);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} (user config).`);
-			return commandConsumed();
-		}
-		const disabledList = await readDisabledServers(userPath);
-		if (!enabled || disabledList.includes(name)) {
-			await setServerDisabled(userPath, name, !enabled);
-			await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"}.`);
-			return commandConsumed();
-		}
-		return usage(`Server "${name}" not found in user or project config.`, runtime);
+		const manager = requireLiveMCPManager();
+		const change = await setMCPServerEnabledRuntime({ session: runtime.session, mcpManager: manager }, name, enabled);
+		await waitForLiveMCPServer(runtime, manager, name);
+		const suffix = change.changed ? "" : " (already set)";
+		await runtime.output(`Server "${name}" ${enabled ? "enabled" : "disabled"} in the live runtime${suffix}.`);
+		return commandConsumed();
 	} catch (err) {
 		return usage(`Failed to ${verb} MCP server: ${errorMessage(err)}`, runtime);
 	}
@@ -458,9 +475,9 @@ async function handleRemoveCommand(rest: string, runtime: SlashCommandRuntime): 
 	if (parsed.error) return usage(parsed.error, runtime);
 	if (!parsed.name) return usage("Usage: /mcp remove <name> [--scope project|user]", runtime);
 	try {
-		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd);
-		await removeMCPServer(filePath, parsed.name);
-		await runtime.output(`Removed server "${parsed.name}" from ${parsed.scope} config.`);
+		const manager = requireLiveMCPManager();
+		await removeMCPServerRuntime({ session: runtime.session, mcpManager: manager }, parsed.name, parsed.scope);
+		await runtime.output(`Removed server "${parsed.name}" from ${parsed.scope} config and the live runtime.`);
 		return commandConsumed();
 	} catch (err) {
 		return usage(`Failed to remove MCP server: ${errorMessage(err)}`, runtime);
@@ -483,7 +500,7 @@ const MCP_HELP_TEXT = [
 	"  /mcp help                                               Show this help",
 ].join("\n");
 
-const TUI_ONLY_MCP_VERBS = new Set(["reauth", "unauth", "smithery-login", "smithery-logout", "reconnect"]);
+const TUI_ONLY_MCP_VERBS = new Set(["reauth", "unauth", "smithery-login", "smithery-logout"]);
 
 /** ACP/text-mode `/mcp` handler. Shared by both dispatchers via the spec. */
 export async function handleMcpAcp(
@@ -502,7 +519,7 @@ export async function handleMcpAcp(
 		);
 	}
 	if (TUI_ONLY_MCP_VERBS.has(verb)) {
-		return usage(`/mcp ${verb} requires OAuth or browser flows only available in the TUI client.`, runtime);
+		return usage(`/mcp ${verb} needs structured interaction; use the TUI or the corresponding RPC command.`, runtime);
 	}
 	switch (verb) {
 		case "resources":
@@ -515,10 +532,19 @@ export async function handleMcpAcp(
 			return await handleAddCommand(rest, runtime);
 		case "smithery-search":
 			return await handleSmitherySearchCommand(rest, runtime);
-		case "reload":
-			await runtime.refreshCommands();
-			await runtime.output("MCP runtime reload requested.");
-			return commandConsumed();
+		case "reload": {
+			try {
+				await runtime.refreshCommands();
+				const manager = requireLiveMCPManager();
+				const result = await reloadMCPRuntime({ session: runtime.session, mcpManager: manager });
+				await runtime.output(
+					`MCP runtime reloaded (${manager.getConnectedServers().length} connected, ${result.errors.size} error(s)).`,
+				);
+				return commandConsumed();
+			} catch (err) {
+				return usage(`Failed to reload MCP runtime: ${errorMessage(err)}`, runtime);
+			}
+		}
 		case "list":
 			return await handleListCommand(runtime);
 		case "enable":
@@ -527,6 +553,18 @@ export async function handleMcpAcp(
 		case "remove":
 		case "rm":
 			return await handleRemoveCommand(rest, runtime);
+		case "reconnect": {
+			const name = rest.split(/\s+/)[0] ?? "";
+			if (!name) return usage("Usage: /mcp reconnect <name>", runtime);
+			try {
+				const manager = requireLiveMCPManager();
+				await reconnectMCPRuntime({ session: runtime.session, mcpManager: manager }, name);
+				await runtime.output(`Reconnected MCP server "${name}" and refreshed live tools.`);
+				return commandConsumed();
+			} catch (err) {
+				return usage(`Failed to reconnect MCP server: ${errorMessage(err)}`, runtime);
+			}
+		}
 		default:
 			return usage(`Unknown /mcp subcommand: ${verb}. Use /mcp help for available subcommands.`, runtime);
 	}
