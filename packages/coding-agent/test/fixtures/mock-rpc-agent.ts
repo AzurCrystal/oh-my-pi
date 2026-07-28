@@ -89,6 +89,17 @@ for await (const raw of console) {
 					data: agentInvoked === undefined ? undefined : { agentInvoked },
 				});
 				await Promise.resolve();
+				if (frame.message === "late-error") {
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "Prompt scheduling failed",
+						code: "prompt_scheduling_failed",
+					});
+					continue;
+				}
 				writeFrame({ type: "prompt_result", id, agentInvoked: agentInvoked ?? false });
 				continue;
 			}

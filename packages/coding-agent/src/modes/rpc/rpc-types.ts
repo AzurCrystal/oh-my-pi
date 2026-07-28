@@ -664,6 +664,16 @@ export interface RpcPromptSubmissionResult extends RpcPromptAcknowledgement {
 	requestId: string;
 }
 
+/** Prompt scheduling failure emitted after the initial acknowledgement. */
+export interface RpcPromptErrorResponse {
+	id: string;
+	type: "response";
+	command: "prompt";
+	success: false;
+	error: string;
+	code?: string;
+}
+
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;

@@ -103,6 +103,7 @@ import type {
 	RpcPlanModeSnapshot,
 	RpcPlanProposalSnapshot,
 	RpcPromptAcknowledgement,
+	RpcPromptErrorResponse,
 	RpcPromptHistoryEntry,
 	RpcPromptResultFrame,
 	RpcPromptSubmissionResult,
@@ -182,6 +183,7 @@ export type RpcBtwOutputListener = (frame: RpcBtwOutputFrame) => void;
 export type RpcIdleRecapListener = (frame: RpcIdleRecapFrame) => void;
 export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
 export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
+export type RpcPromptErrorListener = (response: RpcPromptErrorResponse) => void;
 export type RpcRawSseUpdateListener = (frame: RpcRawSseUpdateFrame) => void;
 export type RpcMcpAuthChallengeListener = (frame: RpcMcpAuthChallengeFrame) => void;
 export type RpcTtsrGenerationEventListener = (frame: RpcTtsrGenerationEventFrame) => void;
@@ -273,6 +275,10 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 		return typeof value.error === "string";
 	}
 	return true;
+}
+
+function isRpcPromptErrorResponse(value: RpcResponse): value is RpcPromptErrorResponse {
+	return value.success === false && value.command === "prompt" && typeof value.id === "string";
 }
 
 function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
@@ -460,6 +466,7 @@ export class RpcClient {
 	#btwOutputListeners = new Set<RpcBtwOutputListener>();
 	#idleRecapListeners = new Set<RpcIdleRecapListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
+	#promptErrorListeners = new Set<RpcPromptErrorListener>();
 	#settingsUpdateListeners = new Set<RpcSettingsUpdateListener>();
 	#rawSseUpdateListeners = new Set<RpcRawSseUpdateListener>();
 	#mcpAuthChallengeListeners = new Set<RpcMcpAuthChallengeListener>();
@@ -771,6 +778,12 @@ export class RpcClient {
 	onIdleRecap(listener: RpcIdleRecapListener): () => void {
 		this.#idleRecapListeners.add(listener);
 		return () => this.#idleRecapListeners.delete(listener);
+	}
+
+	/** Subscribe to prompt scheduling failures emitted after a successful acknowledgement. */
+	onPromptError(listener: RpcPromptErrorListener): () => void {
+		this.#promptErrorListeners.add(listener);
+		return () => this.#promptErrorListeners.delete(listener);
 	}
 
 	/** Subscribe to correlated terminal prompt outcomes for both agent-invoking and local-only prompts. */
@@ -2384,6 +2397,12 @@ export class RpcClient {
 				const pending = this.#pendingRequests.get(id)!;
 				this.#pendingRequests.delete(id);
 				pending.resolve(data);
+				return;
+			}
+			if (isRpcPromptErrorResponse(data)) {
+				for (const listener of this.#promptErrorListeners) {
+					listener(data);
+				}
 				return;
 			}
 		}
