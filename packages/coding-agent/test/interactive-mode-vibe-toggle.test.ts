@@ -10,6 +10,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
@@ -19,6 +20,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
@@ -216,14 +218,38 @@ describe("InteractiveMode vibe mode toggle", () => {
 		}
 	});
 
-	it("preserves workers, Todo access, and mode metadata on a same-session reload", async () => {
+	it("preserves a zero-turn worker and spawn admission on a same-session reload", async () => {
 		await mode.init({ suppressWelcomeIntro: true });
 		await mode.handleVibeModeCommand();
 		await session.sessionManager.ensureOnDisk();
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const registry = VibeSessionRegistry.global();
-		const suspend = vi.spyOn(registry, "suspendScope");
+		let registeredJobs = 0;
+		const register = vi.fn(() => {
+			registeredJobs++;
+			return `preserved-job-${registeredJobs}`;
+		});
+		const zeroTurnManager = { register } as unknown as AsyncJobManager;
+		const vibeSession: ToolSession = {
+			cwd: session.sessionManager.getCwd(),
+			hasUI: false,
+			settings: session.settings,
+			getSessionFile: () => session.sessionManager.getSessionFile() ?? null,
+			getSessionId: () => session.sessionManager.getSessionId(),
+			getAgentId: () => session.getAgentId() ?? null,
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionSpawns: () => "*",
+			sessionManager: session.sessionManager,
+			asyncJobManager: zeroTurnManager,
+		};
+		await registry.spawn(vibeSession, {
+			cli: "fast",
+			name: "preserved-zero-turn",
+			prompt: "Remain attached across a same-session reload.",
+		});
+		expect(registry.screens(vibeSession)).toMatchObject([{ id: "preserved-zero-turn", state: "starting", turns: 0 }]);
+		const suspend = vi.spyOn(registry, "suspendScopeReversibly");
 		const terminate = vi.spyOn(registry, "killAll");
 
 		const readGate = storage.gateNextRead(sessionFile);
@@ -245,6 +271,14 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(suspend).toHaveBeenCalledTimes(1);
 		expect(terminate).not.toHaveBeenCalled();
 		expect(vibeModeEntryCount(session.sessionManager)).toBe(1);
+		expect(registry.screens(vibeSession)).toMatchObject([{ id: "preserved-zero-turn", state: "starting", turns: 0 }]);
+		await registry.spawn(vibeSession, {
+			cli: "good",
+			name: "spawn-after-reload",
+			prompt: "Spawn after the preserved reload.",
+		});
+		expect(registry.listIds(vibeSession)).toEqual(["preserved-zero-turn", "spawn-after-reload"]);
+		expect(register).toHaveBeenCalledTimes(2);
 	});
 
 	it("passes the session's active model into vibe rehydration on resume", async () => {
@@ -284,7 +318,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 		if (!targetFile) throw new Error("Expected target session file");
 		await targetManager.close();
 		const registry = VibeSessionRegistry.global();
-		const suspend = vi.spyOn(registry, "suspendScope");
+		const suspend = vi.spyOn(registry, "suspendScopeReversibly");
 		const terminate = vi.spyOn(registry, "killAll");
 
 		expect(await session.switchSession(targetFile)).toBe(true);

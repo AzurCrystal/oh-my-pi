@@ -143,6 +143,7 @@ import {
 	aggregateVibeWorkerTokensPerSecond,
 	type VibeOwnerScope,
 	type VibeParentSession,
+	type VibeScopeSuspension,
 	VibeSessionRegistry,
 } from "../vibe/runtime";
 import { buildInteractiveSessionAutocompleteProvider, buildSessionAutocompleteCommands } from "./completions";
@@ -560,7 +561,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#goalModePreviousTools: string[] | undefined;
 	#vibeModePreviousTools: string[] | undefined;
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
-	#vibeScopeSuspendedForSwitch = false;
+	#vibeScopeSuspensionForSwitch: VibeScopeSuspension | undefined;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
 	#goalTurnHadToolCalls = false;
 	#goalContinuationTurnInFlight = false;
@@ -2150,8 +2151,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #quiesceVibeForSessionSwitch(): Promise<void> {
 		const ownerScope = this.#vibeModeOwnerScope;
 		if (!this.vibeModeEnabled || !ownerScope) return;
-		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
-		this.#vibeScopeSuspendedForSwitch = true;
+		this.#vibeScopeSuspensionForSwitch = await VibeSessionRegistry.global().suspendScopeReversibly(
+			ownerScope,
+			this.session.asyncJobManager,
+		);
 	}
 
 	#updateGoalModeStatus(): void {
@@ -2397,8 +2400,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Reconcile mode state from session entries on resume/switch. */
 	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
-		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
-		this.#vibeScopeSuspendedForSwitch = false;
+		const vibeSuspension = this.#vibeScopeSuspensionForSwitch;
+		const vibeScopeAlreadySuspended = vibeSuspension !== undefined;
 		const sessionContext = this.sessionManager.buildSessionContext();
 		const vibeSession = this.#vibeParentSession();
 		const targetVibeScope = VibeSessionRegistry.global().ownerScope(vibeSession);
@@ -2408,6 +2411,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModeOwnerScope?.ownerId === targetVibeScope.ownerId &&
 			this.#vibeModeOwnerScope.parentSessionId === targetVibeScope.parentSessionId &&
 			this.#vibeModeOwnerScope.parentSessionFile === targetVibeScope.parentSessionFile;
+		if (vibeSuspension) {
+			await (preserveVibe ? vibeSuspension.rollback() : vibeSuspension.commit());
+			this.#vibeScopeSuspensionForSwitch = undefined;
+		}
 		await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalEnabled = this.session.settings.get("goal.enabled");
