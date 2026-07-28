@@ -345,6 +345,20 @@ export class TtsrManager {
 		return true;
 	}
 
+	/** Remove a registered rule immediately from live stream matching. */
+	removeRule(ruleName: string): boolean {
+		if (!this.#rules.delete(ruleName)) return false;
+		this.#injectionRecords.delete(ruleName);
+		this.#canMatchText = false;
+		this.#canMatchThinking = false;
+		for (const entry of this.#rules.values()) {
+			if (entry.scope.allowText) this.#canMatchText = true;
+			if (entry.scope.allowThinking) this.#canMatchThinking = true;
+		}
+		this.#lastAstSnapshots.clear();
+		return true;
+	}
+
 	/**
 	 * Add a stream chunk to its scoped buffer and return matching rules.
 	 *
