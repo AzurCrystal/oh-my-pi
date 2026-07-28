@@ -159,6 +159,18 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 
+/**
+ * Structured payload persisted on each {@link XDEV_MOUNT_NOTICE_MESSAGE_TYPE}
+ * custom message. Lets a resumed session reconstruct which dynamic devices the
+ * model has already been told about, so reconnecting hosts do not re-announce
+ * (and re-splice a redundant developer message that busts the provider
+ * prompt-cache prefix).
+ */
+interface XdevMountNoticeDetails {
+	added: string[];
+	removed: string[];
+}
+
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
 export class SessionTools {
 	readonly #host: SessionToolsHost;
@@ -172,6 +184,14 @@ export class SessionTools {
 	#rpcHostToolNames = new Set<string>();
 	#xdev: XdevState | undefined;
 	#pendingXdevMountDelta: { added: Set<string>; removed: Set<string> } | undefined;
+	/**
+	 * Dynamic (`xd://`) devices the model has already been told are mounted.
+	 * Seeded lazily from persisted history on resume (see
+	 * {@link #ensureAnnouncedMountsSeeded}) and updated as notices are emitted, so
+	 * a host reconnect that re-mounts the same device does not re-announce it.
+	 */
+	#announcedMounts = new Set<string>();
+	#announcedMountsSeeded = false;
 	#presentationPinnedToolNames: ReadonlySet<string> | undefined;
 	#runtimeSelectedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
@@ -674,26 +694,56 @@ export class SessionTools {
 		this.#host.emitNotice("info", `xd://: ${parts.join("; ")}`, "xdev");
 	}
 
+	/**
+	 * Seed {@link #announcedMounts} from persisted mount notices the first time a
+	 * notice is consumed. On resume the in-memory mount set is rebuilt from
+	 * scratch, so without replaying history every already-announced dynamic device
+	 * would look freshly mounted and re-announce.
+	 */
+	#ensureAnnouncedMountsSeeded(): void {
+		if (this.#announcedMountsSeeded) return;
+		this.#announcedMountsSeeded = true;
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== XDEV_MOUNT_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details as XdevMountNoticeDetails | undefined;
+			if (!details) continue;
+			for (const name of details.added ?? []) this.#announcedMounts.add(name);
+			for (const name of details.removed ?? []) this.#announcedMounts.delete(name);
+		}
+	}
+
 	/** Consumes the hidden notice for unannounced `xd://` mount changes. */
-	takePendingXdevMountNotice(): CustomMessage | undefined {
+	takePendingXdevMountNotice(): CustomMessage<XdevMountNoticeDetails> | undefined {
 		const pending = this.#pendingXdevMountDelta;
 		if (!pending) return undefined;
 		this.#pendingXdevMountDelta = undefined;
+		this.#ensureAnnouncedMountsSeeded();
+		// Only announce a net change relative to what the model already knows (from
+		// this session and persisted history): a re-mount of an already-announced
+		// device — the common resume/reconnect case — and an unmount for a device
+		// it was never told about are both suppressed, keeping the provider prompt
+		// cache prefix byte-stable across resumes.
+		const addedNames = [...pending.added].filter(name => !this.#announcedMounts.has(name));
+		const removedNames = [...pending.removed].filter(name => this.#announcedMounts.has(name));
+		if (addedNames.length === 0 && removedNames.length === 0) return undefined;
 		const summaries = new Map(this.#xdev ? xdevEntries(this.#xdev).map(entry => [entry.name, entry.summary]) : []);
-		const added = [...pending.added].map(name => ({ name, summary: summaries.get(name) ?? "" }));
-		const removed = [...pending.removed].map(name => ({ name }));
+		const added = addedNames.map(name => ({ name, summary: summaries.get(name) ?? "" }));
+		const removed = removedNames.map(name => ({ name }));
 		const docs = this.#xdev
 			? xdevDocsFor(
 					this.#xdev,
-					pending.added,
+					new Set(addedNames),
 					this.#host.settings.get("tools.xdevDocs"),
 					this.#host.settings.get("tools.xdevInlineDevices"),
 				)
 			: "";
+		for (const name of addedNames) this.#announcedMounts.add(name);
+		for (const name of removedNames) this.#announcedMounts.delete(name);
 		return {
 			role: "custom",
 			customType: XDEV_MOUNT_NOTICE_MESSAGE_TYPE,
 			content: prompt.render(xdevMountNoticePrompt, { added, removed, docs }),
+			details: { added: addedNames, removed: removedNames },
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),

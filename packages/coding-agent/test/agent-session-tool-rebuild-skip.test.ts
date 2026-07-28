@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	collectMountedMCPToolRoutes,
@@ -102,6 +102,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		lazyWrite?: boolean;
 		/** Scripted mock model responses; enables driving `session.prompt()`. */
 		responses?: MockResponseSource;
+		/** Persisted history seeded into the agent, e.g. to model a resumed session. */
+		initialMessages?: AgentMessage[];
 	}
 
 	function newSession(
@@ -133,7 +135,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 						? [readTool, initialMcp as unknown as AgentTool]
 						: [readTool, writeTool, initialMcp as unknown as AgentTool]
 					: [readTool, initialMcp as unknown as AgentTool],
-				messages: [],
+				messages: options.initialMessages ?? [],
 			},
 			convertToLlm,
 			streamFn: mock
@@ -924,6 +926,51 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(notices[0]).toContain("xd://mcp__nucleus_search");
 		expect(notices[0]).not.toContain("mcp__nucleus_fetch");
 		expect(notices[0]).not.toContain("No longer mounted");
+	});
+
+	it("does not re-announce devices a resumed session already announced in history", async () => {
+		// Model a process resume / host reconnect: persisted history already carries
+		// a mount notice for mcp__nucleus_search, but the fresh in-memory mount set
+		// starts empty. When the device reconnects, the notice must NOT re-splice a
+		// redundant developer message — doing so busts the provider prompt-cache
+		// prefix and re-bills the whole suffix on metered providers.
+		const priorNotice: AgentMessage = {
+			role: "custom",
+			customType: "xdev-mount-notice",
+			content: "The xd:// device inventory changed.\n\nxd://mcp__nucleus_search became available.",
+			details: { added: ["mcp__nucleus_search"], removed: [] },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now() - 1000,
+		};
+		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+			initialMessages: [priorNotice],
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+
+		// The already-announced device reconnects: no new notice is spliced in.
+		await session.refreshMCPTools([search]);
+		await session.prompt("hello");
+		const afterReconnect = session.agent.state.messages.filter(
+			message => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(afterReconnect).toHaveLength(1);
+		expect(mountNoticesIn(contexts[0])).toHaveLength(1); // only the pre-existing history notice
+
+		// A genuinely new device still announces, and only for itself.
+		await session.refreshMCPTools([search, fetch]);
+		await session.prompt("again");
+		const afterNewDevice = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(afterNewDevice).toHaveLength(2);
+		const fetchNotice = afterNewDevice[1];
+		const fetchText = typeof fetchNotice.content === "string" ? fetchNotice.content : "";
+		expect(fetchText).toContain("xd://mcp__nucleus_fetch");
+		expect(fetchText).not.toContain("xd://mcp__nucleus_search");
 	});
 
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
