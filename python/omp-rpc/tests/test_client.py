@@ -932,6 +932,32 @@ DELTA_COMMANDS_SERVER = textwrap.dedent(
     """
 )
 
+NULLABLE_RESPONSE_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        data = (
+            {}
+            if command["type"] == "get_agent_definition"
+            and command.get("name") == "empty"
+            else None
+        )
+        print(json.dumps({
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": True,
+            "data": data,
+        }), flush=True)
+
+
+
+    """
+)
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
@@ -1100,6 +1126,24 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(seen["provider_observation"][1].payload["model"], "test-model")
         self.assertFalse(seen["context_message"][0].display)
         self.assertEqual(seen["context_message"][0].message["content"], "injected context")
+
+    def test_nullable_response_wrappers_preserve_none(self) -> None:
+        with self.make_client(server=NULLABLE_RESPONSE_SERVER) as client:
+            agent_definition = client.get_agent_definition("missing")
+            empty_agent_definition = client.get_agent_definition("empty")
+            mental_model = client.get_mental_model("model-1", "full")
+            mental_model_history = client.get_mental_model_history("model-1")
+            role_cycle = client.cycle_role_models(["reviewer"])
+            handoff = client.handoff()
+            usage_reports = client.get_usage_reports()
+
+        self.assertIsNone(agent_definition)
+        self.assertEqual(empty_agent_definition, {})
+        self.assertIsNone(mental_model)
+        self.assertIsNone(mental_model_history)
+        self.assertIsNone(role_cycle)
+        self.assertIsNone(handoff)
+        self.assertEqual(usage_reports, {})
 
     def test_delta_command_methods_preserve_protocol_payloads(self) -> None:
         with self.make_client(server=DELTA_COMMANDS_SERVER) as client:

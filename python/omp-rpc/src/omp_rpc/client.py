@@ -1360,8 +1360,8 @@ class RpcClient:
 
     def get_agent_definition(
         self, name: str, scope: str | None = None
-    ) -> JsonObject:
-        return self._request_with_nulls(
+    ) -> JsonObject | None:
+        return self._request_nullable_with_nulls(
             "get_agent_definition", {"name": name, "scope": scope}
         )
 
@@ -1382,8 +1382,10 @@ class RpcClient:
     def get_mental_models(self, detail: str) -> JsonObject:
         return self._request("get_mental_models", detail=detail)
 
-    def get_mental_model(self, mental_model_id: str, detail: str) -> JsonObject:
-        return self._request(
+    def get_mental_model(
+        self, mental_model_id: str, detail: str
+    ) -> JsonObject | None:
+        return self._request_nullable(
             "get_mental_model", mentalModelId=mental_model_id, detail=detail
         )
 
@@ -1419,8 +1421,10 @@ class RpcClient:
     def refresh_auto_mental_models(self) -> JsonObject:
         return self._request("refresh_auto_mental_models")
 
-    def get_mental_model_history(self, mental_model_id: str) -> JsonObject:
-        return self._request(
+    def get_mental_model_history(
+        self, mental_model_id: str
+    ) -> JsonObject | None:
+        return self._request_nullable(
             "get_mental_model_history", mentalModelId=mental_model_id
         )
 
@@ -1480,8 +1484,8 @@ class RpcClient:
 
     def cycle_role_models(
         self, role_order: Sequence[str], direction: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> JsonObject | None:
+        return self._request_nullable(
             "cycle_role_models",
             roleOrder=cast(JsonValue, list(role_order)),
             direction=direction,
@@ -1677,8 +1681,11 @@ class RpcClient:
     def generate_title(self, text: str) -> JsonObject:
         return self._request("generate_title", text=text)
 
-    def handoff(self, custom_instructions: str | None = None) -> JsonObject:
-        return self._request("handoff", customInstructions=custom_instructions)
+    def handoff(self, custom_instructions: str | None = None) -> JsonObject | None:
+        return self._request_nullable(
+            "handoff", customInstructions=custom_instructions
+        )
+
     def set_todos(
         self, todos: Sequence[TodoSeed | TodoPhaseSeed]
     ) -> tuple[TodoPhase, ...]:
@@ -2281,18 +2288,32 @@ class RpcClient:
                 self._event_condition.wait(remaining)
 
     def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
-        return self._request_payload(
+        response = self._request_payload(
             command_type, {key: value for key, value in payload.items() if value is not None}
         )
+        return response if response is not None else {}
 
     def _request_with_nulls(
         self, command_type: str, payload: JsonObject
     ) -> JsonObject:
+        response = self._request_payload(command_type, payload)
+        return response if response is not None else {}
+
+    def _request_nullable(
+        self, command_type: str, **payload: JsonValue
+    ) -> JsonObject | None:
+        return self._request_payload(
+            command_type, {key: value for key, value in payload.items() if value is not None}
+        )
+
+    def _request_nullable_with_nulls(
+        self, command_type: str, payload: JsonObject
+    ) -> JsonObject | None:
         return self._request_payload(command_type, payload)
 
     def _request_payload(
         self, command_type: str, payload: JsonObject
-    ) -> JsonObject:
+    ) -> JsonObject | None:
         process = self._require_process()
         request_id = self._next_request_id()
         envelope: JsonObject = {"id": request_id, "type": command_type}
@@ -2332,9 +2353,7 @@ class RpcClient:
             )
 
         data = response.get("data")
-        if data is None:
-            return {}
-        return _clone_json_object(data)
+        return None if data is None else _clone_json_object(data)
 
     def _send_notification(self, payload: JsonObject) -> None:
         process = self._require_process()
