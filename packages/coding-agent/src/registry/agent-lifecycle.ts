@@ -30,6 +30,27 @@ import {
 	type RegistryEvent,
 } from "./agent-registry";
 
+const RELEASED_SUBAGENT_SUFFIX = ".released";
+
+/** Sidecar retained with a transcript when an explicit release makes it non-revivable. */
+export function releasedSubagentTombstonePath(sessionFile: string): string {
+	return `${sessionFile}${RELEASED_SUBAGENT_SUFFIX}`;
+}
+
+/**
+ * Record a deliberate release without deleting the transcript: history remains
+ * readable, while the persisted-subagent scan can no longer restore the ref.
+ */
+export async function tombstoneReleasedSubagent(sessionFile: string | null): Promise<void> {
+	if (!sessionFile?.endsWith(".jsonl") || !(await Bun.file(sessionFile).exists())) return;
+	await Bun.write(releasedSubagentTombstonePath(sessionFile), "");
+}
+
+/** Whether a persisted transcript was deliberately released and must not be revived. */
+export async function isReleasedSubagent(sessionFile: string): Promise<boolean> {
+	return Bun.file(releasedSubagentTombstonePath(sessionFile)).exists();
+}
+
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
 
 /**
@@ -46,6 +67,11 @@ export interface AdoptOptions {
 	idleTtlMs: number;
 	/** Recreates a live AgentSession from the ref's sessionFile. Absent => not resumable after park (e.g. isolated runs). */
 	revive?: AgentReviver;
+}
+
+interface ReleaseOptions {
+	/** Teardown detaches this process only; retain a persisted transcript for restart restoration. */
+	preservePersistedSubagent?: boolean;
 }
 
 interface AdoptedAgent {
@@ -345,12 +371,14 @@ export class AgentLifecycleManager {
 	}
 
 	/**
-	 * Hard removal: dispose if live, unregister from registry, drop timers.
+	 * Hard removal: dispose if live, unregister from registry, drop timers, and
+	 * tombstone an existing persisted transcript so an explicit release cannot
+	 * revive after restart. Process teardown opts out to preserve resumability.
 	 * When `expected` is given, only a ref matching it is released; a stale
 	 * release can never take down a newer same-id ref. Returns true when a
 	 * matching ref was released.
 	 */
-	async release(id: string, expected?: AgentRefExpectation): Promise<boolean> {
+	async release(id: string, expected?: AgentRefExpectation, options?: ReleaseOptions): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
 		const current = this.#registry.get(id);
 		const currentMatches =
@@ -359,6 +387,7 @@ export class AgentLifecycleManager {
 			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
 		if (!ref) return false;
+		if (!options?.preservePersistedSubagent) await tombstoneReleasedSubagent(ref.sessionFile);
 		if (adopted?.ref === ref) {
 			clearTimeout(adopted.timer);
 			this.#adopted.delete(id);
@@ -387,7 +416,7 @@ export class AgentLifecycleManager {
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
-		await Promise.all(ids.map(id => this.release(id)));
+		await Promise.all(ids.map(id => this.release(id, undefined, { preservePersistedSubagent: true })));
 		this.#revivals.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;

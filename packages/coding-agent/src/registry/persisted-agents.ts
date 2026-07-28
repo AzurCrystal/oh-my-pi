@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { SessionManager } from "../session/session-manager";
 import { persistedVibeChildIds } from "../vibe/runtime";
+import { isReleasedSubagent } from "./agent-lifecycle";
 import { type AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
 
 /**
@@ -82,7 +83,7 @@ async function registerPersistedSubagentsFromDir(
 		}
 		const id = entry.name.slice(0, -6);
 		if (vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile) continue;
-		if (!registry.get(id)) {
+		if (!(await isReleasedSubagent(sessionFile)) && !registry.get(id)) {
 			registry.register({
 				id,
 				displayName: id,
