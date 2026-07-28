@@ -38,7 +38,7 @@
 - RPC mode exited without draining its stdout queue, so responses and streamed output still queued at shutdown were dropped instead of delivered.
 - Fixed collaboration guests applying `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` to their local replica instead of routing them to the authoritative host.
 - Fixed deleting the active session over RPC removing its file while leaving the live session attached to that path; active deletion now uses the canonical drop path and starts a valid replacement session.
-- Fixed cancellation commands such as `abort`, `abort_retry`, `cancel_guided_goal`, and `kill_agent` waiting behind the long-running operation they were intended to interrupt.
+- Fixed cancellation commands such as `abort`, `abort_retry`, and `kill_agent` waiting behind the long-running operation they were intended to interrupt.
 - Fixed `seed_mental_models` reporting a fully successful result when one or more built-in seeds failed; failures are now returned per seed.
 - Fixed RPC login rejecting providers that request manual input before returning an authorization URL.
 - Fixed killed subagents becoming revivable after a process restart, MCP reload reporting success without refreshing the live manager, and goal/loop schedulers racing to submit overlapping turns.
