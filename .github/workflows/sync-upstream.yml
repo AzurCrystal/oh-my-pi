@@ -1,14 +1,11 @@
 name: Sync Upstream
 
 on:
-  schedule:
-    # Check for upstream releases every 6 hours
-    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Specific upstream tag to merge (e.g. v17.2.0). Leave empty to auto-detect latest."
-        required: false
+        description: "Upstream tag to merge (e.g. v17.2.0). Required."
+        required: true
         type: string
 
 permissions:
