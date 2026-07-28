@@ -215,21 +215,20 @@ That helper ignores passive UI notifications (`notify`, `setStatus`, `setWidget`
 ## Prompt Outcomes
 
 `prompt()` keeps its fire-and-forget API. Use `prompt_with_result()` when the
-server acknowledgement must be correlated with a later `prompt_result`
-notification:
+server acknowledgement and the correlated terminal outcome are both useful:
 
 ```python
 acknowledgement = client.prompt_with_result("Run /custom-command")
 print(acknowledgement.request_id, acknowledgement.agent_invoked)
 ```
 
-`agent_invoked` is `True` when an agent turn was scheduled, `False` when the
-prompt completed locally, and `None` only when neither the response nor an
-already-observed correlated notification has resolved the outcome.
-`prompt_and_wait()` also treats `agent_start` or `agent_end` after submission as
-proof that the agent ran, because normal prompt responses may omit
-`agentInvoked` and do not emit a positive `prompt_result`. Local-only prompts
-return an empty `PromptTurn` without waiting for `agent_end`.
+`agent_invoked` is `True` when the outcome was already known to invoke agent
+work, `False` when it was already known to complete locally, and `None` while
+the outcome is still resolving. The server then emits exactly one
+`PromptResultEvent` with the same request id and either value. `prompt_and_wait()`
+waits for that correlated result instead of assigning unrelated agent lifecycle
+events to prompts by arrival order. Local-only prompts return an empty
+`PromptTurn`; agent-invoking prompts additionally wait for `agent_end`.
 
 ## Error Handling and Retained History
 
@@ -244,6 +243,10 @@ allows:
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed
   through `client.listener_errors` and `client.on_listener_error(...)`
+
+User callbacks run on one ordered dispatcher thread after reader-side
+bookkeeping. A callback may call `wait_for_idle()` without blocking stdout
+processing; listener exceptions retain the same `listener_errors` policy.
 
 For long-lived hosts, retained event and stderr history is bounded by default:
 

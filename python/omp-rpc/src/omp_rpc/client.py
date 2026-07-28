@@ -423,8 +423,10 @@ class _PendingPromptOutcome:
     start_event_index: int
     retain_result: bool
     result: bool | None = None
+    error: BaseException | None = None
     acknowledged: bool = False
     scheduled: bool = False
+    completed: bool = False
 
 
 
@@ -550,6 +552,7 @@ class RpcClient:
         self._pgid: int | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
+        self._listener_dispatch_thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -567,7 +570,6 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._pending_prompt_outcomes: dict[str, _PendingPromptOutcome] = {}
-        self._scheduled_prompt_runs: list[str | None] = []
         self._active_agent_runs = 0
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
@@ -585,6 +587,9 @@ class RpcClient:
             _DEFAULT_ERROR_HISTORY_LIMIT
         )
         self._prompt_lifecycle = _PromptLifecycleCoordinator()
+        self._listener_dispatch_queue: queue.Queue[Callable[[], None] | None] = (
+            queue.Queue()
+        )
 
         self._notification_listeners: list[NotificationListener] = []
         self._event_listeners: list[AgentEventListener] = []
@@ -657,8 +662,8 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._pending_prompt_outcomes.clear()
-        self._scheduled_prompt_runs.clear()
         self._active_agent_runs = 0
+        self._listener_dispatch_queue = queue.Queue()
         self._ui_requests = queue.Queue()
         with self._state_lock:
             self._stderr_chunks.clear()
@@ -685,12 +690,18 @@ class RpcClient:
         self._process = process
         self._pgid = _process_group_id(process)
 
+        self._listener_dispatch_thread = threading.Thread(
+            target=self._read_listener_dispatch_loop,
+            name="omp-rpc-listeners",
+            daemon=True,
+        )
         self._stdout_thread = threading.Thread(
             target=self._read_stdout_loop, name="omp-rpc-stdout", daemon=True
         )
         self._stderr_thread = threading.Thread(
             target=self._read_stderr_loop, name="omp-rpc-stderr", daemon=True
         )
+        self._listener_dispatch_thread.start()
         self._stdout_thread.start()
         self._stderr_thread.start()
 
@@ -787,6 +798,7 @@ class RpcClient:
                 self._stdout_thread.join(timeout=1.0)
             if self._stderr_thread is not None:
                 self._stderr_thread.join(timeout=1.0)
+            self._stop_listener_dispatcher()
             self._stdout_thread = None
             self._stderr_thread = None
 
@@ -2221,10 +2233,12 @@ class RpcClient:
         with self._event_condition:
             if start_event_index is None:
                 start_event_index = self._events.current_index()
-            self._pending_prompt_outcomes[request_id] = _PendingPromptOutcome(
+            outcome = _PendingPromptOutcome(
                 start_event_index=start_event_index,
                 retain_result=retain_result,
             )
+            self._pending_prompt_outcomes[request_id] = outcome
+            self._schedule_prompt_outcome(outcome)
         try:
             data = self._request_payload(
                 "prompt",
@@ -2241,26 +2255,39 @@ class RpcClient:
             )
         except BaseException:
             with self._event_condition:
-                self._pending_prompt_outcomes.pop(request_id, None)
+                outcome = self._pending_prompt_outcomes.pop(request_id, None)
+                if outcome is not None:
+                    self._complete_prompt_outcome(outcome)
             raise
 
         raw_agent_invoked = (data or {}).get("agentInvoked")
         if raw_agent_invoked is not None and not isinstance(raw_agent_invoked, bool):
             with self._event_condition:
-                self._pending_prompt_outcomes.pop(request_id, None)
+                outcome = self._pending_prompt_outcomes.pop(request_id, None)
+                if outcome is not None:
+                    self._complete_prompt_outcome(outcome)
             raise RpcError("prompt response agentInvoked must be a boolean")
         agent_invoked = (
             raw_agent_invoked if isinstance(raw_agent_invoked, bool) else None
         )
 
         with self._event_condition:
-            outcome = self._pending_prompt_outcomes[request_id]
+            outcome = self._pending_prompt_outcomes.get(request_id)
+            if outcome is None:
+                if self._closed_error is not None:
+                    raise RpcProcessExitError(str(self._closed_error))
+                raise RpcError(
+                    f"Prompt result lifecycle was lost for request {request_id}"
+                )
+            if outcome.error is not None:
+                self._pending_prompt_outcomes.pop(request_id, None)
+                raise outcome.error
             outcome.acknowledged = True
-            if agent_invoked is not None:
+            if outcome.result is None and agent_invoked is not None:
                 outcome.result = agent_invoked
             resolved = outcome.result
-            if resolved is not False:
-                self._schedule_prompt_outcome(request_id, outcome)
+            if resolved is False:
+                self._complete_prompt_outcome(outcome)
             if resolved is not None and not outcome.retain_result:
                 self._pending_prompt_outcomes.pop(request_id, None)
             self._event_condition.notify_all()
@@ -2280,6 +2307,19 @@ class RpcClient:
     ) -> bool:
         with self._event_condition:
             while True:
+                outcome = self._pending_prompt_outcomes.get(request_id)
+                if outcome is None:
+                    if self._closed_error is not None:
+                        raise RpcProcessExitError(str(self._closed_error))
+                    raise RpcError(
+                        f"Prompt result lifecycle was lost for request {request_id}"
+                    )
+                if outcome.error is not None:
+                    self._pending_prompt_outcomes.pop(request_id, None)
+                    raise outcome.error
+                if outcome.result is not None:
+                    self._pending_prompt_outcomes.pop(request_id, None)
+                    return outcome.result
                 if self._closed_error is not None:
                     raise RpcProcessExitError(str(self._closed_error))
 
@@ -2295,33 +2335,16 @@ class RpcClient:
                 if async_errors:
                     raise async_errors[0]
 
-                outcome = self._pending_prompt_outcomes.get(request_id)
-                if outcome is None:
-                    raise RpcError(
-                        f"Prompt result lifecycle was lost for request {request_id}"
-                    )
-                if outcome.result is not None:
-                    self._pending_prompt_outcomes.pop(request_id, None)
-                    return outcome.result
-
                 if start_event_index < self._events.offset:
                     raise RpcError(
                         "Event history limit was exceeded while waiting for prompt lifecycle. "
                         "Increase max_event_history to retain more streamed events."
                     )
-                lifecycle_observed = any(
-                    payload.get("type") in ("agent_start", "agent_end")
-                    for payload in self._events.snapshot_from(start_event_index)
-                )
-                if lifecycle_observed:
-                    outcome.result = True
-                    self._pending_prompt_outcomes.pop(request_id, None)
-                    return True
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RpcTimeoutError(
-                        f"Timed out waiting for prompt_result or agent lifecycle. Stderr: {self.stderr}"
+                        f"Timed out waiting for correlated prompt_result. Stderr: {self.stderr}"
                     )
                 self._event_condition.wait(remaining)
 
@@ -2331,68 +2354,49 @@ class RpcClient:
             if outcome is None:
                 return
             outcome.retain_result = False
-            if outcome.result is not None:
+            if outcome.result is not None or outcome.error is not None:
                 self._pending_prompt_outcomes.pop(request_id, None)
 
-    def _schedule_prompt_outcome(
-        self, request_id: str, outcome: _PendingPromptOutcome
-    ) -> None:
+    def _schedule_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
         if outcome.scheduled:
             return
         outcome.scheduled = True
-        self._scheduled_prompt_runs.append(request_id)
         self._scheduled_agent_runs += 1
         self._last_schedule_async_error_index = self._async_errors.current_index()
 
-    def _claim_scheduled_prompt_run(self) -> str | None:
-        if self._scheduled_prompt_runs:
-            return self._scheduled_prompt_runs.pop(0)
-
-        event_index = self._events.current_index()
-        candidate = next(
-            (
-                (request_id, outcome)
-                for request_id, outcome in self._pending_prompt_outcomes.items()
-                if not outcome.scheduled
-                and outcome.result is not False
-                and outcome.start_event_index < event_index
-            ),
-            None,
-        )
-        if candidate is None:
-            return None
-        request_id, outcome = candidate
-        self._schedule_prompt_outcome(request_id, outcome)
-        return self._scheduled_prompt_runs.pop(0)
+    def _complete_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
+        if outcome.completed:
+            return
+        outcome.completed = True
+        if self._completed_agent_runs < self._scheduled_agent_runs:
+            self._completed_agent_runs += 1
+        self._event_condition.notify_all()
 
     def _handle_prompt_agent_lifecycle(self, event_type: str) -> None:
         with self._event_condition:
             if event_type == "agent_start":
-                request_id = self._claim_scheduled_prompt_run()
+                if (
+                    self._scheduled_agent_runs - self._completed_agent_runs
+                    <= self._active_agent_runs
+                ):
+                    self._scheduled_agent_runs += 1
+                    self._last_schedule_async_error_index = (
+                        self._async_errors.current_index()
+                    )
                 self._active_agent_runs += 1
             elif self._active_agent_runs > 0:
                 self._active_agent_runs -= 1
-                self._event_condition.notify_all()
-                return
-            else:
-                request_id = self._claim_scheduled_prompt_run()
-
-            if request_id is not None:
-                outcome = self._pending_prompt_outcomes.get(request_id)
-                if outcome is not None and outcome.result is None:
-                    outcome.result = True
-                    if outcome.acknowledged and not outcome.retain_result:
-                        self._pending_prompt_outcomes.pop(request_id, None)
             self._event_condition.notify_all()
 
     def _mark_agent_run_scheduled(self) -> None:
         with self._event_condition:
-            self._scheduled_prompt_runs.append(None)
             self._scheduled_agent_runs += 1
             self._last_schedule_async_error_index = self._async_errors.current_index()
 
     def _mark_agent_run_completed(self) -> None:
         with self._event_condition:
+            if self._completed_agent_runs == self._scheduled_agent_runs:
+                self._scheduled_agent_runs += 1
             self._completed_agent_runs += 1
             self._event_condition.notify_all()
 
@@ -2552,17 +2556,11 @@ class RpcClient:
             return
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(event.id)
-            if outcome is None or outcome.result is not None:
+            if outcome is None or outcome.error is not None or outcome.result is not None:
                 return
             outcome.result = event.agent_invoked
-            if event.agent_invoked:
-                self._schedule_prompt_outcome(event.id, outcome)
-            elif outcome.acknowledged and outcome.scheduled:
-                try:
-                    self._scheduled_prompt_runs.remove(event.id)
-                except ValueError:
-                    pass
-                self._completed_agent_runs += 1
+            if not event.agent_invoked:
+                self._complete_prompt_outcome(outcome)
             if outcome.acknowledged and not outcome.retain_result:
                 self._pending_prompt_outcomes.pop(event.id, None)
             self._event_condition.notify_all()
@@ -3103,7 +3101,41 @@ class RpcClient:
                 notification = parse_notification(payload)
                 if isinstance(notification, PromptResultEvent):
                     self._handle_prompt_result(notification)
-                listener_notification = parse_notification(payload)
+                elif isinstance(notification, ReadyEvent):
+                    self._ready_event = notification
+                    self._ready_received = True
+                    self._ready.set()
+                elif isinstance(notification, ExtensionUiRequest):
+                    self._ui_requests.put(notification)
+                elif not isinstance(
+                    notification,
+                    (
+                        ExtensionError,
+                        ExecOutputEvent,
+                        BtwOutputEvent,
+                        IdleRecapEvent,
+                        ExtensionUiCancelEvent,
+                        SettingsUpdateEvent,
+                        RawSseUpdateEvent,
+                        McpAuthChallengeEvent,
+                        TtsrGenerationEvent,
+                        VoiceEvent,
+                        ProviderRequestObservationEvent,
+                        AvailableCommandsUpdateEvent,
+                        SubagentLifecycleEvent,
+                        SubagentProgressEvent,
+                        SubagentEvent,
+                        UnknownNotification,
+                    ),
+                ):
+                    listener_event = cast(RpcAgentEvent, notification)
+                    self._append_event(payload)
+                    if listener_event.type in ("agent_start", "agent_end"):
+                        self._handle_prompt_agent_lifecycle(listener_event.type)
+                    if listener_event.type == "agent_end":
+                        self._mark_agent_run_completed()
+
+                listener_notification = notification
                 self._dispatch_listeners(
                     "notification",
                     listener_notification.type,
@@ -3114,9 +3146,6 @@ class RpcClient:
                 if isinstance(notification, PromptResultEvent):
                     continue
                 if isinstance(notification, ReadyEvent):
-                    self._ready_event = notification
-                    self._ready_received = True
-                    self._ready.set()
                     self._dispatch_listeners(
                         "ready",
                         listener_notification.type,
@@ -3126,7 +3155,6 @@ class RpcClient:
                     continue
 
                 if isinstance(notification, ExtensionUiRequest):
-                    self._ui_requests.put(notification)
                     self._dispatch_listeners(
                         "ui_request",
                         listener_notification.type,
@@ -3278,12 +3306,6 @@ class RpcClient:
                     )
                     continue
 
-                listener_event = cast(RpcAgentEvent, listener_notification)
-                self._append_event(payload)
-                if listener_event.type in ("agent_start", "agent_end"):
-                    self._handle_prompt_agent_lifecycle(listener_event.type)
-                if listener_event.type == "agent_end":
-                    self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "event", listener_event.type, self._event_listeners, listener_event
                 )
@@ -3327,16 +3349,25 @@ class RpcClient:
                 self._mark_closed(RpcError(f"Failed to read RPC stderr: {exc}"))
 
     def _mark_closed(self, error: BaseException) -> None:
-        if self._closed_error is not None:
-            return
-        self._closed_error = error
-        self._ready.set()
-        self._fail_pending(error)
         with self._event_condition:
-            self._pending_prompt_outcomes.clear()
-            self._scheduled_prompt_runs.clear()
+            if self._closed_error is not None:
+                return
+            self._closed_error = error
+            for outcome in self._pending_prompt_outcomes.values():
+                if outcome.error is None:
+                    outcome.error = error
+                self._complete_prompt_outcome(outcome)
+            completed_submissions = [
+                request_id
+                for request_id, outcome in self._pending_prompt_outcomes.items()
+                if outcome.acknowledged and not outcome.retain_result
+            ]
+            for request_id in completed_submissions:
+                self._pending_prompt_outcomes.pop(request_id, None)
             self._active_agent_runs = 0
             self._event_condition.notify_all()
+        self._ready.set()
+        self._fail_pending(error)
 
     def _fail_pending(self, error: BaseException) -> None:
         with self._state_lock:
@@ -3365,30 +3396,34 @@ class RpcClient:
             protocol_error.command in _ASYNC_COMMANDS
             and protocol_error.remote_error is not None
         ):
+            command_error = RpcCommandError(
+                protocol_error.command, protocol_error.remote_error
+            )
+            consumed_by_prompt = False
             if (
                 protocol_error.command == "prompt"
                 and protocol_error.request_id is not None
             ):
                 with self._event_condition:
-                    self._pending_prompt_outcomes.pop(
-                        protocol_error.request_id, None
+                    outcome = self._pending_prompt_outcomes.get(
+                        protocol_error.request_id
                     )
-                    try:
-                        self._scheduled_prompt_runs.remove(
-                            protocol_error.request_id
+                    if outcome is not None:
+                        if outcome.error is None:
+                            outcome.error = command_error
+                            self._complete_prompt_outcome(outcome)
+                        consumed_by_prompt = (
+                            not outcome.acknowledged or outcome.retain_result
                         )
-                    except ValueError:
-                        pass
+                        if outcome.acknowledged and not outcome.retain_result:
+                            self._pending_prompt_outcomes.pop(
+                                protocol_error.request_id, None
+                            )
+                        self._event_condition.notify_all()
             elif protocol_error.command == "abort_and_prompt":
-                with self._event_condition:
-                    try:
-                        self._scheduled_prompt_runs.remove(None)
-                    except ValueError:
-                        pass
-            self._append_async_error(
-                RpcCommandError(protocol_error.command, protocol_error.remote_error)
-            )
-            self._mark_agent_run_completed()
+                self._mark_agent_run_completed()
+            if not consumed_by_prompt:
+                self._append_async_error(command_error)
 
         self._record_protocol_error(protocol_error)
 
@@ -3454,6 +3489,22 @@ class RpcClient:
             except Exception:
                 continue
 
+    def _read_listener_dispatch_loop(self) -> None:
+        while True:
+            dispatch = self._listener_dispatch_queue.get()
+            if dispatch is None:
+                return
+            dispatch()
+
+    def _stop_listener_dispatcher(self) -> None:
+        thread = self._listener_dispatch_thread
+        if thread is None:
+            return
+        self._listener_dispatch_queue.put(None)
+        if thread is not threading.current_thread():
+            thread.join()
+        self._listener_dispatch_thread = None
+
     def _dispatch_listeners(
         self,
         listener_kind: str,
@@ -3461,18 +3512,25 @@ class RpcClient:
         listeners: Sequence[Callable[[Any], None]],
         payload: Any,
     ) -> None:
-        for listener in list(listeners):
-            try:
-                listener(payload)
-            except Exception as exc:
-                self._record_listener_error(
-                    ListenerErrorEvent(
-                        listener_kind=listener_kind,
-                        source_type=source_type,
-                        listener=listener,
-                        error=exc,
+        listener_snapshot = list(listeners)
+        if not listener_snapshot:
+            return
+
+        def dispatch() -> None:
+            for listener in listener_snapshot:
+                try:
+                    listener(payload)
+                except Exception as exc:
+                    self._record_listener_error(
+                        ListenerErrorEvent(
+                            listener_kind=listener_kind,
+                            source_type=source_type,
+                            listener=listener,
+                            error=exc,
+                        )
                     )
-                )
+
+        self._listener_dispatch_queue.put(dispatch)
 
     @staticmethod
     def _validate_history_limit(name: str, limit: int | None) -> int | None:

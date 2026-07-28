@@ -18,10 +18,12 @@ from omp_rpc import (
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
+    RpcProcessExitError,
     RpcError,
     host_tool,
 )
 from omp_rpc.client import _RpcFrameDecoder
+from omp_rpc.protocol import JsonObject
 
 
 FAKE_SERVER = textwrap.dedent(
@@ -925,23 +927,34 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
     """
     import json
     import sys
-    import time
+    import threading
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    write_lock = threading.Lock()
+
+    def emit(payload):
+        with write_lock:
+            print(json.dumps(payload), flush=True)
+
+    def emit_later(delay, payload):
+        timer = threading.Timer(delay, emit, args=(payload,))
+        timer.daemon = True
+        timer.start()
+
+    emit({"type": "ready"})
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         request_id = command["id"]
         message = command["message"]
-        if message in {"async-before", "async-true-before"}:
-            print(json.dumps({
+        if message in {"async-before", "async-true-before", "interleave-agent", "listener-true"}:
+            emit({
                 "type": "prompt_result",
                 "id": request_id,
-                "agentInvoked": message == "async-true-before",
-            }), flush=True)
+                "agentInvoked": message != "async-before",
+            })
 
         if message in {"ack", "immediate"}:
             data = {"agentInvoked": False}
-        elif message == "immediate-true":
+        elif message in {"immediate-true", "listener-agent-start"}:
             data = {"agentInvoked": True}
         else:
             data = None
@@ -953,22 +966,44 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
         }
         if data is not None:
             response["data"] = data
-        print(json.dumps(response), flush=True)
+        emit(response)
 
-        if message in {"async-after", "listener-after"}:
-            time.sleep(0.05)
-            print(json.dumps({
+        if message in {"async-after", "listener-after", "interleave-local"}:
+            emit_later(0.05, {
                 "type": "prompt_result",
                 "id": request_id,
                 "agentInvoked": False,
-            }), flush=True)
+            })
+        elif message in {"ack", "immediate"}:
+            emit({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": False,
+            })
+        elif message in {"immediate-true", "listener-agent-start", "ordered"}:
+            emit({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": True,
+            })
 
-        if message in {"async-true-before", "immediate-true", "normal"}:
-            print(json.dumps({"type": "agent_start"}), flush=True)
-            print(json.dumps({
-                "type": "agent_end",
-                "messages": [],
-            }), flush=True)
+        if message in {
+            "async-true-before",
+            "immediate-true",
+            "interleave-agent",
+            "listener-true",
+            "listener-agent-start",
+            "normal",
+            "ordered",
+        }:
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            if message == "normal":
+                emit({
+                    "type": "prompt_result",
+                    "id": request_id,
+                    "agentInvoked": True,
+                })
     """
 )
 
@@ -1467,8 +1502,35 @@ class RpcClientTests(unittest.TestCase):
             [
                 PromptResultEvent(id="req_1", agent_invoked=False),
                 PromptResultEvent(id="req_2", agent_invoked=False),
+                PromptResultEvent(id="req_3", agent_invoked=True),
             ],
         )
+
+    def test_interleaved_prompt_results_keep_request_correlation(self) -> None:
+        outcomes: dict[str, bool] = {}
+        outcomes_received = threading.Event()
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            def capture_outcome(event: object) -> None:
+                if not isinstance(event, PromptResultEvent) or event.id is None:
+                    return
+                outcomes[event.id] = event.agent_invoked
+                if outcomes.keys() >= {"req_1", "req_2"}:
+                    outcomes_received.set()
+
+            client.on_notification(capture_outcome)
+            local = client.prompt_with_result("interleave-local")
+            invoked = client.prompt_with_result("interleave-agent")
+
+            self.assertIsNone(local.agent_invoked)
+            self.assertIs(invoked.agent_invoked, True)
+            self.assertTrue(outcomes_received.wait(1.0))
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(outcomes, {"req_1": False, "req_2": True})
+            self.assertEqual(client._pending_prompt_outcomes, {})
+            self.assertEqual(
+                client._scheduled_agent_runs, client._completed_agent_runs
+            )
 
     def test_notification_before_response_is_returned_by_acknowledgement(
         self,
@@ -1503,6 +1565,73 @@ class RpcClientTests(unittest.TestCase):
             self.assertTrue(listener_finished.wait(1.0))
             self.assertEqual(listener_errors, [])
             self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_blocking_prompt_and_agent_start_listeners_do_not_block_reader(
+        self,
+    ) -> None:
+        prompt_listener_finished = threading.Event()
+        start_listener_finished = threading.Event()
+        listener_errors: list[BaseException] = []
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            def wait_from_prompt_result(event: object) -> None:
+                if not isinstance(event, PromptResultEvent) or not event.agent_invoked:
+                    return
+                try:
+                    client.wait_for_idle(timeout=0.5)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    prompt_listener_finished.set()
+
+            def wait_from_agent_start(_event: object) -> None:
+                try:
+                    client.wait_for_idle(timeout=0.5)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    start_listener_finished.set()
+
+            client.on_notification(wait_from_prompt_result)
+            client.prompt_with_result("listener-true")
+            self.assertTrue(prompt_listener_finished.wait(1.0))
+
+            client.on_agent_start(wait_from_agent_start)
+            client.prompt_with_result("listener-agent-start")
+            self.assertTrue(start_listener_finished.wait(1.0))
+            self.assertEqual(listener_errors, [])
+
+    def test_listener_callbacks_preserve_wire_order(self) -> None:
+        observed: list[str] = []
+        finished = threading.Event()
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            def record(event: object) -> None:
+                event_type = getattr(event, "type", None)
+                if event_type not in {"prompt_result", "agent_start", "agent_end"}:
+                    return
+                observed.append(event_type)
+                if event_type == "agent_end":
+                    finished.set()
+
+            client.on_notification(record)
+            client.prompt_with_result("ordered")
+            self.assertTrue(finished.wait(1.0))
+
+        self.assertEqual(observed, ["prompt_result", "agent_start", "agent_end"])
+
+    def test_stop_joins_listener_dispatcher(self) -> None:
+        client = self.make_client(server=PROMPT_RESULTS_SERVER)
+        client.start()
+        dispatcher = client._listener_dispatch_thread
+        self.assertIsNotNone(dispatcher)
+        assert dispatcher is not None
+        self.assertTrue(dispatcher.is_alive())
+
+        client.stop()
+
+        self.assertFalse(dispatcher.is_alive())
+        self.assertIsNone(client._listener_dispatch_thread)
 
     def test_prompt_and_wait_reconstructs_compacted_terminal_messages(self) -> None:
         with self.make_client() as client:
@@ -1940,6 +2069,42 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(len(protocol_errors), 1)
         self.assertIn("late failure", protocol_errors[0])
         self.assertEqual(len(client.protocol_errors), 1)
+        self.assertEqual(client._pending_prompt_outcomes, {})
+        self.assertLessEqual(
+            client._completed_agent_runs, client._scheduled_agent_runs
+        )
+
+    def test_stop_after_prompt_response_raises_process_exit_without_lost_outcome(
+        self,
+    ) -> None:
+        client = self.make_client(server=PROMPT_RESULTS_SERVER)
+        client.start()
+        original_request_payload = client._request_payload
+
+        def request_then_stop(
+            command_type: str,
+            payload: JsonObject,
+            *,
+            request_id: str | None = None,
+        ) -> JsonObject | None:
+            response = original_request_payload(
+                command_type, payload, request_id=request_id
+            )
+            if command_type == "prompt":
+                client.stop()
+            return response
+
+        setattr(client, "_request_payload", request_then_stop)
+        try:
+            with self.assertRaises(RpcProcessExitError):
+                client.prompt_with_result("ack")
+        finally:
+            client.stop()
+
+        self.assertEqual(client._pending_prompt_outcomes, {})
+        self.assertLessEqual(
+            client._completed_agent_runs, client._scheduled_agent_runs
+        )
 
     def test_listener_exceptions_are_reported_without_stopping_client(self) -> None:
         listener_errors: list[tuple[str, str | None, str]] = []
