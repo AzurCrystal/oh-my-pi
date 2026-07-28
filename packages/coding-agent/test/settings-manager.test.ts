@@ -119,6 +119,22 @@ describe("Settings", () => {
 		});
 	});
 
+	describe("save failures", () => {
+		it("rejects flush and retains the pending value when saving fails", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const saveError = new Error("simulated config write failure");
+			vi.spyOn(fileLock, "withFileLock").mockRejectedValueOnce(saveError);
+
+			settings.set("setupVersion", 1);
+
+			await expect(settings.flush()).rejects.toBe(saveError);
+			expect(settings.get("setupVersion")).toBe(1);
+
+			await settings.flush();
+			expect((await readSettings()).setupVersion).toBe(1);
+		});
+	});
+
 	describe("shell configuration errors", () => {
 		it("points to the selected global config in the active agent directory", async () => {
 			const configPath = path.join(agentDir, "config.yaml");

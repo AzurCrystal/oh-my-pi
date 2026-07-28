@@ -131,6 +131,60 @@ describe("dispatchRpcInputFrame", () => {
 			expect(bashFrame.data.exitCode).toBe(-1);
 		}
 	});
+	test("python is dispatched in the background so abort_python preempts it", async () => {
+		const pythonResponse: RpcResponse = {
+			id: "p1",
+			type: "response",
+			command: "python",
+			success: true,
+			data: {
+				output: "",
+				exitCode: undefined,
+				cancelled: true,
+				truncated: false,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+				displayOutputs: [],
+				stdinRequested: false,
+			},
+		};
+		const { promise: pythonPending, resolve: resolvePython } = Promise.withResolvers<RpcResponse>();
+		let abortPythonCalled = false;
+
+		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+			if (command.type === "python") return await pythonPending;
+			if (command.type === "abort_python") {
+				abortPythonCalled = true;
+				resolvePython(pythonResponse);
+				return { id: command.id, type: "response", command: "abort_python", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		};
+
+		const { deps, outputs } = makeDeps(handleCommand);
+
+		const pythonAwait = dispatchRpcInputFrame({ id: "p1", type: "python", code: "while True: pass" }, deps);
+		expect(pythonAwait).toBeUndefined();
+		await flushMicrotasks();
+		expect(outputs).toHaveLength(0);
+
+		const abortAwait = dispatchRpcInputFrame({ id: "a1", type: "abort_python" }, deps);
+		expect(abortAwait).toBeInstanceOf(Promise);
+		await abortAwait;
+
+		expect(abortPythonCalled).toBe(true);
+		expect(outputs[0]).toEqual({
+			id: "a1",
+			type: "response",
+			command: "abort_python",
+			success: true,
+		});
+
+		await flushMicrotasks();
+		expect(outputs.filter(frame => (frame as RpcResponse).command === "python")).toEqual([pythonResponse]);
+	});
 
 	test("non-bash commands are dispatched serially (ordering preserved)", async () => {
 		const started: string[] = [];
@@ -188,6 +242,30 @@ describe("dispatchRpcInputFrame", () => {
 			success: false,
 			error: "kaboom",
 		});
+	});
+	test("python handler errors identify python on the background frame", async () => {
+		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+			if (command.type === "python") throw new Error("kaboom");
+			throw new Error(`unexpected: ${command.type}`);
+		};
+
+		const { deps, outputs } = makeDeps(handleCommand);
+
+		const awaited = dispatchRpcInputFrame({ id: "p2", type: "python", code: "raise Exception()" }, deps);
+		expect(awaited).toBeUndefined();
+
+		await flushMicrotasks();
+		await flushMicrotasks();
+
+		expect(outputs).toEqual([
+			{
+				id: "p2",
+				type: "response",
+				command: "python",
+				success: false,
+				error: "kaboom",
+			},
+		]);
 	});
 
 	test("background bash task is exposed so EOF cleanup can await its response", async () => {
@@ -327,6 +405,12 @@ describe("RpcInputDispatcher", () => {
 						messageCount: 0,
 						queuedMessageCount: 0,
 						todoPhases: [],
+						isRetrying: false,
+						isBashRunning: false,
+						isAborting: false,
+						isGeneratingHandoff: false,
+						configWarnings: [],
+						skillWarnings: [],
 					},
 				};
 			}

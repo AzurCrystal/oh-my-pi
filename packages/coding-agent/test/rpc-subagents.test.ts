@@ -78,6 +78,7 @@ function createSessionChangeSession(options: SessionChangeStubOptions): RpcSessi
 		newSession: async (_options?: unknown) => options.newSession ?? true,
 		switchSession: async (_sessionPath: string) => options.switchSession ?? true,
 		branch: async (_entryId: string) => options.branch ?? { selectedText: "branched text", cancelled: false },
+		fork: async () => true,
 	};
 }
 
