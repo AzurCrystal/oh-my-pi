@@ -1120,6 +1120,13 @@ class TtsrGenerationEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class PromptResultEvent:
+    agent_invoked: bool
+    id: str | None = None
+    type: Literal["prompt_result"] = "prompt_result"
+
+
+@dataclass(slots=True, frozen=True)
 class SettingsUpdateEvent:
     path: str
     value: JsonValue
@@ -1223,6 +1230,7 @@ RpcNotification: TypeAlias = (
     | BtwOutputEvent
     | IdleRecapEvent
     | TtsrGenerationEvent
+    | PromptResultEvent
     | SettingsUpdateEvent
     | RawSseUpdateEvent
     | McpAuthChallengeEvent
@@ -1728,6 +1736,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             event=_clone_json_object(
                 payload.get("event"), field="ttsr_generation_event.event"
             ),
+            id=_optional_str(payload, "id"),
+        )
+    if event_type == "prompt_result":
+        agent_invoked = _optional_bool(payload, "agentInvoked")
+        if agent_invoked is None:
+            raise ValueError("prompt_result.agentInvoked must be a boolean")
+        return PromptResultEvent(
+            agent_invoked=agent_invoked,
             id=_optional_str(payload, "id"),
         )
     if event_type == "settings_update":

@@ -212,6 +212,22 @@ That helper ignores passive UI notifications (`notify`, `setStatus`, `setWidget`
 `setTitle`, `set_editor_text`), answers `confirm` with `False`, and cancels
 `select`/`input`/`editor` requests unless you provide explicit values.
 
+## Prompt Outcomes
+
+`prompt()` keeps its fire-and-forget API. Use `prompt_with_result()` when the
+server acknowledgement must be correlated with a later `prompt_result`
+notification:
+
+```python
+acknowledgement = client.prompt_with_result("Run /custom-command")
+print(acknowledgement.request_id, acknowledgement.agent_invoked)
+```
+
+`agent_invoked` is `True` when an agent turn was scheduled, `False` when the
+prompt completed locally, and `None` when the correlated result is still
+pending. `prompt_and_wait()` handles all three states; local-only prompts return
+an empty `PromptTurn` without waiting for `agent_end`.
+
 ## Error Handling and Retained History
 
 The client now surfaces more of the transport edge cases that the wire protocol

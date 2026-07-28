@@ -13,7 +13,14 @@ import time
 from pathlib import Path
 import unittest
 
-from omp_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
+from omp_rpc import (
+    PromptResultEvent,
+    RpcClient,
+    RpcCommandError,
+    RpcConcurrencyError,
+    RpcError,
+    host_tool,
+)
 from omp_rpc.client import _RpcFrameDecoder
 
 
@@ -381,7 +388,7 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"steer", "follow_up", "abort"}:
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
-            respond(request_id, command_type, {})
+            respond(request_id, command_type, {"agentInvoked": True})
             message = command["message"]
             if message == "needs ui":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
@@ -910,6 +917,55 @@ ASYNC_FRAMES_SERVER = textwrap.dedent(
             respond(request_id, command_type, {})
     """
 )
+PROMPT_RESULTS_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command["id"]
+        message = command["message"]
+        if message in {"async-before", "async-true-before"}:
+            print(json.dumps({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": message == "async-true-before",
+            }), flush=True)
+
+        data = (
+            {"agentInvoked": False}
+            if message in {"ack", "immediate"}
+            else None
+        )
+        response = {
+            "id": request_id,
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+        }
+        if data is not None:
+            response["data"] = data
+        print(json.dumps(response), flush=True)
+
+        if message == "async-after":
+            print(json.dumps({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": False,
+            }), flush=True)
+
+        if message == "async-true-before":
+            print(json.dumps({"type": "agent_start"}), flush=True)
+            print(json.dumps({
+                "type": "agent_end",
+                "messages": [],
+            }), flush=True)
+    """
+)
+
+
 
 DELTA_COMMANDS_SERVER = textwrap.dedent(
     """
@@ -1330,6 +1386,61 @@ class RpcClientTests(unittest.TestCase):
             turn = client.prompt_and_wait("say hello", timeout=2.0)
             self.assertEqual(turn.require_assistant_text(), "pong")
             self.assertGreaterEqual(len(turn.events), 3)
+
+    def test_immediate_local_prompt_returns_empty_turn_and_stays_idle(self) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            acknowledgement = client.prompt_with_result("ack")
+            self.assertEqual(acknowledgement.request_id, "req_1")
+            self.assertIs(acknowledgement.agent_invoked, False)
+            client.wait_for_idle(timeout=0.5)
+
+            started = time.monotonic()
+            turn = client.prompt_and_wait("immediate", timeout=0.5)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(turn.events, ())
+            self.assertEqual(turn.messages, ())
+            self.assertIsNone(turn.assistant_message)
+            self.assertIsNone(turn.assistant_text)
+            client.wait_for_idle(timeout=0.5)
+
+    def test_async_local_prompt_result_is_correlated_across_frame_orderings(
+        self,
+    ) -> None:
+        notifications: list[PromptResultEvent] = []
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            client.on_notification(
+                lambda event: notifications.append(event)
+                if isinstance(event, PromptResultEvent)
+                else None
+            )
+
+            started = time.monotonic()
+            turn = client.prompt_and_wait("async-before", timeout=0.5)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(turn.events, ())
+            self.assertIsNone(turn.assistant_text)
+            client.wait_for_idle(timeout=0.5)
+
+            acknowledgement = client.prompt_with_result("async-after")
+            self.assertEqual(acknowledgement.request_id, "req_2")
+            self.assertIsNone(acknowledgement.agent_invoked)
+            client.wait_for_idle(timeout=0.5)
+
+            turn = client.prompt_and_wait("async-true-before", timeout=0.5)
+            self.assertEqual(
+                [event.type for event in turn.events],
+                ["agent_start", "agent_end"],
+            )
+            client.wait_for_idle(timeout=0.5)
+
+        self.assertEqual(
+            notifications,
+            [
+                PromptResultEvent(id="req_1", agent_invoked=False),
+                PromptResultEvent(id="req_2", agent_invoked=False),
+                PromptResultEvent(id="req_3", agent_invoked=True),
+            ],
+        )
 
     def test_prompt_and_wait_reconstructs_compacted_terminal_messages(self) -> None:
         with self.make_client() as client:
