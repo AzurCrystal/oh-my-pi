@@ -14,6 +14,26 @@ import type { AssistantMessage, Model, ToolCall } from "../types";
 const MARKER_RE = /\bto=functions\.[A-Za-z_]\w*/g;
 const HARMONY_RE = /<\|(start|end|channel|message|call|return)\|>/g;
 
+// Reserved Harmony control-token spellings. Escaping these to their inert
+// backslash form lets untrusted data (user text, tool results) reach
+// harmony-server models (gpt-5.x) without the provider's prompt validator
+// rejecting the whole request (invalid_prompt / "Request blocked"). `constrain`
+// is escaped too — it is a real control token even though it is not a leak
+// signal on its own.
+const HARMONY_CONTROL_TOKEN_ESCAPE_RE = /<\|(start|end|message|channel|constrain|return|call)\|>/g;
+
+/**
+ * Escape reserved Harmony control tokens in arbitrary text so it can be
+ * transported as data to a harmony-dialect model. Returns the input unchanged
+ * when it carries no reserved spelling.
+ *
+ * Callers MUST gate on a harmony target and escape only the transport copy —
+ * the persisted transcript keeps the byte-for-byte original.
+ */
+export function escapeHarmonyControlTokens(text: string): string {
+	return text.replace(HARMONY_CONTROL_TOKEN_ESCAPE_RE, "<\\|$1\\|>");
+}
+
 // Channel-word adjacency (`C`): channel/role name appearing immediately before the marker.
 const CHANNEL_WORD_RE = /\b(?:analysis|commentary|assistant|user|system|developer|tool)\s+to=functions\./;
 

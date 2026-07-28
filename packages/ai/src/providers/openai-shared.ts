@@ -1,6 +1,6 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { toFirepassWireModelId, toFireworksWireModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
-import { isGlm52ReasoningEffortModelId, isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
+import { isGlm52ReasoningEffortModelId, isKimiK3ModelId, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type {
@@ -78,6 +78,7 @@ import {
 	kStreamingPartialJson,
 } from "../utils/block-symbols";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
+import { escapeHarmonyControlTokens } from "../utils/harmony-leak";
 import type { CapturedHttpErrorResponse } from "../utils/http-inspector";
 import { getOpenRouterHeaders } from "../utils/openrouter-headers";
 import { isForcedToolChoice } from "../utils/tool-choice";
@@ -1482,16 +1483,24 @@ export function convertResponsesInputContent(
 	content: string | Array<TextContent | ImageContent>,
 	supportsImages: boolean,
 	supportsImageDetailOriginal: boolean,
+	escapeControlTokens = false,
 ): ResponseInputContent[] | undefined {
 	if (typeof content === "string") {
 		if (content.trim().length === 0) return undefined;
-		return [{ type: "input_text", text: content.toWellFormed() } satisfies ResponseInputText];
+		const text = content.toWellFormed();
+		return [
+			{
+				type: "input_text",
+				text: escapeControlTokens ? escapeHarmonyControlTokens(text) : text,
+			} satisfies ResponseInputText,
+		];
 	}
 
 	const { textBlocks, imageBlocks, omittedImages } = partitionVisionContent(content, supportsImages);
 	const normalizedContent: ResponseInputContent[] = [];
 	for (const item of textBlocks) {
-		const text = item.text.toWellFormed();
+		const raw = item.text.toWellFormed();
+		const text = escapeControlTokens ? escapeHarmonyControlTokens(raw) : raw;
 		if (text.trim().length === 0) continue;
 		normalizedContent.push({
 			type: "input_text",
@@ -1628,6 +1637,11 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	const filterReasoning = <T extends { type?: string }>(items: T[]): T[] =>
 		options.nativeHistory?.filterReasoning ? items.filter(item => item?.type !== "reasoning") : items;
 	const includeThinkingSignatures = options.includeThinkingSignatures ?? options.nativeHistory?.replay ?? true;
+	// Harmony-server models (gpt-5.x) reject requests whose input data reproduces
+	// reserved control-token spellings; escape the transport copy of untrusted
+	// user/tool text so ordinary docs, code, or grep results cannot poison the
+	// session (#6913). The persisted transcript is never touched.
+	const escapeControlTokens = preferredDialect(options.model.id) === "harmony";
 
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
@@ -1667,13 +1681,20 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				msg.content,
 				options.model.input.includes("image"),
 				supportsImageDetailOriginal,
+				escapeControlTokens,
 			);
 			if (!content) continue;
+			const developerText =
+				options.developerStringContent && msg.role === "developer" && typeof msg.content === "string"
+					? msg.content.toWellFormed()
+					: undefined;
 			messages.push({
 				role: "user",
 				content:
-					options.developerStringContent && msg.role === "developer" && typeof msg.content === "string"
-						? msg.content.toWellFormed()
+					developerText !== undefined
+						? escapeControlTokens
+							? escapeHarmonyControlTokens(developerText)
+							: developerText
 						: content,
 			});
 		} else if (msg.role === "assistant") {
@@ -1951,7 +1972,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	// genuinely empty text result (empty file read, silent tool) must stay
 	// empty — the placeholder sent models chasing an attachment that never
 	// existed.
-	const output = (
+	const rawOutput = (
 		omittedImages
 			? joinTextWithImagePlaceholder(textResult, true)
 			: textResult.length > 0
@@ -1960,6 +1981,10 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 					? "(see attached image)"
 					: ""
 	).toWellFormed();
+	// Harmony-server models reject reserved control-token spellings even as tool
+	// data; escape the transport copy so a grep/read result cannot poison the
+	// session (#6913). Covers every downstream branch that consumes `output`.
+	const output = preferredDialect(model.id) === "harmony" ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({
 			type: "message",

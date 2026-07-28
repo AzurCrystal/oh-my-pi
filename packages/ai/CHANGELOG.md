@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Responses requests for Harmony-dialect models (gpt-5.x / openai-codex) now escape reserved Harmony control-token spellings (e.g. `<|channel|>analysis`) in untrusted user and tool-result text before serialization, so ordinary data — documentation, code, logs, or `omp://` grep results — can no longer trip the provider's `invalid_prompt` / "Request blocked" validator and permanently poison the session. Only the transport copy is escaped; the persisted transcript is byte-for-byte unchanged, and non-Harmony models are untouched. Extends the existing compaction-payload escaping to the live agent-loop request boundary ([#6913](https://github.com/can1357/oh-my-pi/issues/6913)).
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed
