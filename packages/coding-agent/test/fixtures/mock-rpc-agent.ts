@@ -79,6 +79,21 @@ for await (const raw of console) {
 				protocolV2Enabled = true;
 				continue;
 			}
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_PROMPT_RESULTS === "1") {
+				const agentInvoked = frame.message === "agent" ? true : undefined;
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: agentInvoked === undefined ? undefined : { agentInvoked },
+				});
+				if (frame.message === "local-only") {
+					await Promise.resolve();
+					writeFrame({ type: "prompt_result", id, agentInvoked: false });
+				}
+				continue;
+			}
 			if (frame.type === "get_messages_page") {
 				if (Bun.env.MOCK_RPC_PAGE_BUSY === "1") {
 					writeFrame({

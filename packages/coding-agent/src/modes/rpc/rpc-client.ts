@@ -103,6 +103,8 @@ import type {
 	RpcPlanModeSnapshot,
 	RpcPlanProposalSnapshot,
 	RpcPromptHistoryEntry,
+	RpcPromptResultFrame,
+	RpcPromptSubmissionResult,
 	RpcProviderRequestObservationFrame,
 	RpcQueuedMessages,
 	RpcRawSseSnapshot,
@@ -178,6 +180,7 @@ export type RpcExecOutputListener = (frame: RpcExecOutputFrame) => void;
 export type RpcBtwOutputListener = (frame: RpcBtwOutputFrame) => void;
 export type RpcIdleRecapListener = (frame: RpcIdleRecapFrame) => void;
 export type RpcSettingsUpdateListener = (frame: RpcSettingsUpdateFrame) => void;
+export type RpcPromptResultListener = (frame: RpcPromptResultFrame) => void;
 export type RpcRawSseUpdateListener = (frame: RpcRawSseUpdateFrame) => void;
 export type RpcMcpAuthChallengeListener = (frame: RpcMcpAuthChallengeFrame) => void;
 export type RpcTtsrGenerationEventListener = (frame: RpcTtsrGenerationEventFrame) => void;
@@ -327,6 +330,15 @@ function isRpcIdleRecapFrame(value: unknown): value is RpcIdleRecapFrame {
 	return isRecord(value) && value.type === "idle_recap" && typeof value.recap === "string";
 }
 
+function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
+	return (
+		isRecord(value) &&
+		value.type === "prompt_result" &&
+		(value.id === undefined || typeof value.id === "string") &&
+		typeof value.agentInvoked === "boolean"
+	);
+}
+
 function isRpcSettingsUpdateFrame(value: unknown): value is RpcSettingsUpdateFrame {
 	return isRecord(value) && value.type === "settings_update" && typeof value.path === "string";
 }
@@ -446,6 +458,7 @@ export class RpcClient {
 	#execOutputListeners = new Set<RpcExecOutputListener>();
 	#btwOutputListeners = new Set<RpcBtwOutputListener>();
 	#idleRecapListeners = new Set<RpcIdleRecapListener>();
+	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#settingsUpdateListeners = new Set<RpcSettingsUpdateListener>();
 	#rawSseUpdateListeners = new Set<RpcRawSseUpdateListener>();
 	#mcpAuthChallengeListeners = new Set<RpcMcpAuthChallengeListener>();
@@ -759,6 +772,12 @@ export class RpcClient {
 		return () => this.#idleRecapListeners.delete(listener);
 	}
 
+	/** Subscribe to asynchronous completion of prompts handled without an agent turn. */
+	onPromptResult(listener: RpcPromptResultListener): () => void {
+		this.#promptResultListeners.add(listener);
+		return () => this.#promptResultListeners.delete(listener);
+	}
+
 	/**
 	 * Subscribe to effective setting changes emitted by the RPC server.
 	 */
@@ -844,7 +863,16 @@ export class RpcClient {
 	 * Use waitForIdle() to wait for completion.
 	 */
 	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "prompt", message, images });
+		await this.promptWithResult(message, images);
+	}
+
+	/**
+	 * Send a prompt and retain any outcome known when the server acknowledges it.
+	 * An omitted `agentInvoked` means the prompt is still resolving asynchronously.
+	 */
+	async promptWithResult(message: string, images?: ImageContent[]): Promise<RpcPromptSubmissionResult> {
+		const response = await this.#send({ type: "prompt", message, images });
+		return this.#getData<RpcPromptSubmissionResult | undefined>(response) ?? {};
 	}
 
 	/**
@@ -2503,6 +2531,13 @@ export class RpcClient {
 
 		if (isRpcProviderRequestObservationFrame(data)) {
 			for (const listener of this.#providerRequestObservationListeners) {
+				listener(data);
+			}
+			return;
+		}
+
+		if (isRpcPromptResultFrame(data)) {
+			for (const listener of this.#promptResultListeners) {
 				listener(data);
 			}
 			return;

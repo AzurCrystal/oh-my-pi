@@ -657,6 +657,11 @@ export interface RpcVoiceEventFrame {
 	event: RpcVoiceEvent;
 }
 
+export interface RpcPromptSubmissionResult {
+	/** Set when the server can determine the outcome before acknowledging the prompt. */
+	agentInvoked?: boolean;
+}
+
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
@@ -768,7 +773,7 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "prompt"; success: true; data?: RpcPromptSubmissionResult }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
