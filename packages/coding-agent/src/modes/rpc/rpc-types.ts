@@ -98,6 +98,7 @@ import type { RpcThemeSnapshot } from "./rpc-theme";
 import type { RpcLiveStatus, RpcSpeechMode, RpcSpeechStatus, RpcSttStatus, RpcVoiceEvent } from "./rpc-voice";
 import type {
 	RpcGoalModeSnapshot,
+	RpcGuidedGoalKickoffResult,
 	RpcPlanDecisionResult as RpcPlanDecisionResultBase,
 	RpcPlanFinalizationStrategy,
 	RpcPlanModeSnapshot as RpcPlanModeSnapshotBase,
@@ -204,6 +205,7 @@ export type {
 	RpcGoalBudgetSnapshot,
 	RpcGoalDescriptor,
 	RpcGoalModeSnapshot,
+	RpcGuidedGoalKickoffResult,
 	RpcPlanFinalizationStrategy,
 	RpcPlanProposalSnapshot,
 	RpcVibeModeSnapshot,
@@ -292,6 +294,7 @@ export type RpcCommand =
 	| { id?: string; type: "clear_goal" }
 	| { id?: string; type: "set_goal_budget"; tokenBudget: number | null }
 	| { id?: string; type: "get_goal_state" }
+	| { id?: string; type: "begin_guided_goal"; initialObjective?: string }
 	| { id?: string; type: "enter_vibe_mode" }
 	| { id?: string; type: "exit_vibe_mode" }
 	| { id?: string; type: "get_vibe_mode_state" }
@@ -650,21 +653,51 @@ export interface RpcVoiceEventFrame {
 	event: RpcVoiceEvent;
 }
 
-export interface RpcPromptSubmissionResult {
+export type RpcPromptLifecycleDisposition = "none" | "current" | "future";
+
+export type RpcCapability = "prompt_result" | "prompt_lifecycle_disposition";
+
+/** Prompt outcome carried in the server acknowledgement payload. */
+export interface RpcPromptAcknowledgement {
 	/** Set when the server can determine the outcome before acknowledging the prompt. */
 	agentInvoked?: boolean;
+	/** How this input relates to agent lifecycle reservations. */
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
+}
+
+/** Client-side prompt submission result; `requestId` is the response envelope id, not wire payload data. */
+export interface RpcPromptSubmissionResult extends RpcPromptAcknowledgement {
+	requestId: string;
+}
+
+/** Client-side acknowledgement for an asynchronous command that may report a later same-id outcome. */
+export interface RpcAsyncCommandSubmissionResult {
+	requestId: string;
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
+}
+
+/** Prompt scheduling failure emitted after the initial prompt or abort-and-prompt acknowledgement. */
+export interface RpcPromptErrorResponse {
+	id: string;
+	type: "response";
+	command: "prompt" | "abort_and_prompt";
+	success: false;
+	error: string;
+	code?: string;
 }
 
 export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
 	agentInvoked: boolean;
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
 }
 
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
+	capabilities?: RpcCapability[];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
 }
@@ -766,11 +799,11 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: RpcPromptSubmissionResult }
+	| { id?: string; type: "response"; command: "prompt"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	| { id?: string; type: "response"; command: "follow_up"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "abort"; success: true }
-	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "ask_btw"; success: true; data: RpcBtwAskResult }
 	| {
 			id?: string;
@@ -885,6 +918,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "clear_goal"; success: true; data: RpcGoalModeSnapshot }
 	| { id?: string; type: "response"; command: "set_goal_budget"; success: true; data: RpcGoalModeSnapshot }
 	| { id?: string; type: "response"; command: "get_goal_state"; success: true; data: RpcGoalModeSnapshot }
+	| {
+			id?: string;
+			type: "response";
+			command: "begin_guided_goal";
+			success: true;
+			data: RpcGuidedGoalKickoffResult;
+	  }
 	| { id?: string; type: "response"; command: "enter_vibe_mode"; success: true; data: RpcVibeModeSnapshot }
 	| { id?: string; type: "response"; command: "exit_vibe_mode"; success: true; data: RpcVibeModeSnapshot }
 	| { id?: string; type: "response"; command: "get_vibe_mode_state"; success: true; data: RpcVibeModeSnapshot }

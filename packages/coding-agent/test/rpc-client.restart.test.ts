@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn, test, vi } from "bun:test";
 import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { ptree, TempDir } from "@oh-my-pi/pi-utils";
@@ -133,6 +133,108 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 
 		await expect(pending).rejects.toThrow("Client stopped");
 	});
+
+	test("bash and python response deadlines are opt-in and stay out of the wire command", async () => {
+		const encoder = new TextEncoder();
+		const { promise: exited, resolve: exit } = Promise.withResolvers<number>();
+		const commands: Record<string, unknown>[] = [];
+		let output: ReadableStreamDefaultController<Uint8Array> | undefined;
+		const writeOutput = (frame: Record<string, unknown>) => {
+			output?.enqueue(encoder.encode(`${JSON.stringify(frame)}\n`));
+		};
+		const stdout = new ReadableStream<Uint8Array>({
+			start(controller) {
+				output = controller;
+				writeOutput({ type: "ready" });
+			},
+		});
+		const fakeChild = {
+			stdout,
+			stdin: {
+				write(raw: string) {
+					const command = JSON.parse(raw) as Record<string, unknown>;
+					commands.push(command);
+					if (command.type === "get_state") {
+						writeOutput({ id: command.id, type: "response", command: "get_state", success: true, data: {} });
+					}
+					return 0;
+				},
+				flush() {
+					return 0;
+				},
+			},
+			exited,
+			peekStderr() {
+				return "";
+			},
+			kill() {
+				exit(0);
+			},
+		};
+		const spawn = spyOn(ptree, "spawn").mockImplementation(() => fakeChild as never);
+
+		try {
+			using client = new RpcClient({ cliPath: MOCK_AGENT });
+			await client.start();
+			vi.useFakeTimers();
+			try {
+				for (const commandType of ["bash", "python"] as const) {
+					const defaultRequest =
+						commandType === "bash" ? client.bash("long command") : client.python("long_call()");
+					const defaultCommand = commands.at(-1);
+					if (!defaultCommand || typeof defaultCommand.id !== "string") {
+						throw new Error("Execution request was not written");
+					}
+					expect(defaultCommand).not.toHaveProperty("timeoutMs");
+					let defaultSettled = false;
+					void defaultRequest.then(
+						() => {
+							defaultSettled = true;
+						},
+						() => {
+							defaultSettled = true;
+						},
+					);
+					vi.advanceTimersByTime(30_001);
+					await Promise.resolve();
+					expect(defaultSettled).toBe(false);
+					writeOutput({
+						id: defaultCommand.id,
+						type: "response",
+						command: commandType,
+						success: true,
+						data: {},
+					});
+					await defaultRequest;
+
+					const timedRequest =
+						commandType === "bash"
+							? client.bash("timed command", { timeoutMs: 10 })
+							: client.python("timed_call()", { timeoutMs: 10 });
+					const timedCommand = commands.at(-1);
+					if (!timedCommand || typeof timedCommand.id !== "string") {
+						throw new Error("Timed execution request was not written");
+					}
+					expect(timedCommand).not.toHaveProperty("timeoutMs");
+					vi.advanceTimersByTime(10);
+					await expect(timedRequest).rejects.toThrow(`Timeout waiting for response to ${commandType}`);
+
+					writeOutput({
+						id: timedCommand.id,
+						type: "response",
+						command: commandType,
+						success: false,
+						error: "late execution failure",
+					});
+					await client.getState();
+				}
+			} finally {
+				vi.useRealTimers();
+			}
+		} finally {
+			spawn.mockRestore();
+		}
+	}, 10_000);
 
 	test("rejects pending requests and reaps the worker when stdout parsing fails", async () => {
 		// This awaits the real child-process grace-to-hard-kill path; fake timers

@@ -4,7 +4,11 @@ import unittest
 
 from omp_rpc import (
     AgentEndEvent,
+    ExtensionAskDialogOption,
+    ExtensionAskDialogQuestion,
     ExtensionUiRequest,
+    PromptResultEvent,
+    ReadyEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -96,6 +100,37 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
         self.assertTrue(state.model.thinking.supports_display)
 
+    def test_ready_capabilities_are_additive(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "ready",
+                "capabilities": [
+                    "prompt_result",
+                    "prompt_lifecycle_disposition",
+                    "future_capability",
+                ],
+            }
+        )
+
+        self.assertIsInstance(notification, ReadyEvent)
+        self.assertEqual(
+            notification.capabilities,
+            ("prompt_result", "prompt_lifecycle_disposition"),
+        )
+
+    def test_parse_prompt_lifecycle_disposition(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "prompt_result",
+                "id": "request-1",
+                "agentInvoked": True,
+                "lifecycleDisposition": "current",
+            }
+        )
+
+        self.assertIsInstance(notification, PromptResultEvent)
+        self.assertEqual(notification.lifecycle_disposition, "current")
+
     def test_parse_agent_end_notification(self) -> None:
         notification = parse_notification(
             {
@@ -155,6 +190,66 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertTrue(notification.is_interactive())
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
+
+    def test_parse_ask_dialog_request_with_typed_questions(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-ask-1",
+                "method": "askDialog",
+                "questions": [
+                    {
+                        "id": "database",
+                        "question": "Which database should we use?",
+                        "header": "Database",
+                        "options": [
+                            {
+                                "label": "Postgres",
+                                "description": "Relational database",
+                                "preview": "CREATE TABLE users (...);",
+                            },
+                            {"label": "SQLite"},
+                        ],
+                        "multi": False,
+                        "recommended": 0,
+                    }
+                ],
+                "timeout": 30000,
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.method, "askDialog")
+        self.assertTrue(notification.is_interactive())
+        self.assertTrue(notification.requires_response())
+        assert notification.questions is not None
+        question = notification.questions[0]
+        self.assertIsInstance(question, ExtensionAskDialogQuestion)
+        self.assertEqual(question.id, "database")
+        self.assertEqual(question.header, "Database")
+        self.assertFalse(question.multi)
+        self.assertEqual(question.recommended, 0)
+        self.assertIsInstance(question.options[0], ExtensionAskDialogOption)
+        self.assertEqual(question.options[0].label, "Postgres")
+        self.assertEqual(question.options[0].description, "Relational database")
+        self.assertEqual(question.options[1].preview, None)
+
+    def test_parse_ask_dialog_rejects_invalid_questions(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_notification(
+                {
+                    "type": "extension_ui_request",
+                    "id": "ui-ask-1",
+                    "method": "askDialog",
+                    "questions": [
+                        {
+                            "id": "database",
+                            "question": "Which database should we use?",
+                            "options": [{"label": 42}],
+                        }
+                    ],
+                }
+            )
 
     def test_parse_todo_reminder_notification(self) -> None:
         notification = parse_notification(

@@ -1,6 +1,7 @@
 import type { CollabUiRequest, CollabUiResponseValue, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { Settings } from "../config/settings";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { SessionTransitionRunner } from "../session/agent-session-types";
 import type { SessionManager } from "../session/session-manager";
 import type { EventBus } from "../utils/event-bus";
 import type { CollabGuestLink } from "./guest";
@@ -31,6 +32,8 @@ export interface CollabGuestContext {
 	settings: Settings;
 	eventBus?: EventBus;
 	collabGuest?: CollabGuestLink;
+	/** Frontend-owned commit/reconcile boundary for replica and return transitions. */
+	runSessionTransition?: SessionTransitionRunner;
 	showStatus?(message: string, options?: { dim?: boolean }): void;
 	showError?(message: string): void;
 	syncRunningSubagentBadge?(): void;

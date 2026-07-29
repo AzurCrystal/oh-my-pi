@@ -25,7 +25,7 @@ Behavior notes:
 - RPC startup sets `PI_NO_TITLE=1`, so `prompt` never starts an implicit title-generation model call. Clients control titles explicitly with `set_session_name` or `generate_title`.
 - RPC mode resets workflow-altering `todo.*`, `task.*`, `memory.backend`/`memories.enabled`, `advisor.*`, `async.*`, and `bash.autoBackground.*` settings to their built-in defaults instead of inheriting user overrides.
 - The process reads stdin as JSONL (`readJsonl(Bun.stdin.stream())`).
-- At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
+- At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions, transport limits, and additive capabilities.
 - When stdin closes, pending host-tool calls and host-URI requests are rejected and the process exits with code `0`.
 - Responses/events are written as one JSON object per line.
 
@@ -40,6 +40,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "type": "ready",
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
+  "capabilities": ["prompt_result", "prompt_lifecycle_disposition"],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864
 }
@@ -66,7 +67,7 @@ After the success response, oversized stdout objects are emitted losslessly as a
 
 Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The exported TypeScript `RpcFrameDecoder` implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
 
-Legacy clients may ignore the added ready fields and remain on v1. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
+Legacy clients may ignore the added ready fields and remain on v1. New clients use `capabilities` independently of the transport version: `prompt_result` enables correlated terminal scheduling outcomes, and `prompt_lifecycle_disposition` enables explicit `none` / `current` / `future` run ownership. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
 
 ### Outbound frame categories (stdout)
 
@@ -77,7 +78,7 @@ The table below names the 18 asynchronous frames and event variants a standalone
 | `extension_ui_request` | An extension, login flow, collab host, or tool needs host UI. Requests that expect an answer are completed with `extension_ui_response`. | Automatic; use `RpcClient.onExtensionUiRequest`. |
 | `extension_error` | An extension event handler throws. | Automatic raw stdout frame; the TypeScript client has no dedicated listener. |
 | `available_commands_update` | Emitted once at startup and whenever slash-command metadata changes. | Automatic; use `RpcClient.onAvailableCommandsUpdate`. |
-| `prompt_result` | An immediately acknowledged scheduled `prompt` later finishes locally without invoking the agent. | Automatic; use `RpcClient.onPromptResult` and correlate by `id`. Use `promptWithResult` when the immediate `agentInvoked` outcome is also needed. |
+| `prompt_result` | Every successfully acknowledged `prompt` or `abort_and_prompt` reports whether agent-facing input handled it (`true`) or it completed locally (`false`). Exactly one terminal outcome is emitted and correlated by request `id`; `lifecycleDisposition` is `"none"`, `"current"`, or `"future"` and identifies which run reservation owns the work. | Automatic; use `RpcClient.onPromptResult`, and also `onPromptError` when late scheduling failures must be observed. Use `promptWithResult` or `abortAndPromptWithResult` to retain the acknowledgement request id. |
 | `subagent_lifecycle` | A subscribed subagent starts, stops, or changes lifecycle state. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentLifecycle`. |
 | `subagent_progress` | A subscribed subagent publishes progress. | Send `set_subagent_subscription` with `level: "progress"` or `"events"`, then use `RpcClient.onSubagentProgress`. |
 | `subagent_event` | A subscribed subagent emits its underlying session event. | Send `set_subagent_subscription` with `level: "events"`, then use `RpcClient.onSubagentEvent`. |
@@ -137,13 +138,15 @@ Important edge behavior from runtime:
 
 - Unknown command responses preserve the request `id` when one was provided.
 - Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
-- `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- `prompt` and `abort_and_prompt` return immediate success, then emit either a same-id `prompt_result` or a later same-id error response if async prompt scheduling fails. The TypeScript client exposes both through the typed `onPromptResult` / `onPromptError` subscriptions. `RpcPromptErrorResponse.command` is `"prompt" | "abort_and_prompt"`; use the `requestId` returned by `promptWithResult()` or `abortAndPromptWithResult()` for correlation. Matched immediate failures remain normal command responses and are not also published to the listener.
+- Success acknowledgements may include `data.agentInvoked` and `data.lifecycleDisposition` when the server already knows the terminal scheduling outcome. `agentInvoked: false` pairs with `"none"`; `"current"` means the input joined the active run; `"future"` means it owns a queued or newly starting run. Omitted fields mean the outcome is still resolving.
+- Consumers that need every terminal prompt outcome subscribe to both listeners. The SDKs retain at most 1,024 timed-out request ids and 1,024 already-reported prompt-error ids in insertion order: late duplicates inside that window are ignored, while bounded eviction prevents lifetime growth.
+
+The high-level TypeScript `promptAndWait()` and Python `prompt_and_wait()` helpers require the advertised `prompt_result` capability. Against an older runtime that omits it, they fail immediately with `code: "capability_unavailable"` and an upgrade message rather than waiting indefinitely. Fire-and-forget prompt methods and all unrelated client APIs remain compatible with that runtime.
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 185 command discriminants; referenced TypeScript types are exported from the same module.
+`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 181 command discriminants; referenced TypeScript types are exported from the same module.
 
 ### Protocol
 
@@ -220,7 +223,7 @@ There is no separate reset command. A descriptor with `nullable: true` accepts `
 - `{ id?, type: "approve_plan_proposal", editedContent?: string, strategy?: "execute" | "keep-context" | "compact-context", executionModel?: { provider: string, modelId: string }, thinkingLevel?: ConfiguredThinkingLevel }`
 - `{ id?, type: "reject_plan_proposal", feedback?: string }`
 
-Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPlanDecisionResult`. Every plan snapshot includes `paused`. `pause_plan_mode` preserves plan mode as the persisted `plan_paused` session mode and returns `{ enabled: false, paused: true, ... }`; `resume_plan_mode` restores the active plan runtime. Approval may replace the proposal with `editedContent`. `execute` starts a new execution session, `keep-context` executes in the current context, and `compact-context` compacts the current context before execution. `executionModel` and `thinkingLevel` select the execution turn.
+Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPlanDecisionResult`. Every plan snapshot includes `paused`. `pause_plan_mode` preserves plan mode as the persisted `plan_paused` session mode and returns `{ enabled: false, paused: true, ... }`; `resume_plan_mode` restores the active plan runtime. Approval may replace the proposal with `editedContent`. `execute` starts a new execution session, `keep-context` executes in the current context, and `compact-context` compacts the current context before execution. `executionModel` and `thinkingLevel` select the execution turn. A collaboration guest cannot use `strategy: "execute"` until it calls `leave_collab_session`; the proposal remains pending and plan mode remains active.
 
 #### Goal and guided-goal modes
 
@@ -231,13 +234,9 @@ Plan commands return `RpcPlanModeSnapshot`, `RpcPlanProposalSnapshot`, or `RpcPl
 - `{ id?, type: "clear_goal" }`
 - `{ id?, type: "set_goal_budget", tokenBudget: number | null }`
 - `{ id?, type: "get_goal_state" }`
-- `{ id?, type: "begin_guided_goal", initialObjective: string }`
-- `{ id?, type: "answer_guided_goal", answer: string }`
-- `{ id?, type: "accept_guided_goal", objective: string }`
-- `{ id?, type: "cancel_guided_goal" }`
-- `{ id?, type: "get_guided_goal_state" }`
+- `{ id?, type: "begin_guided_goal", initialObjective?: string }` → `{ queued: boolean }`
 
-Goal mode is autonomous. Creating a goal while idle immediately starts its first agent turn; after each completed turn the RPC goal scheduler can submit the next continuation while the goal remains active. A streaming session receives goal context as steering instead. Guided goal runs a bounded question/review flow and `accept_guided_goal` converts the reviewed objective into the same autonomous goal mode.
+Goal mode is autonomous. Creating a goal while idle immediately starts its first agent turn; after each completed turn the RPC goal scheduler can submit the next continuation while the goal remains active. A streaming session receives goal context as steering instead. `begin_guided_goal` mirrors the TUI command: it validates preconditions, exposes the `goal` tool, and injects a synthetic kickoff prompt. `queued: true` means that kickoff is a follow-up behind an active turn; `false` means direct submission. The guided interview is normal conversation: clients send answers with `prompt`, and the agent completes it with `goal create`.
 
 #### Vibe and aggregate state
 
@@ -246,7 +245,7 @@ Goal mode is autonomous. Creating a goal while idle immediately starts its first
 - `{ id?, type: "get_vibe_mode_state" }`
 - `{ id?, type: "get_work_mode_state" }`
 
-Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_state` returns the active mode plus plan, goal, guided-goal, and vibe snapshots.
+Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_state` returns the active mode plus plan, goal, and vibe snapshots.
 
 ### Runtime control
 
@@ -259,7 +258,7 @@ Vibe snapshots expose active/ephemeral tools and worker state. `get_work_mode_st
 - `{ id?, type: "get_pause_state" }`
 - `{ id?, type: "get_session_tree" }`
 
-Loop state reports `enabled`, `state`, `action`, `prompt`, and an optional iteration or duration limit. `cancel_loop_iteration` pauses future repeats and aborts only the active loop turn. Pause commands operate on the process-wide agent pause gate.
+Loop state reports `enabled`, `state`, `action`, `prompt`, and an optional iteration or duration limit. `cancel_loop_iteration` pauses future repeats and aborts only the active loop turn. `action: "reset"` starts a new session and is rejected for collaboration guests before the loop is enabled; call `leave_collab_session` first. Other loop actions are unchanged. Pause commands operate on the process-wide agent pause gate.
 
 `get_session_tree` returns `{ leafId, tree }`. Every node's `id` is a valid `navigate_tree.targetId`; clients MUST use these ids rather than deriving targets from messages or labels.
 
@@ -378,6 +377,12 @@ These commands operate on the active Hindsight bank. Bulk refresh and seeding re
 
 `switch_session.sessionPath` accepts an absolute path, a session-id prefix, a session filename prefix, or a partial title. Id and filename-prefix resolution checks the current workspace and then the global session list; if neither matches, partial-title resolution follows the same local-then-global order. No match returns `code: "unknown_session"`. Switching across projects reconciles the live cwd and its cwd-dependent runtime state to the destination session.
 
+`new_session`, `switch_session`, `branch`, and `fork` reconcile work modes around the change. The outgoing session's transient runtime is released without persisting anything — plan and goal give their pre-mode tools and model back, and vibe workers are suspended rather than killed — so the destination hydrates from a clean base and a mode-less target inherits no mode tooling. A change reported as `cancelled: true`, or one that fails before commit, leaves the still-current session operational with its recorded mode, tools, model, hosted collaboration relay, voice capture, and process-local vibe workers intact; hosting, voice, and suspended workers are released only once the change commits. These four commands and deletion of the active session fail with `code: "operation_failed"` while joined as a collaboration guest; call `leave_collab_session` first.
+
+When `switch_session` resolves to the active session file, path identity uses the runtime's platform-aware canonical comparison (including Windows casing and separators). This is a reload, not a destructive switch: RPC rolls the reversible work-mode suspension back, preserves process-local vibe workers and the RPC subagent registry, and keeps session-owned attachments. Switching to a different logical file remains destructive.
+
+A transition that aborts the outgoing provider turn and then fails before commit does not resurrect that cancelled turn. It reconnects the restored session and automatically consumes its restored steering, follow-up, or deferred hidden queue so the session returns to normal operation without a manual prompt.
+
 `get_sessions` defaults to the current cwd and a limit of 100, supports case-insensitive full-text substring filtering, and caps the limit at 1,000. `cwd` selects another workspace when `scope` is not `"all"`. Results are sorted by newest modification time and omit `allMessagesText`.
 
 Deleting the active session uses the canonical drop/new-session path so the live session never points at a deleted file; it may return `code: "cancelled"` if that transition is cancelled. A non-active path not owned by the session index returns `code: "unknown_session"`.
@@ -470,7 +475,7 @@ Realtime `/live` and harness-side microphone STT emit `voice_event` frames. Spee
 - `{ id?, type: "join_collab_session", link: string }`
 - `{ id?, type: "leave_collab_session" }`
 
-After `join_collab_session` makes the RPC session a guest, `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` are routed to the authoritative host instead of mutating the local replica. Normal prompt, steer, and follow-up share the collab protocol's host-side steer path. A guest-routing failure uses `code: "not_guest"`, `"read_only"`, or `"link_unavailable"` so clients need not match error text. Remote host dialog requests reuse `extension_ui_request`.
+After `join_collab_session` makes the RPC session a guest, `prompt`, `steer`, `follow_up`, `abort`, and `abort_and_prompt` are routed to the authoritative host instead of mutating the local replica. Normal prompt, steer, and follow-up share the collab protocol's host-side steer path. The guest mirror reports `"current"` when relayed input joins an active remote run and `"future"` when the host is idle, so SDK reservations follow server-owned state. Session-changing entrypoints (`new_session`, `switch_session`, `branch`, `fork`, `branch_btw`, active-session deletion, plan approval with `strategy: "execute"`, and loops with `action: "reset"`) fail with `code: "operation_failed"` and instruct the client to call `leave_collab_session`; deleting a non-active session remains allowed. A guest-routing failure uses `code: "not_guest"`, `"read_only"`, or `"link_unavailable"` so clients need not match error text. Remote host dialog requests are relayed as `extension_ui_request` and answered with `extension_ui_response`; dialog cancellation is also relayed.
 
 ## Response Schema
 
@@ -481,9 +486,9 @@ All command results use `RpcResponse`:
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
 
-### `prompt` payload
+### Prompt scheduling payloads
 
-`prompt` is acknowledged after the command is accepted, not after a model turn finishes:
+`prompt` and `abort_and_prompt` are acknowledged after the command is accepted, not after a model turn finishes:
 
 ```json
 {
@@ -491,19 +496,23 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
   "type": "response",
   "command": "prompt",
   "success": true,
-  "data": { "agentInvoked": false }
+  "data": { "agentInvoked": false, "lifecycleDisposition": "none" }
 }
 ```
 
-`data.agentInvoked: false` is a completion signal for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the prompt produced agent lifecycle events; those events can be emitted before or after the prompt response depending on the command path. Older runtimes may omit `data`; hosts should then rely on `agent_end`, custom message completion, or `prompt_result`.
+`data.agentInvoked: false` with `"none"` is an immediate outcome for local-only prompts, including slash commands that produce output without starting an agent turn. `data.agentInvoked: true` means the agent-facing input path handled the prompt; `"current"` and `"future"` identify the run reservation it owns. Older runtimes may omit `data`; current runtimes always follow every successful `prompt` and `abort_and_prompt` with one correlated terminal outcome.
 
-`prompt_result` is emitted when a prompt was accepted immediately but later resolves as local-only:
+`prompt_result` carries that outcome:
 
 ```json
-{ "type": "prompt_result", "id": "req_1", "agentInvoked": false }
+[
+  { "type": "prompt_result", "id": "req_1", "agentInvoked": false, "lifecycleDisposition": "none" },
+  { "type": "prompt_result", "id": "req_2", "agentInvoked": true, "lifecycleDisposition": "current" },
+  { "type": "prompt_result", "id": "req_3", "agentInvoked": true, "lifecycleDisposition": "future" }
+]
 ```
 
-Local-only slash commands may emit `command_output` frames before completing via `data.agentInvoked: false` or a later `prompt_result`. They do not emit `agent_end`.
+Local-only slash commands may emit `command_output` frames before their `prompt_result`; they do not emit `agent_end`. An extension-injected send is included in the correlated result only after its task settles. A guest steer or follow-up can join an active host run (`"current"`), while a queued prompt owns a later run (`"future"`).
 
 ### `get_state` payload
 
@@ -931,9 +940,14 @@ This is the most important operational behavior.
 
 That means:
 
-- command acceptance != run completion
-- agent turns complete via `agent_end`
-- local-only prompts complete via `data.agentInvoked: false` on the response or via a later `prompt_result`
+- command acceptance != prompt outcome or run completion
+- every successfully acknowledged `prompt` and `abort_and_prompt` produces one same-id `prompt_result`; a scheduling failure instead produces one same-id error response
+- `prompt_result.agentInvoked: true` means handled input, not necessarily a new lifecycle
+- `prompt_result.lifecycleDisposition` is `"none"` for no run, `"current"` for work merged into the active run, and `"future"` for a queued or newly starting run
+- local agent runs are tracked independently through `agent_start` and `agent_end`
+- `agent_end.isTerminal: false` marks an intermediate settle whose continuation is already scheduled; only an absent/true `isTerminal` completes the logical run
+- `RpcClient.waitForIdle()` returns immediately when no run is active or reserved, and otherwise spans queued follow-up gaps and non-terminal settles
+- `RpcClient.promptAndWait()` requires the ready-frame `prompt_result` capability, observes the correlated terminal outcome, and waits for the run selected by its lifecycle disposition. Local-only outcomes return with no reserved run; extension-injected work cannot return before its tracked send task schedules/completes a run or fails.
 
 ### While streaming
 
@@ -942,7 +956,7 @@ That means:
 - `"steer"` => queued steering message (interrupt path)
 - `"followUp"` => queued follow-up message (post-turn path)
 
-If omitted during streaming, prompt fails.
+If omitted during streaming, prompt fails. The TypeScript helpers accept the same value as the final optional argument to `prompt()`, `promptWithResult()`, and `promptAndWait()`; using `"followUp"` lets the correlated waiter span the active-run/queued-run gap.
 
 ### Background vs ordered dispatch
 
@@ -957,7 +971,6 @@ Most commands are processed in stdin order through one serialized queue. Operati
 - `approve_plan_proposal`
 - `reject_plan_proposal`
 - `begin_guided_goal`
-- `answer_guided_goal`
 - `prompt_agent`
 - `generate_ttsr_rule`
 - `start_live`
@@ -977,7 +990,7 @@ Most commands are processed in stdin order through one serialized queue. Operati
 - `mcp_search_registry`
 - `mcp_deploy_registry_result`
 
-Responses from those commands can interleave with later ordered responses; clients MUST correlate by `id`. This lets `abort`, `abort_retry`, `cancel_guided_goal`, `cancel_btw`, `abort_bash`, `abort_python`, and `kill_agent` run while their target operation is pending, and lets voice, STT, collaboration, and MCP control commands overtake the corresponding network startup. `extension_ui_response`, host-tool updates/results, and host-URI results bypass the ordered queue as control frames.
+Responses from those commands can interleave with later ordered responses; clients MUST correlate by `id`. This lets `abort`, `abort_retry`, `cancel_btw`, `abort_bash`, `abort_python`, and `kill_agent` run while their target operation is pending, and lets voice, STT, collaboration, and MCP control commands overtake the corresponding network startup. `extension_ui_response`, host-tool updates/results, and host-URI results bypass the ordered queue as control frames.
 
 ### Queue defaults
 
@@ -1274,4 +1287,13 @@ stdin:
 
 The client spawns `bun <cliPath> --mode rpc`, negotiates protocol v2, correlates responses by generated `req_<n>` ids, exposes `onSessionEvent`/`onEvent` plus the frame-specific listeners named above, and handles registered host-tool calls through `setCustomTools()`. Provider observations require both `subscribeProviderRequestObservations()` and `onProviderRequestObservation()`; extension dialog cancellation uses `onExtensionUiCancel()`.
 
-Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error`, which has no dedicated listener method; `prompt_result` uses `onPromptResult()`.
+Typed helpers cover every command group. Host URI support uses `setHostUriSchemes()` plus `registerHostUriHandler()`, which handles request, result, cancellation, and abort signaling internally. Raw stdout handling is required only for `extension_error`, which has no dedicated listener method. For `prompt`, subscribe to both `onPromptResult()` and `onPromptError()` before calling `promptWithResult()` when every terminal outcome is required. For `abort_and_prompt`, `abortAndPromptWithResult()` returns `{ requestId }` and `onPromptError()` publishes a typed same-id `{ command: "abort_and_prompt", success: false, error, code? }` at most once.
+
+`bash()` and `python()` are the exception to the client's 30-second request deadline because server-side execution can legitimately run longer. They wait indefinitely by default; pass `timeoutMs` in the helper options to set a client-side response deadline in milliseconds:
+
+```ts
+await client.bash("make release", { timeoutMs: 120_000 });
+await client.python("train_model()", { timeoutMs: 120_000 });
+```
+
+`timeoutMs` controls only how long the TypeScript client waits. It is not serialized into the RPC command and does not limit server-side execution. Other request helpers keep the 30-second default.

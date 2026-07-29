@@ -16,6 +16,8 @@ ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
+PromptLifecycleDisposition: TypeAlias = Literal["none", "current", "future"]
+RpcCapability: TypeAlias = Literal["prompt_result", "prompt_lifecycle_disposition"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
@@ -28,6 +30,7 @@ ExtensionUiMethod: TypeAlias = Literal[
     "select",
     "confirm",
     "input",
+    "askDialog",
     "editor",
     "cancel",
     "notify",
@@ -39,7 +42,7 @@ ExtensionUiMethod: TypeAlias = Literal[
     "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal[
-    "select", "confirm", "input", "editor"
+    "select", "confirm", "input", "askDialog", "editor"
 ]
 PassiveExtensionUiMethod: TypeAlias = Literal[
     "notify",
@@ -64,7 +67,7 @@ PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = froze
     }
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = (
-    frozenset({"select", "confirm", "input", "editor"})
+    frozenset({"select", "confirm", "input", "askDialog", "editor"})
 )
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset(
     {"select", "input", "editor"}
@@ -75,6 +78,9 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_PROMPT_LIFECYCLE_DISPOSITION_VALUES: Final[frozenset[str]] = frozenset(
+    {"none", "current", "future"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -91,6 +97,7 @@ _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
         "confirm",
         "input",
         "editor",
+        "askDialog",
         "cancel",
         "notify",
         "setStatus",
@@ -808,6 +815,7 @@ class BashResult:
     output_bytes: int
     artifact_id: str | None = None
 
+
 @dataclass(slots=True, frozen=True)
 class PythonResult:
     output: str
@@ -889,6 +897,7 @@ class SessionStats:
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
+    capabilities: tuple[RpcCapability, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
     type: Literal["ready"] = "ready"
@@ -902,9 +911,99 @@ class MessagesPage:
 
 
 @dataclass(slots=True, frozen=True)
+class ExtensionAskDialogOption:
+    label: str
+    description: str | None = None
+    preview: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ExtensionAskDialogQuestion:
+    id: str
+    question: str
+    options: tuple[ExtensionAskDialogOption, ...]
+    header: str | None = None
+    multi: bool | None = None
+    recommended: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ExtensionAskDialogResultItem:
+    id: str
+    question: str
+    options: tuple[str, ...]
+    multi: bool
+    selected_options: tuple[str, ...]
+    custom_input: str | None = None
+    note: str | None = None
+    timed_out: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ExtensionAskDialogChatResult:
+    kind: Literal["chat"] = field(default="chat", init=False)
+
+
+@dataclass(slots=True, frozen=True)
+class ExtensionAskDialogSubmitResult:
+    results: tuple[ExtensionAskDialogResultItem, ...]
+    kind: Literal["submit"] = field(default="submit", init=False)
+
+
+ExtensionAskDialogResult: TypeAlias = (
+    ExtensionAskDialogChatResult | ExtensionAskDialogSubmitResult
+)
+
+
+def _serialize_extension_ask_dialog_result(
+    result: ExtensionAskDialogResult,
+) -> JsonObject:
+    if isinstance(result, ExtensionAskDialogChatResult):
+        return {"kind": "chat"}
+    if not isinstance(result, ExtensionAskDialogSubmitResult):
+        raise ValueError("ask dialog result must be a chat or submit result")
+
+    results: list[JsonValue] = []
+    for index, item in enumerate(result.results):
+        field_name = f"ask dialog result.results[{index}]"
+        if not isinstance(item, ExtensionAskDialogResultItem):
+            raise ValueError(f"{field_name} must be an ExtensionAskDialogResultItem")
+        if not isinstance(item.id, str) or not isinstance(item.question, str):
+            raise ValueError(f"{field_name} id and question must be strings")
+        if not all(isinstance(option, str) for option in item.options):
+            raise ValueError(f"{field_name}.options must contain only strings")
+        if not isinstance(item.multi, bool):
+            raise ValueError(f"{field_name}.multi must be a boolean")
+        if not all(isinstance(option, str) for option in item.selected_options):
+            raise ValueError(f"{field_name}.selected_options must contain only strings")
+        if item.custom_input is not None and not isinstance(item.custom_input, str):
+            raise ValueError(f"{field_name}.custom_input must be a string or None")
+        if item.note is not None and not isinstance(item.note, str):
+            raise ValueError(f"{field_name}.note must be a string or None")
+        if item.timed_out is not None and not isinstance(item.timed_out, bool):
+            raise ValueError(f"{field_name}.timed_out must be a boolean or None")
+        results.append(
+            {
+                "id": item.id,
+                "question": item.question,
+                "options": list(item.options),
+                "multi": item.multi,
+                "selectedOptions": list(item.selected_options),
+                "customInput": item.custom_input,
+                "note": item.note,
+                "timedOut": item.timed_out,
+            }
+        )
+    return {"kind": "submit", "results": results}
+
+
+@dataclass(slots=True, frozen=True)
 class ExtensionUiRequest:
     id: str
     method: ExtensionUiMethod
+    questions: tuple[ExtensionAskDialogQuestion, ...] | None = field(
+        default=None, kw_only=True
+    )
     title: str | None = None
     options: tuple[str, ...] | None = None
     message: str | None = None
@@ -956,6 +1055,7 @@ class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
+    is_terminal: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -994,6 +1094,7 @@ class ContextMessageAddedEvent:
     message: AgentMessage
     display: bool
     type: Literal["context_message_added"] = "context_message_added"
+
 
 @dataclass(slots=True, frozen=True)
 class ToolExecutionStartEvent:
@@ -1120,6 +1221,14 @@ class TtsrGenerationEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class PromptResultEvent:
+    agent_invoked: bool
+    id: str | None = None
+    lifecycle_disposition: PromptLifecycleDisposition | None = None
+    type: Literal["prompt_result"] = "prompt_result"
+
+
+@dataclass(slots=True, frozen=True)
 class SettingsUpdateEvent:
     path: str
     value: JsonValue
@@ -1173,6 +1282,7 @@ class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
 
+
 @dataclass(slots=True, frozen=True)
 class ProviderRequestObservationEvent:
     stage: Literal["context", "before_provider_request"]
@@ -1223,6 +1333,7 @@ RpcNotification: TypeAlias = (
     | BtwOutputEvent
     | IdleRecapEvent
     | TtsrGenerationEvent
+    | PromptResultEvent
     | SettingsUpdateEvent
     | RawSseUpdateEvent
     | McpAuthChallengeEvent
@@ -1616,17 +1727,64 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     )
 
 
+def _parse_extension_ask_dialog_questions(
+    value: object,
+) -> tuple[ExtensionAskDialogQuestion, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("extension_ui_request.questions must be a list")
+
+    questions: list[ExtensionAskDialogQuestion] = []
+    for question_index, raw_question in enumerate(value):
+        question_field = f"extension_ui_request.questions[{question_index}]"
+        question = _clone_json_object(raw_question, field=question_field)
+        raw_options = question.get("options")
+        if not isinstance(raw_options, list):
+            raise ValueError(f"{question_field}.options must be a list")
+
+        options: list[ExtensionAskDialogOption] = []
+        for option_index, raw_option in enumerate(raw_options):
+            option_field = f"{question_field}.options[{option_index}]"
+            option = _clone_json_object(raw_option, field=option_field)
+            options.append(
+                ExtensionAskDialogOption(
+                    label=_require_str(option, "label"),
+                    description=_optional_str(option, "description"),
+                    preview=_optional_str(option, "preview"),
+                )
+            )
+
+        questions.append(
+            ExtensionAskDialogQuestion(
+                id=_require_str(question, "id"),
+                question=_require_str(question, "question"),
+                options=tuple(options),
+                header=_optional_str(question, "header"),
+                multi=_optional_bool(question, "multi"),
+                recommended=_optional_int(question, "recommended"),
+            )
+        )
+    return tuple(questions)
+
+
 def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
+    method = cast(
+        ExtensionUiMethod,
+        _require_literal(
+            payload.get("method"),
+            _EXTENSION_UI_METHOD_VALUES,
+            field="extension_ui_request.method",
+        ),
+    )
+    questions = _parse_extension_ask_dialog_questions(payload.get("questions"))
+    if method == "askDialog" and questions is None:
+        raise ValueError("extension_ui_request.questions must be a list")
+
     return ExtensionUiRequest(
         id=_require_str(payload, "id"),
-        method=cast(
-            ExtensionUiMethod,
-            _require_literal(
-                payload.get("method"),
-                _EXTENSION_UI_METHOD_VALUES,
-                field="extension_ui_request.method",
-            ),
-        ),
+        method=method,
+        questions=questions,
         title=_optional_str(payload, "title"),
         options=_tuple_of_strings(
             payload.get("options"), field="extension_ui_request.options"
@@ -1686,9 +1844,25 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities: tuple[RpcCapability, ...] | None = None
+        if raw_capabilities is not None:
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(capability, str) for capability in raw_capabilities
+            ):
+                raise ValueError("ready.capabilities must contain strings")
+            capabilities = cast(
+                tuple[RpcCapability, ...],
+                tuple(
+                    capability
+                    for capability in raw_capabilities
+                    if capability in {"prompt_result", "prompt_lifecycle_disposition"}
+                ),
+            )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
+            capabilities=capabilities,
             max_frame_bytes=_optional_int(payload, "maxFrameBytes"),
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
@@ -1730,14 +1904,34 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ),
             id=_optional_str(payload, "id"),
         )
+    if event_type == "prompt_result":
+        agent_invoked = _optional_bool(payload, "agentInvoked")
+        if agent_invoked is None:
+            raise ValueError("prompt_result.agentInvoked must be a boolean")
+        return PromptResultEvent(
+            agent_invoked=agent_invoked,
+            id=_optional_str(payload, "id"),
+            lifecycle_disposition=cast(
+                PromptLifecycleDisposition | None,
+                _optional_literal(
+                    payload.get("lifecycleDisposition"),
+                    _PROMPT_LIFECYCLE_DISPOSITION_VALUES,
+                    field="prompt_result.lifecycleDisposition",
+                ),
+            ),
+        )
     if event_type == "settings_update":
         return SettingsUpdateEvent(
             path=_require_str(payload, "path"),
-            value=_clone_json_value(payload.get("value"), field="settings_update.value"),
+            value=_clone_json_value(
+                payload.get("value"), field="settings_update.value"
+            ),
         )
     if event_type == "raw_sse_update":
         return RawSseUpdateEvent(
-            snapshot=_clone_json_object(payload.get("snapshot"), field="raw_sse_update.snapshot")
+            snapshot=_clone_json_object(
+                payload.get("snapshot"), field="raw_sse_update.snapshot"
+            )
         )
     if event_type == "mcp_auth_challenge":
         return McpAuthChallengeEvent(
@@ -1757,13 +1951,16 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
         request_id = _optional_int(payload, "requestId")
         if request_id is None:
-            raise ValueError("provider_request_observation.requestId must be an integer")
+            raise ValueError(
+                "provider_request_observation.requestId must be an integer"
+            )
         if stage == "context":
             return ProviderRequestObservationEvent(
                 stage=cast(Literal["context"], stage),
                 request_id=request_id,
                 messages=_clone_json_value(
-                    payload.get("messages"), field="provider_request_observation.messages"
+                    payload.get("messages"),
+                    field="provider_request_observation.messages",
                 ),
                 serialization_error=_optional_str(payload, "serializationError"),
             )
@@ -1807,6 +2004,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 cast(JsonValue | None, payload.get("messages"))
             ),
             message_count=_optional_int(payload, "messageCount"),
+            is_terminal=_optional_bool(payload, "isTerminal"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()

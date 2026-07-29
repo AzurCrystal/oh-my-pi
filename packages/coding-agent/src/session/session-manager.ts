@@ -346,7 +346,7 @@ export type ReadonlySessionManager = Pick<
 	| "putBlobSync"
 >;
 
-interface SessionManagerStateSnapshot {
+export interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
 	sessionId: string;
@@ -357,6 +357,7 @@ interface SessionManagerStateSnapshot {
 	hasTitleSlot: boolean;
 	onDisk: boolean;
 	needsRewrite: boolean;
+	leafId: string | null;
 	draftOnlySessionCleanupArmed: boolean;
 	header: SessionHeader;
 	entries: SessionEntry[];
@@ -1137,6 +1138,7 @@ export class SessionManager {
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
+			leafId: this.#index.leafId(),
 			// Snapshot header + entries by reference: switch/reload replaces the
 			// active header/array wholesale, so rollback needs no deep clone.
 			header: this.#header,
@@ -1177,6 +1179,7 @@ export class SessionManager {
 		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		this.#index.setLeaf(snapshot.leafId);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
@@ -2231,6 +2234,7 @@ export class SessionManager {
 
 		this.#sessionFile = newSessionFile;
 		this.#rewriteSynchronously();
+		if (this.#diskFailure) throw this.#diskFailure;
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		return newSessionFile;
 	}

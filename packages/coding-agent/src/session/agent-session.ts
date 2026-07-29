@@ -89,6 +89,7 @@ import {
 	isInteractiveHost,
 	isRecord,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	Snowflake,
@@ -225,6 +226,11 @@ import type {
 	SessionHandoffOptions,
 	SessionOAuthAccountList,
 	SessionStats,
+	SessionTransitionCoordinator,
+	SessionTransitionLease,
+	SessionTransitionOptions,
+	SessionTransitionOutcome,
+	SessionTransitionRunOptions,
 	UsageFallbackConfirmation,
 } from "./agent-session-types";
 import {
@@ -306,7 +312,7 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
+import { cleanupEmptyMoveSession, type SessionManager, type SessionManagerStateSnapshot } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -647,16 +653,12 @@ export class AgentSession {
 	 *  queue was consumed normally or a new turn already started. */
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
-		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
-		// dispose) call #disconnectFromAgent() BEFORE `await abort()`, so abort's own
-		// finally lands here with no listener attached. Auto-resuming now would snapshot
-		// the still-old context (the transition hasn't reached agent.reset() yet), start a
-		// stale provider turn that races the reset, and — once reconnected — append its
-		// output to the fresh session (issue #5800). A disconnected session never owns the
-		// queue: the transition does. newSession/switchSession drop the queue (reset /
-		// clearAllQueues), so nothing survives; compaction preserves it and re-drains itself
-		// after #reconnectToAgent (see compact()'s finally); an explicit prompt flushes it
-		// in every case.
+		// Session transitions call #disconnectFromAgent() BEFORE `await abort()`, so
+		// abort's own finally lands here with no listener attached. Auto-resuming
+		// then would race the transition and could append old-context output to the
+		// destination session (issue #5800). Successful new/switch transitions drop
+		// their queues; rollback paths that restore queues explicitly re-drain only
+		// after reconnecting. Compaction likewise re-drains after reconnecting.
 		if (this.#unsubscribeAgent === undefined) return;
 		// A concern steered into a resumed streaming run after a user interrupt can
 		// strand at the turn tail (steered past the loop's final boundary poll). While
@@ -672,6 +674,26 @@ export class AgentSession {
 		}
 		this.#scheduleQueuedMessageDrain();
 		this.#resumeStrandedIrcAsides();
+	}
+	/** Resume queues restored by a failed transition. Hidden next-turn context
+	 *  starts one replacement turn first; its prompt consumes that context and
+	 *  the normal settle drain handles any remaining steer/follow-up. The aborted
+	 *  provider turn stays ended — this only makes the restored session runnable. */
+	#drainRestoredQueuedMessages(): void {
+		if (this.#unsubscribeAgent === undefined) return;
+		if (this.#pendingNextTurnMessages.length > 0) {
+			this.#scheduleHiddenNextTurnMessageDrain();
+			return;
+		}
+		// A follow-up was waiting for the now-cancelled turn to finish. With that
+		// turn restored at a user-message tail, Agent.continue() cannot start from
+		// the follow-up queue alone; promote it to the steering queue so it becomes
+		// the replacement turn's valid user tail without copying or duplicating it.
+		const followUp = this.agent.peekFollowUpQueue();
+		if (this.agent.peekSteeringQueue().length === 0 && followUp.length > 0) {
+			this.agent.replaceQueues([...followUp], []);
+		}
+		this.#drainStrandedQueuedMessages();
 	}
 
 	/** IRC records that arrive after the loop's final aside poll — or while an abort skipped that
@@ -1537,6 +1559,33 @@ export class AgentSession {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	#sessionTransitionCoordinator: SessionTransitionCoordinator | undefined;
+
+	/** Installs the active frontend's single commit/reconcile boundary. */
+	setSessionTransitionCoordinator(coordinator: SessionTransitionCoordinator | null): void {
+		this.#sessionTransitionCoordinator = coordinator ?? undefined;
+	}
+
+	/** Runs a transition through the active frontend, or directly when none owns reconciliation. */
+	async runSessionTransition<T>(
+		transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+		options?: SessionTransitionRunOptions,
+	): Promise<T> {
+		const coordinator = this.#sessionTransitionCoordinator;
+		if (coordinator) return coordinator.run(transition, options);
+		return (await transition({})).result;
+	}
+
+	/** Reserves the active transition boundary across asynchronous protocol setup. */
+	acquireSessionTransition(): SessionTransitionLease {
+		const coordinator = this.#sessionTransitionCoordinator;
+		if (coordinator) return coordinator.acquire();
+		return {
+			run: async transition => (await transition({})).result,
+			release: () => {},
+		};
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -4171,9 +4220,9 @@ export class AgentSession {
 	}
 
 	/** Register post-prompt work in tests without driving a full agent turn. */
-	trackPostPromptTaskForTests(task: Promise<unknown>): void {
+	trackPostPromptTaskForTests(task: Promise<unknown> | ((signal: AbortSignal) => Promise<unknown>)): void {
 		if (!isBunTestRuntime()) throw new Error("trackPostPromptTaskForTests is test-only");
-		this.#trackPostPromptTask(task);
+		this.#trackPostPromptTask(typeof task === "function" ? task(this.#postPromptTasksAbortController.signal) : task);
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -5438,7 +5487,11 @@ export class AgentSession {
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
 		this.#pendingNextTurnMessages.push(message);
-		if (!triggerTurn) return;
+		if (triggerTurn) this.#scheduleHiddenNextTurnMessageDrain();
+	}
+
+	#scheduleHiddenNextTurnMessageDrain(): void {
+		if (this.#pendingNextTurnMessages.length === 0) return;
 		const generation = this.#promptGeneration;
 		if (this.#scheduledHiddenNextTurnGeneration === generation) {
 			return;
@@ -6005,8 +6058,8 @@ export class AgentSession {
 	 * @param options - Optional initial messages and parent session path
 	 * @returns true if completed, false if cancelled by hook
 	 */
-	async newSession(options?: NewSessionOptions): Promise<boolean> {
-		this.#assertVibeSessionTransitionAllowed("start a new session");
+	async newSession(options?: NewSessionOptions & SessionTransitionOptions): Promise<boolean> {
+		const { beforeCommit, onCommitted, ...newSessionOptions } = options ?? {};
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -6021,42 +6074,108 @@ export class AgentSession {
 			}
 		}
 
-		this.#disconnectFromAgent();
-		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
+		// Complete fallible persistence work before aborting or clearing anything
+		// owned by the outgoing session.
 		await this.#bash.flushPending();
-		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
+		await this.sessionManager.flush();
+
+		await beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("start a new session");
+
+		const previousSessionState = this.sessionManager.captureState();
+		const previousAgentMessages = [...this.agent.state.messages];
+		const previousSteeringMessages = [...this.agent.peekSteeringQueue()];
+		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
+		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 		let sessionTransitioned = false;
-		try {
-			this.agent.reset();
-			if (options?.drop && previousSessionFile) {
-				// Detach the advisor recorder feed and drain its writer BEFORE deleting the
-				// old artifacts dir: `await this.abort()` only stops the primary, so a still-
-				// running advisor turn could otherwise finish, emit `message_end`, and recreate
-				// `<old>/__advisor.jsonl`. #resetAdvisorSessionState (after newSession) re-primes
-				// the advisor and re-attaches the feed at the new session's path.
-				await this.#advisors.detachAndCloseRecorders();
+
+		const activateCommittedSession = (): void => {
+			try {
 				try {
-					await this.sessionManager.dropSession(previousSessionFile);
-				} catch (err) {
-					logger.error("Failed to delete session during /drop", { err });
+					this.#cancelOwnAsyncJobs();
+					this.#closeAllProviderSessions("new session");
+				} finally {
+					this.agent.reset();
+				}
+			} finally {
+				// A committed transcript must never remain detached, including when
+				// reset or an earlier synchronous cleanup step throws.
+				this.#reconnectToAgent();
+			}
+		};
+
+		this.#disconnectFromAgent();
+		try {
+			await this.abort();
+			const bashTransition = this.#bash.beginSessionTransition({
+				persistDetached: newSessionOptions.drop !== true,
+			});
+			try {
+				await this.sessionManager.newSession({
+					...newSessionOptions,
+					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
+				});
+				sessionTransitioned = true;
+				onCommitted?.();
+				this.#bash.markSessionTransition(bashTransition);
+				// The new session owns the transcript from here, so the previous
+				// conversation's advisor spend is retired with it. Clearing at the commit
+				// point keeps the status line honest even if a later step below throws.
+				this.#advisors.clearCost();
+			} finally {
+				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			}
+		} catch (error) {
+			if (!sessionTransitioned) {
+				try {
+					this.sessionManager.restoreState(previousSessionState);
+				} finally {
+					try {
+						this.agent.replaceMessages(previousAgentMessages);
+						this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
+						this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
+						this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+					} finally {
+						this.#reconnectToAgent();
+						this.#drainRestoredQueuedMessages();
+					}
 				}
 			} else {
-				await this.sessionManager.flush();
+				try {
+					activateCommittedSession();
+				} catch (activationError) {
+					logger.warn("Failed to activate committed session after new-session error", {
+						error: String(activationError),
+					});
+				}
+				try {
+					this.#syncAgentSessionId();
+					this.#memory.rekeyForCurrentSessionId();
+				} catch (syncError) {
+					logger.warn("Failed to synchronize committed session after new-session error", {
+						error: String(syncError),
+					});
+				}
 			}
-			await this.sessionManager.newSession({
-				...options,
-				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
-			});
-			this.#bash.markSessionTransition(bashTransition);
-			// The new session owns the transcript from here, so the previous
-			// conversation's advisor spend is retired with it. Clearing at the commit
-			// point keeps the status line honest even if a later step below throws.
-			this.#advisors.clearCost();
-			sessionTransitioned = true;
+			throw error;
+		}
+
+		try {
+			activateCommittedSession();
 		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			this.#syncAgentSessionId();
+			this.#memory.rekeyForCurrentSessionId();
+		}
+
+		if (newSessionOptions.drop && previousSessionFile) {
+			// Stop the old recorder before deleting its transcript and artifacts.
+			await this.#advisors.detachAndCloseRecorders();
+			try {
+				await this.sessionManager.dropSession(previousSessionFile);
+			} catch (err) {
+				logger.error("Failed to delete session during /drop", { err });
+			}
 		}
 
 		this.#clearSessionScopedToolState();
@@ -6064,8 +6183,6 @@ export class AgentSession {
 		this.setTodoPhases([]);
 		this.#freshProviderSessionId = undefined;
 		this.#clearInheritedProviderPromptCacheKey();
-		this.#syncAgentSessionId();
-		this.#memory.rekeyForCurrentSessionId();
 		await this.#memory.resetContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -6077,7 +6194,6 @@ export class AgentSession {
 		this.#planReferenceSent = false;
 		this.#planReferencePath = "local://PLAN.md";
 		this.#advisors.resetSessionState();
-		this.#reconnectToAgent();
 		// The workspace-roots block must reflect the new session's directory set,
 		// not the previous session's — refresh before the next turn goes out.
 		await this.refreshBaseSystemPrompt();
@@ -6108,8 +6224,7 @@ export class AgentSession {
 	 * Unlike newSession(), this preserves all messages in the agent state.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
-		this.#assertVibeSessionTransitionAllowed("fork the session");
+	async fork(options?: SessionTransitionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
@@ -6125,15 +6240,20 @@ export class AgentSession {
 		}
 
 		await this.#bash.flushPending();
-		// Flush current session to ensure all entries are written
+		// Flush current session to ensure all entries are written before reversible
+		// runtime preparation or the session manager changes identity.
 		await this.sessionManager.flush();
+		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const bashTransition = this.#bash.beginSessionTransition();
 
 		// Fork the session (creates new session file with same entries)
+		const previousSessionState = this.sessionManager.captureState();
 		let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 		try {
 			forkResult = await this.sessionManager.fork();
 		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
 			this.#bash.finishSessionTransition(bashTransition, false);
 			throw error;
 		}
@@ -6141,8 +6261,18 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			return false;
 		}
-		this.#bash.markSessionTransition(bashTransition);
-		this.#bash.finishSessionTransition(bashTransition, true);
+		try {
+			options?.onCommitted?.();
+			this.#bash.markSessionTransition(bashTransition);
+		} finally {
+			try {
+				this.#bash.finishSessionTransition(bashTransition, true);
+			} finally {
+				// A fork changes transcript ownership only after SessionManager commits.
+				// Failed or cancelled forks must leave the source session's jobs deliverable.
+				this.#cancelOwnAsyncJobs();
+			}
+		}
 
 		// Copy artifacts directory if it exists
 		const oldArtifactDir = forkResult.oldSessionFile.slice(0, -6);
@@ -6350,8 +6480,19 @@ export class AgentSession {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		return this.#handoff.handoff(customInstructions, options);
+	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		return this.runSessionTransition(async transitionOptions => {
+			let committed = false;
+			const onCommitted = transitionOptions.onCommitted;
+			const result = await this.#handoff.handoff(customInstructions, options, {
+				beforeCommit: transitionOptions.beforeCommit,
+				onCommitted: () => {
+					committed = true;
+					onCommitted?.();
+				},
+			});
+			return { result, committed, honorPlanDefault: false };
+		});
 	}
 
 	#isTerminalYieldToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
@@ -7008,13 +7149,13 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(sessionPath: string, options?: SessionTransitionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
-		const switchingToDifferentSession = previousSessionFile
-			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
-			: true;
+		const switchingToDifferentSession =
+			previousSessionFile === undefined ||
+			normalizePathForComparison(previousSessionFile) !== normalizePathForComparison(sessionPath);
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+		if (!options?.bypassBeforeSwitchHook && this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
 				reason: "resume",
@@ -7026,15 +7167,11 @@ export class AgentSession {
 			}
 		}
 
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
-
+		// Flush before disconnecting or aborting so a persistence failure leaves the
+		// outgoing agent and all of its queues untouched.
 		await this.#bash.flushPending();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
 		const previousSessionState = this.sessionManager.captureState();
-		const bashTransition = this.#bash.beginSessionTransition();
 		// Only same-session reloads compare against the prior context to detect
 		// rollback edits (`#didSessionMessagesChange` below). Building it for a
 		// different-session switch is a pure waste — and on huge pre-fix sessions
@@ -7044,14 +7181,19 @@ export class AgentSession {
 		// error-recovery path rebuilds the context on demand from the restored
 		// state instead.
 		const previousSessionContext = switchingToDifferentSession ? undefined : this.buildDisplaySessionContext();
-		// switchSession replaces these arrays wholesale during load/rollback, so retaining
-		// the existing message objects is sufficient and avoids structured-clone failures for
-		// extension/custom metadata that is valid to persist but not cloneable.
+		// Snapshot messages and queues before aborting so a failed switch restores
+		// the exact runnable outgoing agent rather than its interrupted state.
 		const previousAgentMessages = [...this.agent.state.messages];
 		const previousSteeringMessages = [...this.agent.peekSteeringQueue()];
 		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+
+		await options?.beforeCommit?.();
+
+		// Work-mode preparation intentionally restores the base tools/model. Capture
+		// that base so RPC reconciliation can re-enter the recorded outgoing mode
+		// without treating its transient tool set as the next base on rollback.
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -7072,12 +7214,15 @@ export class AgentSession {
 		const previousPendingRewindReport = this.#pendingRewindReport;
 		const previousLastCompletedRewind = this.#lastCompletedRewind;
 		const previousRewoundToolResultIds = new Set(this.#rewoundToolResultIds);
-
-		this.agent.clearAllQueues();
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+		const bashTransition = this.#bash.beginSessionTransition();
 
 		try {
+			this.#disconnectFromAgent();
+			await this.abort({ goalReason: "internal" });
+			await this.#sessionBeforeSwitchReconciler?.();
+			this.agent.clearAllQueues();
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.#bash.markSessionTransition(bashTransition);
 			if (switchingToDifferentSession) {
@@ -7217,7 +7362,6 @@ export class AgentSession {
 			// an earlier clear would be lost work if any step above rolled the switch back.
 			if (switchingToDifferentSession) this.#advisors.clearCost();
 			this.#bash.finishSessionTransition(bashTransition, true);
-			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
@@ -7255,6 +7399,12 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			throw error;
 		}
+		try {
+			options?.onCommitted?.();
+		} finally {
+			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs();
+		}
+		return true;
 	}
 
 	/**
@@ -7267,7 +7417,10 @@ export class AgentSession {
 	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
-	async branch(entryId: string): Promise<{
+	async branch(
+		entryId: string,
+		options?: SessionTransitionOptions,
+	): Promise<{
 		selectedText: string;
 		selectedImages: ImageContent[];
 		cancelled: boolean;
@@ -7297,31 +7450,47 @@ export class AgentSession {
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
 
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-
 		await this.#bash.flushPending();
-		// Flush pending writes before branching
+		// All persistence and background-drain work must finish before pending
+		// input or jobs from the outgoing branch are discarded.
 		await this.sessionManager.flush();
-		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
-
-		let sessionTransitioned = false;
+		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("branch the session");
+		const previousSessionState = this.sessionManager.captureState();
+		const bashTransition = this.#bash.beginSessionTransition();
 		try {
 			if (!selectedEntry.parentId) {
 				await this.sessionManager.newSession({ parentSession: previousSessionFile });
 			} else {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
-			this.#bash.markSessionTransition(bashTransition);
-			this.#advisors.clearCost();
-			sessionTransitioned = true;
-		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			await this.sessionManager.ensureOnDisk();
+			await this.sessionManager.flush();
+		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
+			this.#bash.finishSessionTransition(bashTransition, false);
+			throw error;
 		}
+
+		let onCommittedError: unknown;
+		let onCommittedFailed = false;
+		try {
+			options?.onCommitted?.();
+		} catch (error) {
+			onCommittedError = error;
+			onCommittedFailed = true;
+		}
+		try {
+			this.#bash.markSessionTransition(bashTransition);
+		} finally {
+			this.#bash.finishSessionTransition(bashTransition, true);
+		}
+		this.#advisors.clearCost();
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#cancelOwnAsyncJobs();
+		this.#abortAutolearnCapture();
 		this.#clearSessionScopedToolState();
 		this.#rehydrateCheckpointRewindState();
 		this.#todo.syncFromBranch();
@@ -7348,12 +7517,14 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
+		if (onCommittedFailed) throw onCommittedError;
 		return { selectedText, selectedImages, cancelled: false };
 	}
 
 	async branchFromBtw(
 		question: string,
 		assistantMessage: AssistantMessage,
+		options?: SessionTransitionOptions,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		const previousSessionFile = this.sessionFile;
 		if (!this.sessionManager.getSessionFile()) {
@@ -7386,7 +7557,6 @@ export class AgentSession {
 			}
 		}
 
-		await this.#cancelPostPromptTasks();
 		if (
 			this.isBashRunning ||
 			this.isEvalRunning ||
@@ -7396,59 +7566,119 @@ export class AgentSession {
 		) {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
+		await this.#bash.flushPending();
+		await this.sessionManager.flush();
+		await this.#drainAutolearnCapture();
+		await options?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("branch the session");
+
+		// Build and publish the destination through an independent manager. Until
+		// close succeeds, the live manager, provider stream, queues, and post-prompt
+		// controller still belong to the source and remain fully runnable.
+		const destinationManager = this.sessionManager.cloneCurrentSession();
+		let destinationState: SessionManagerStateSnapshot;
+		try {
+			destinationManager.createBranchedSession(leafId);
+			destinationManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: question }],
+				timestamp: Date.now(),
+			});
+			destinationManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
+			await destinationManager.flush();
+			await destinationManager.close();
+			destinationState = destinationManager.captureState();
+		} catch (error) {
+			await destinationManager.close().catch(() => undefined);
+			throw error;
+		}
+
+		// Durability is the commit boundary. From here onward the destination is
+		// authoritative: failures are remembered, but activation must still finish.
+		const committedErrors: unknown[] = [];
+		const rememberCommittedError = (error: unknown): void => {
+			committedErrors.push(error);
+		};
+		const bashTransitionResult = (() => {
+			try {
+				return { transition: this.#bash.beginSessionTransition() };
+			} catch (error) {
+				rememberCommittedError(error);
+				return {};
+			}
+		})();
 
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
-		if (this.isStreaming) {
-			await this.abort({ goalReason: "internal", reason: "branching /btw" });
-			this.agent.replaceQueues([], []);
+		try {
+			if (this.isStreaming) {
+				await this.abort({ goalReason: "internal", reason: "branching /btw" });
+			} else {
+				await this.#cancelPostPromptTasks();
+			}
+		} catch (error) {
+			rememberCommittedError(error);
 		}
-		await this.#bash.flushPending();
-		await this.sessionManager.flush();
-		const bashTransition = this.#bash.beginSessionTransition();
+		this.agent.replaceQueues([], []);
+
+		this.sessionManager.restoreState(destinationState);
+		try {
+			options?.onCommitted?.();
+		} catch (error) {
+			rememberCommittedError(error);
+		}
+		if (bashTransitionResult.transition) {
+			try {
+				this.#bash.markSessionTransition(bashTransitionResult.transition);
+			} catch (error) {
+				rememberCommittedError(error);
+			}
+			try {
+				this.#bash.finishSessionTransition(bashTransitionResult.transition, true);
+			} catch (error) {
+				rememberCommittedError(error);
+			}
+		}
+
 		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
-		let sessionTransitioned = false;
-		try {
-			this.sessionManager.createBranchedSession(leafId);
-			this.#bash.markSessionTransition(bashTransition);
-			this.#advisors.clearCost();
-			sessionTransitioned = true;
-		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
-		}
-
+		this.#advisors.clearCost();
 		this.#clearSessionScopedToolState();
-
 		this.#rehydrateCheckpointRewindState();
-		this.sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: question }],
-			timestamp: Date.now(),
-		});
-		this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
 		this.#todo.syncFromBranch();
 		this.#freshProviderSessionId = undefined;
 		this.#syncAgentSessionId();
 		this.#memory.rekeyForCurrentSessionId();
-		await this.#memory.resetContextForNewTranscript();
+		try {
+			await this.#memory.resetContextForNewTranscript();
+		} catch (error) {
+			rememberCommittedError(error);
+		}
 
-		const sessionContext = this.buildDisplaySessionContext();
-
+		let sessionContext: SessionContext;
+		try {
+			sessionContext = this.buildDisplaySessionContext();
+		} catch (error) {
+			rememberCommittedError(error);
+			sessionContext = destinationManager.buildSessionContext();
+		}
 		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_branch",
-				previousSessionFile,
-			});
+			try {
+				await this.#extensionRunner.emit({
+					type: "session_branch",
+					previousSessionFile,
+				});
+			} catch (error) {
+				rememberCommittedError(error);
+			}
 		}
 
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#advisors.resetSessionState();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
+		if (committedErrors.length > 0) throw committedErrors[0];
 		return { cancelled: false, sessionFile: this.sessionFile };
 	}
 
@@ -7491,6 +7721,7 @@ export class AgentSession {
 			 */
 			reanswerAskResult?: AgentToolResult<AskToolDetails>;
 		} = {},
+		transitionOptions?: SessionTransitionOptions,
 	): Promise<{
 		editorText?: string;
 		/** Image attachments of the target user message, parallel to the positional `[Image #N]` markers in {@link editorText}. */
@@ -7672,6 +7903,7 @@ export class AgentSession {
 		// new sibling answer — the trigger for resuming the agent afterwards so the
 		// model consumes it, mirroring a live `ask` completion (issue #6483).
 		let isAskReanswerCompletion = false;
+		let askReanswerMessage: ToolResultMessage | undefined;
 
 		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 			// User message: leaf = parent (null if root), text goes to editor
@@ -7700,7 +7932,7 @@ export class AgentSession {
 			// off the same `ask` toolCall instead of reusing `targetId` — the
 			// original answer's branch stays reachable (issue #5642).
 			const reanswer = options.reanswerAskResult;
-			const toolResultMessage: ToolResultMessage = {
+			askReanswerMessage = {
 				role: "toolResult",
 				toolCallId: targetEntry.message.toolCallId,
 				toolName: "ask",
@@ -7709,7 +7941,7 @@ export class AgentSession {
 				isError: reanswer.isError === true,
 				timestamp: Date.now(),
 			};
-			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
+			newLeafId = targetEntry.parentId;
 			isAskReanswerCompletion = true;
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
@@ -7721,10 +7953,15 @@ export class AgentSession {
 
 		// Switch leaf (with or without summary)
 		// Summary is attached at the navigation target position (newLeafId), not the old branch
+		await transitionOptions?.beforeCommit?.();
+		this.#assertVibeSessionTransitionAllowed("navigate session history");
+		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#bash.beginSessionTransition();
 		let summaryEntry: BranchSummaryEntry | undefined;
-		let branchTransitioned = false;
-		try {
+		const applyNavigation = (): void => {
+			if (askReanswerMessage) {
+				newLeafId = this.sessionManager.appendMessageToBranch(askReanswerMessage, newLeafId);
+			}
 			if (summaryText) {
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
@@ -7739,10 +7976,32 @@ export class AgentSession {
 			} else {
 				this.sessionManager.branch(newLeafId);
 			}
+		};
+		try {
+			if (askReanswerMessage || summaryText) {
+				await this.sessionManager.appendEntriesAtomically(applyNavigation);
+			} else {
+				applyNavigation();
+			}
+		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
+			this.#branchSummaryAbortController = undefined;
+			this.#bash.finishSessionTransition(bashTransition, false);
+			throw error;
+		}
+
+		let onCommittedError: unknown;
+		let onCommittedFailed = false;
+		try {
+			transitionOptions?.onCommitted?.();
+		} catch (error) {
+			onCommittedError = error;
+			onCommittedFailed = true;
+		}
+		try {
 			this.#bash.markSessionTransition(bashTransition);
-			branchTransitioned = true;
 		} finally {
-			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
+			this.#bash.finishSessionTransition(bashTransition, true);
 		}
 
 		// Update agent state — build display context to populate agent messages.
@@ -7755,6 +8014,7 @@ export class AgentSession {
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;
+		if (onCommittedFailed) throw onCommittedError;
 
 		// Report a committed `ask` re-answer so the interactive caller can resume
 		// the agent via `resumeAfterAskReanswer()` *after* rebuilding its

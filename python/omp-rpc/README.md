@@ -187,16 +187,44 @@ full replacement content.
 ## Extension UI Requests
 
 Extensions in RPC mode can ask the host for input. Those requests are available as
-typed `ExtensionUiRequest` instances:
+typed `ExtensionUiRequest` instances. Rich `askDialog` questions and options are
+immutable dataclasses, so a host can inspect them before responding:
 
 ```python
+from omp_rpc import ExtensionAskDialogResultItem, ExtensionAskDialogSubmitResult
+
 request = client.next_ui_request(timeout=5.0)
 
-if request.method == "confirm":
+if request.method == "askDialog":
+    assert request.questions is not None
+    for question in request.questions:
+        print(question.header or question.id, question.question)
+        print([option.label for option in question.options])
+
+    question = request.questions[0]
+    client.send_ui_ask_dialog_result(
+        request.id,
+        ExtensionAskDialogSubmitResult(
+            results=(
+                ExtensionAskDialogResultItem(
+                    id=question.id,
+                    question=question.question,
+                    options=tuple(option.label for option in question.options),
+                    multi=question.multi or False,
+                    selected_options=(question.options[0].label,),
+                ),
+            )
+        ),
+    )
+elif request.method == "confirm":
     client.send_ui_confirmation(request.id, True)
 elif request.method in {"input", "editor"}:
     client.send_ui_value(request.id, "approved")
 ```
+
+Use `client.cancel_ui_request(request.id)` instead when the host cannot answer an
+interactive request. An ask dialog can also return
+`ExtensionAskDialogChatResult()` when the user chooses to continue in chat.
 
 For non-interactive scripts, you can install a default headless policy instead of
 handling every request manually:
@@ -209,8 +237,79 @@ with RpcClient(model="anthropic/claude-sonnet-4-5") as client:
 ```
 
 That helper ignores passive UI notifications (`notify`, `setStatus`, `setWidget`,
-`setTitle`, `set_editor_text`), answers `confirm` with `False`, and cancels
-`select`/`input`/`editor` requests unless you provide explicit values.
+`setTitle`, `set_editor_text`), answers `confirm` with `False`, always cancels
+`askDialog`, and cancels `select`/`input`/`editor` requests unless you provide
+explicit values.
+
+## Prompt Outcomes
+
+`prompt()` keeps its fire-and-forget API. Use `prompt_with_result()` when the
+server acknowledgement and the correlated terminal outcome are both useful:
+
+```python
+acknowledgement = client.prompt_with_result("Run /custom-command")
+print(acknowledgement.request_id, acknowledgement.agent_invoked)
+```
+
+`agent_invoked` is `True` when the agent-facing input path accepted the prompt,
+`False` when it completed locally, and `None` while the outcome is still
+resolving. Every successfully acknowledged `prompt` or `abort_and_prompt` then
+emits one same-id `PromptResultEvent`; a late scheduling failure instead raises
+one correlated `RpcCommandError`. `lifecycle_disposition` is `"none"` when no
+run was scheduled, `"current"` when work joined the active run, and `"future"`
+when the input owns a queued or newly starting run. `prompt_and_wait()` uses
+that server-owned disposition, so a guest follow-up relayed as host steering
+waits on the active run without reserving a nonexistent future run, and an
+extension-injected send cannot return before its tracked scheduling task
+completes or fails.
+
+`prompt_and_wait()` requires the runtime to advertise the additive
+`prompt_result` capability in its ready frame. Against an older runtime that
+omits it, the helper raises `RpcCommandError(code="capability_unavailable")`
+immediately with an upgrade message instead of hanging. `prompt()`,
+`prompt_with_result()`, and unrelated client APIs remain compatible; only the
+high-level correlated waiter requires the capability.
+
+`follow_up()` normally reserves a distinct future run before writing the
+request. A successful acknowledgement keeps that reservation across the
+previous run's `agent_end` / next `agent_start` gap; an immediate rejection
+rolls it back. When the response reports `"current"`, the client merges the
+request into the active reservation instead. `wait_for_idle()` therefore spans
+the correct run without waiting for a future lifecycle that will never start.
+`agent_end.isTerminal: false` is exposed as `AgentEndEvent.is_terminal is
+False` and does not complete the reservation; the final absent/true value does.
+
+## Long-Running Bash and Python Requests
+
+The execution helpers wait indefinitely for their response by default:
+
+```python
+bash_result = client.bash("make release")
+python_result = client.python("train_model()")
+```
+
+Set `response_timeout` to an optional client-side deadline in seconds:
+
+```python
+bash_result = client.bash("make release", response_timeout=120.0)
+python_result = client.python("train_model()", response_timeout=120.0)
+```
+
+The public signatures are:
+
+```python
+client.bash(
+    command,
+    *,
+    exclude_from_context=None,
+    use_user_shell=None,
+    follow_cwd=None,
+    response_timeout=None,
+)
+client.python(code, *, exclude_from_context=None, response_timeout=None)
+```
+
+`response_timeout` is local to the Python client and is never serialized into the RPC command, so it does not stop server-side execution. The client's `request_timeout` still applies to all other request methods.
 
 ## Error Handling and Retained History
 
@@ -219,12 +318,22 @@ allows:
 
 - id-less `parse` and unknown-command failures are correlated back to the
   waiting request when they can be matched unambiguously
-- late `prompt` / `abort_and_prompt` scheduling failures cause
-  `prompt_and_wait()` and `wait_for_idle()` to raise instead of timing out
-- unmatched background error responses are exposed through
+- correlated late `prompt` / `abort_and_prompt` scheduling failures are treated
+  as command failures, not additional protocol errors
+- `prompt_and_wait()` or `wait_for_idle()` raises the correlated
+  `RpcCommandError` once; a later idle observation neither re-raises nor hangs
+- genuinely unmatched background error responses are exposed through
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed
   through `client.listener_errors` and `client.on_listener_error(...)`
+- timed-out request ids and already-reported prompt-error ids use separate insertion-ordered tombstone windows capped at 1,024 entries; retained late duplicates stay suppressed without lifetime growth
+
+User callbacks run on one ordered dispatcher generation after reader-side
+bookkeeping. Normal `stop()` drains that generation before joining it.
+Unexpected EOF or invalid JSON cancels callbacks that have not started, while a
+callback already running may finish. Reentrant `stop()` does not self-join, and
+the client rejects restart until that dispatcher generation exits. Listener
+exceptions retain the same `listener_errors` policy.
 
 For long-lived hosts, retained event and stderr history is bounded by default:
 

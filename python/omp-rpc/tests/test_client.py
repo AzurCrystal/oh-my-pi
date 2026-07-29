@@ -13,8 +13,25 @@ import time
 from pathlib import Path
 import unittest
 
-from omp_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
-from omp_rpc.client import _RpcFrameDecoder
+from omp_rpc import (
+    ExtensionAskDialogResultItem,
+    ExtensionAskDialogSubmitResult,
+    PromptResultEvent,
+    PromptTurn,
+    RpcClient,
+    RpcCommandError,
+    RpcConcurrencyError,
+    RpcProcessExitError,
+    RpcTimeoutError,
+    RpcError,
+    host_tool,
+)
+from omp_rpc.client import (
+    _BoundedTombstones,
+    _RPC_TOMBSTONE_LIMIT,
+    _RpcFrameDecoder,
+)
+from omp_rpc.protocol import JsonObject
 
 
 FAKE_SERVER = textwrap.dedent(
@@ -97,9 +114,19 @@ FAKE_SERVER = textwrap.dedent(
         delay: float = 0.0,
         include_extra_events: bool = False,
         compact_terminal: bool = False,
+        prompt_request_id: str | None = None,
     ):
         global last_assistant_text, messages
         print(json.dumps({"type": "agent_start"}), flush=True)
+        if prompt_request_id is not None:
+            print(
+                json.dumps({
+                    "type": "prompt_result",
+                    "id": prompt_request_id,
+                    "agentInvoked": True,
+                }),
+                flush=True,
+            )
         print(json.dumps({"type": "turn_start"}), flush=True)
         partial = assistant_message("")
         print(json.dumps({"type": "message_start", "message": partial}), flush=True)
@@ -236,7 +263,7 @@ FAKE_SERVER = textwrap.dedent(
             payload["error"] = error
         print(json.dumps(payload), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     todo_phases = []
     messages = []
     branch_messages = [{"entryId": "entry-1", "text": "branch message"}]
@@ -261,7 +288,10 @@ FAKE_SERVER = textwrap.dedent(
         request_id = command.get("id")
 
         if command_type == "extension_ui_response":
-            emit_prompt_turn("ui acknowledged")
+            if command.get("id") in {"ui-ask-1", "ui-ask-2"}:
+                emit_prompt_turn(json.dumps(command, sort_keys=True))
+            else:
+                emit_prompt_turn("ui acknowledged")
             continue
 
         if command_type == "get_state":
@@ -381,7 +411,11 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"steer", "follow_up", "abort"}:
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
-            respond(request_id, command_type, {})
+            respond(
+                request_id,
+                command_type,
+                {"agentInvoked": True},
+            )
             message = command["message"]
             if message == "needs ui":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
@@ -391,6 +425,29 @@ FAKE_SERVER = textwrap.dedent(
                 continue
             if message == "needs cancel":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-3", "method": "editor", "title": "Edit", "placeholder": "value"}), flush=True)
+                continue
+            if message in {"needs ask dialog", "needs headless ask dialog"}:
+                dialog_id = "ui-ask-1" if message == "needs ask dialog" else "ui-ask-2"
+                print(json.dumps({
+                    "type": "extension_ui_request",
+                    "id": dialog_id,
+                    "method": "askDialog",
+                    "questions": [{
+                        "id": "database",
+                        "question": "Which database should we use?",
+                        "header": "Database",
+                        "options": [
+                            {
+                                "label": "Postgres",
+                                "description": "Relational database",
+                                "preview": "CREATE TABLE users (...);",
+                            },
+                            {"label": "SQLite"},
+                        ],
+                        "multi": False,
+                        "recommended": 0,
+                    }],
+                }), flush=True)
                 continue
             if message == "needs host tool":
                 print(json.dumps({"type": "agent_start"}), flush=True)
@@ -445,6 +502,7 @@ FAKE_SERVER = textwrap.dedent(
                 delay=0.3 if message == "slow" else 0.0,
                 include_extra_events=message == "all events",
                 compact_terminal=message == "compacted turn",
+                prompt_request_id=request_id,
             )
         elif command_type == "host_tool_update":
             print(
@@ -522,6 +580,7 @@ V2_MESSAGES_SERVER = textwrap.dedent(
                 "type": "ready",
                 "protocolVersion": 1,
                 "supportedProtocolVersions": [1, 2],
+                "capabilities": ["prompt_result", "prompt_lifecycle_disposition"],
                 "maxFrameBytes": 1024 * 1024,
                 "maxReassembledFrameBytes": 64 * 1024 * 1024,
             }
@@ -634,7 +693,7 @@ IDLESS_ERROR_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -675,7 +734,7 @@ LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -746,7 +805,7 @@ STDERR_SERVER = textwrap.dedent(
     sys.stderr.flush()
     sys.stderr.write("second\\n")
     sys.stderr.flush()
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -804,7 +863,7 @@ ASYNC_FRAMES_SERVER = textwrap.dedent(
             "data": data,
         }), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         request_id = command["id"]
@@ -910,6 +969,326 @@ ASYNC_FRAMES_SERVER = textwrap.dedent(
             respond(request_id, command_type, {})
     """
 )
+PROMPT_RESULTS_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+    import threading
+
+    write_lock = threading.Lock()
+
+    def emit(payload):
+        with write_lock:
+            print(json.dumps(payload), flush=True)
+
+    def emit_later(delay, payload):
+        timer = threading.Timer(delay, emit, args=(payload,))
+        timer.daemon = True
+        timer.start()
+
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command["id"]
+        message = command["message"]
+        if message in {"async-before", "async-true-before", "interleave-agent", "listener-true"}:
+            emit({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": message != "async-before",
+            })
+
+        if message in {"ack", "immediate"}:
+            data = {"agentInvoked": False}
+        elif message in {"immediate-true", "listener-agent-start"}:
+            data = {"agentInvoked": True}
+        else:
+            data = None
+        response = {
+            "id": request_id,
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+        }
+        if data is not None:
+            response["data"] = data
+        emit(response)
+        if message == "immediate-true":
+            emit({"type": "agent_start"})
+
+        if message in {"async-after", "listener-after", "interleave-local"}:
+            emit_later(0.05, {
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": False,
+            })
+        elif message in {"ack", "immediate"}:
+            emit({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": False,
+            })
+        elif message in {"immediate-true", "listener-agent-start", "ordered"}:
+            emit({
+                "type": "prompt_result",
+                "id": request_id,
+                "agentInvoked": True,
+            })
+
+        if message in {
+            "async-true-before",
+            "immediate-true",
+            "interleave-agent",
+            "listener-true",
+            "listener-agent-start",
+            "normal",
+            "ordered",
+        }:
+            if message != "immediate-true":
+                emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            if message == "normal":
+                emit({
+                    "type": "prompt_result",
+                    "id": request_id,
+                    "agentInvoked": True,
+                })
+    """
+)
+
+PROMPT_ACCOUNTING_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    def respond(request_id, data=None):
+        payload = {
+            "id": request_id,
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+        }
+        if data is not None:
+            payload["data"] = data
+        emit(payload)
+
+    def outcome(request_id):
+        emit({
+            "type": "prompt_result",
+            "id": request_id,
+            "agentInvoked": True,
+        })
+
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command["id"]
+        message = command["message"]
+
+        if message == "guest":
+            outcome(request_id)
+            respond(request_id, {"agentInvoked": True})
+        elif message in {"active", "followup-base"}:
+            respond(request_id)
+            emit({"type": "agent_start"})
+            outcome(request_id)
+        elif message == "active-steer":
+            respond(request_id)
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+        elif message == "idle-steer":
+            respond(request_id)
+            emit({"type": "agent_start"})
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+        elif message == "queued-followup":
+            respond(request_id)
+            outcome(request_id)
+            emit({"type": "agent_end", "messages": []})
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+    """
+)
+
+LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    def respond(command, *, success=True, error=None, code=None, data=None):
+        payload = {
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": success,
+        }
+        if error is not None:
+            payload["error"] = error
+        if code is not None:
+            payload["code"] = code
+        if data is not None:
+            payload["data"] = data
+        emit(payload)
+
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    pending_extension_id = None
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+
+        if command_type == "prompt":
+            if command["message"] == "extension-delayed":
+                pending_extension_id = command["id"]
+                respond(command)
+            elif command["message"] == "extension-prestart-error":
+                respond(command)
+                emit({
+                    "id": command["id"],
+                    "type": "response",
+                    "command": "prompt",
+                    "success": False,
+                    "error": "Extension task failed before agent start",
+                    "code": "prompt_scheduling_failed",
+                })
+            else:
+                respond(command)
+                emit({"type": "agent_start"})
+                emit({
+                    "type": "prompt_result",
+                    "id": command["id"],
+                    "agentInvoked": True,
+                    "lifecycleDisposition": "future",
+                })
+        elif command_type == "follow_up":
+            if command["message"] == "reject":
+                respond(
+                    command,
+                    success=False,
+                    error="follow-up rejected",
+                    code="follow_up_rejected",
+                )
+            elif command["message"] == "guest-current":
+                respond(
+                    command,
+                    data={
+                        "agentInvoked": True,
+                        "lifecycleDisposition": "current",
+                    },
+                )
+            else:
+                respond(
+                    command,
+                    data={
+                        "agentInvoked": True,
+                        "lifecycleDisposition": "future",
+                    },
+                )
+        elif command_type == "abort_and_prompt":
+            respond(command)
+            if command["message"] == "local-only":
+                emit({
+                    "type": "prompt_result",
+                    "id": command["id"],
+                    "agentInvoked": False,
+                    "lifecycleDisposition": "none",
+                })
+            else:
+                emit({
+                    "id": command["id"],
+                    "type": "response",
+                    "command": command_type,
+                    "success": False,
+                    "error": "replacement rejected",
+                    "code": "prompt_scheduling_failed",
+                })
+        elif command_type == "release_extension":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            if pending_extension_id is not None:
+                emit({
+                    "type": "prompt_result",
+                    "id": pending_extension_id,
+                    "agentInvoked": True,
+                    "lifecycleDisposition": "future",
+                })
+                pending_extension_id = None
+            respond(command)
+        elif command_type == "finish_active":
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        elif command_type == "finish_follow_up":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        elif command_type == "intermediate_end":
+            emit({"type": "agent_end", "messages": [], "isTerminal": False})
+            respond(command)
+        elif command_type == "finish_continuation":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            respond(command)
+        else:
+            respond(command)
+    """
+)
+
+OLD_RUNTIME_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        print(json.dumps({
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": True,
+            "data": {},
+        }), flush=True)
+    """
+)
+
+DISPATCHER_CONTROL_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+
+        emit({
+            "id": command["id"],
+            "type": "response",
+            "command": command_type,
+            "success": True,
+        })
+        if command_type == "emit_one":
+            emit({"type": "agent_start"})
+        elif command_type == "emit_pair":
+            emit({"type": "agent_start"})
+            emit({"type": "turn_start"})
+        elif command_type == "invalid":
+            emit({"type": "turn_start"})
+            print("{invalid", flush=True)
+        elif command_type == "eof":
+            emit({"type": "turn_start"})
+            break
+    """
+)
+
 
 DELTA_COMMANDS_SERVER = textwrap.dedent(
     """
@@ -917,17 +1296,20 @@ DELTA_COMMANDS_SERVER = textwrap.dedent(
     import sys
 
     published_text = None
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         if command["type"] == "publish_editor_text":
             published_text = command["text"]
+        data = {"received": command, "publishedText": published_text}
+        if command["type"] == "begin_guided_goal":
+            data["queued"] = False
         print(json.dumps({
             "id": command["id"],
             "type": "response",
             "command": command["type"],
             "success": True,
-            "data": {"received": command, "publishedText": published_text},
+            "data": data,
         }), flush=True)
     """
 )
@@ -937,7 +1319,7 @@ NULLABLE_RESPONSE_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         data = (
@@ -959,6 +1341,73 @@ NULLABLE_RESPONSE_SERVER = textwrap.dedent(
     """
 )
 
+EXECUTION_TIMEOUT_SERVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    control_dir = Path(os.environ["OMP_RPC_TEST_CONTROL_DIR"])
+    counts = {"bash": 0, "python": 0}
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        request_id = command["id"]
+        if command_type in counts:
+            counts[command_type] += 1
+            sequence = counts[command_type]
+            prefix = control_dir / f"{command_type}-{sequence}"
+            prefix.with_suffix(".json").write_text(json.dumps(command), encoding="utf-8")
+            while not prefix.with_suffix(".release").exists():
+                time.sleep(0.001)
+            if sequence == 2:
+                emit({
+                    "id": request_id,
+                    "type": "response",
+                    "command": command_type,
+                    "success": False,
+                    "error": "late execution failure",
+                })
+            else:
+                data = {
+                    "output": f"{command_type} complete\\n",
+                    "exitCode": 0,
+                    "cancelled": False,
+                    "truncated": False,
+                    "totalLines": 1,
+                    "totalBytes": 16,
+                    "outputLines": 1,
+                    "outputBytes": 16,
+                }
+                if command_type == "python":
+                    data["displayOutputs"] = []
+                    data["stdinRequested"] = False
+                emit({
+                    "id": request_id,
+                    "type": "response",
+                    "command": command_type,
+                    "success": True,
+                    "data": data,
+                })
+        else:
+            emit({
+                "id": request_id,
+                "type": "response",
+                "command": command_type,
+                "success": True,
+                "data": {"ok": True},
+            })
+    """
+)
+
+
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
         return RpcClient(
@@ -978,6 +1427,7 @@ class RpcClientTests(unittest.TestCase):
         }
         encoded_empty = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         frame["data"]["payload"] = "x" * (1024 * 1024 - len(encoded_empty))
+
         encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         self.assertEqual(len(encoded), 1024 * 1024)
 
@@ -999,6 +1449,87 @@ class RpcClientTests(unittest.TestCase):
             )
 
         self.assertEqual(decoded, frame)
+
+    def test_bounded_tombstones_evict_only_the_oldest_ids(self) -> None:
+        tombstones = _BoundedTombstones(_RPC_TOMBSTONE_LIMIT)
+        for index in range(_RPC_TOMBSTONE_LIMIT + 1):
+            tombstones.add(f"request-{index}")
+
+        self.assertEqual(len(tombstones), _RPC_TOMBSTONE_LIMIT)
+        self.assertNotIn("request-0", tombstones)
+        self.assertIn(f"request-{_RPC_TOMBSTONE_LIMIT}", tombstones)
+
+    def test_bash_and_python_response_timeouts_are_opt_in_and_out_of_band(
+        self,
+    ) -> None:
+        for command_type in ("bash", "python"):
+            with self.subTest(command_type=command_type):
+                with tempfile.TemporaryDirectory() as control_dir:
+                    client = RpcClient(
+                        command=[sys.executable, "-u", "-c", EXECUTION_TIMEOUT_SERVER],
+                        env={"OMP_RPC_TEST_CONTROL_DIR": control_dir},
+                        startup_timeout=2.0,
+                        request_timeout=0.01,
+                    )
+                    client.start()
+                    errors: list[BaseException] = []
+
+                    def execute_default() -> None:
+                        try:
+                            if command_type == "bash":
+                                client.bash("long command")
+                            else:
+                                client.python("long_call()")
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    def wait_for(path: Path) -> None:
+                        deadline = time.monotonic() + 2.0
+                        while not path.exists():
+                            if time.monotonic() >= deadline:
+                                self.fail(f"Timed out waiting for {path}")
+                            time.sleep(0.001)
+
+                    try:
+                        default_thread = threading.Thread(target=execute_default)
+                        default_thread.start()
+                        first_prefix = Path(control_dir) / f"{command_type}-1"
+                        first_payload_path = first_prefix.with_suffix(".json")
+                        wait_for(first_payload_path)
+                        first_payload = json.loads(
+                            first_payload_path.read_text(encoding="utf-8")
+                        )
+                        self.assertNotIn("response_timeout", first_payload)
+                        self.assertNotIn("client_response_timeout", first_payload)
+                        self.assertNotIn("_client_response_timeout", first_payload)
+                        time.sleep(0.05)
+                        self.assertTrue(default_thread.is_alive())
+                        first_prefix.with_suffix(".release").touch()
+                        default_thread.join(timeout=2.0)
+                        self.assertFalse(default_thread.is_alive())
+                        self.assertEqual(errors, [])
+
+                        with self.assertRaises(RpcTimeoutError):
+                            if command_type == "bash":
+                                client.bash("timed command", response_timeout=0.01)
+                            else:
+                                client.python("timed_call()", response_timeout=0.01)
+
+                        second_prefix = Path(control_dir) / f"{command_type}-2"
+                        second_payload_path = second_prefix.with_suffix(".json")
+                        wait_for(second_payload_path)
+                        second_payload = json.loads(
+                            second_payload_path.read_text(encoding="utf-8")
+                        )
+                        self.assertNotIn("response_timeout", second_payload)
+                        self.assertNotIn("client_response_timeout", second_payload)
+                        self.assertNotIn("_client_response_timeout", second_payload)
+                        second_prefix.with_suffix(".release").touch()
+
+                        self.assertEqual(client.request_raw("control"), {"ok": True})
+                        self.assertEqual(client.protocol_errors, ())
+                    finally:
+                        client.stop()
 
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
@@ -1077,20 +1608,14 @@ class RpcClientTests(unittest.TestCase):
             client.on_btw_output(lambda event: seen["btw"].append(event))
             client.on_idle_recap(lambda event: seen["idle"].append(event))
             client.on_raw_sse_update(lambda event: seen["sse"].append(event))
-            client.on_mcp_auth_challenge(
-                lambda event: seen["challenge"].append(event)
-            )
+            client.on_mcp_auth_challenge(lambda event: seen["challenge"].append(event))
             client.on_ttsr_generation_event(lambda event: seen["ttsr"].append(event))
             client.on_voice_event(lambda event: seen["voice"].append(event))
             client.on_available_commands_update(
                 lambda event: seen["commands"].append(event)
             )
-            client.on_subagent_lifecycle(
-                lambda event: seen["lifecycle"].append(event)
-            )
-            client.on_subagent_progress(
-                lambda event: seen["progress"].append(event)
-            )
+            client.on_subagent_lifecycle(lambda event: seen["lifecycle"].append(event))
+            client.on_subagent_progress(lambda event: seen["progress"].append(event))
             client.on_subagent_event(lambda event: seen["subagent"].append(event))
             client.on_extension_ui_cancel(lambda event: seen["ui_cancel"].append(event))
             client.on_provider_request_observation(
@@ -1122,10 +1647,14 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(seen["progress"][0].payload["progress"], 0.5)
         self.assertEqual(seen["subagent"][0].payload["event"]["type"], "message")
         self.assertTrue(seen["ui_cancel"][0].timed_out)
-        self.assertEqual(seen["provider_observation"][0].messages[0]["content"], "rewritten context")
+        self.assertEqual(
+            seen["provider_observation"][0].messages[0]["content"], "rewritten context"
+        )
         self.assertEqual(seen["provider_observation"][1].payload["model"], "test-model")
         self.assertFalse(seen["context_message"][0].display)
-        self.assertEqual(seen["context_message"][0].message["content"], "injected context")
+        self.assertEqual(
+            seen["context_message"][0].message["content"], "injected context"
+        )
 
     def test_nullable_response_wrappers_preserve_none(self) -> None:
         with self.make_client(server=NULLABLE_RESPONSE_SERVER) as client:
@@ -1204,9 +1733,7 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(approved["received"]["editedContent"], "revised plan")
         self.assertEqual(approved["received"]["strategy"], "keep-context")
-        self.assertEqual(
-            approved["received"]["executionModel"]["modelId"], "gpt-5.6"
-        )
+        self.assertEqual(approved["received"]["executionModel"]["modelId"], "gpt-5.6")
         self.assertEqual(approved["received"]["thinkingLevel"], "high")
         self.assertEqual(
             [
@@ -1295,7 +1822,9 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(role_cleared["received"]["role"], "reviewer")
         self.assertEqual(logout["received"]["credentialId"], 7)
         self.assertEqual(removed_account["received"]["credentialId"], 8)
-        self.assertEqual(removed_provider["received"]["type"], "remove_provider_credentials")
+        self.assertEqual(
+            removed_provider["received"]["type"], "remove_provider_credentials"
+        )
         self.assertEqual(mcp_added["received"]["config"]["command"], "demo-mcp")
         self.assertEqual(mcp_removed["received"]["scope"], "project")
         self.assertTrue(mcp_enabled["received"]["enabled"])
@@ -1304,17 +1833,568 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(mcp_unauthenticated["received"]["name"], "demo")
         self.assertEqual(mcp_reauth_started["received"]["type"], "mcp_begin_reauth")
         self.assertEqual(mcp_reauth_completed["received"]["completion"], "code")
-        self.assertEqual(smithery_started["received"]["type"], "mcp_begin_smithery_login")
+        self.assertEqual(
+            smithery_started["received"]["type"], "mcp_begin_smithery_login"
+        )
         self.assertEqual(smithery_completed["received"]["apiKey"], "key")
         self.assertEqual(smithery_logged_out["received"]["type"], "mcp_logout_smithery")
         self.assertEqual(registry["received"]["semantic"], True)
         self.assertEqual(deployed["received"]["values"]["token"], "secret")
+
+    def test_begin_guided_goal_omits_missing_initial_objective(self) -> None:
+        with self.make_client(server=DELTA_COMMANDS_SERVER) as client:
+            without_objective = client.begin_guided_goal()
+            with_objective = client.begin_guided_goal("Ship the release")
+
+        self.assertIs(without_objective["queued"], False)
+        self.assertEqual(without_objective["received"]["type"], "begin_guided_goal")
+        self.assertNotIn("initialObjective", without_objective["received"])
+        self.assertEqual(
+            with_objective["received"]["initialObjective"], "Ship the release"
+        )
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:
             turn = client.prompt_and_wait("say hello", timeout=2.0)
             self.assertEqual(turn.require_assistant_text(), "pong")
             self.assertGreaterEqual(len(turn.events), 3)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_prompt_and_wait_requires_negotiated_prompt_result_capability(
+        self,
+    ) -> None:
+        with self.make_client(server=OLD_RUNTIME_SERVER) as client:
+            self.assertEqual(client.request_raw("legacy_probe"), {})
+            client.prompt("legacy fire-and-forget")
+            client.wait_for_idle(timeout=0.5)
+            with self.assertRaisesRegex(
+                RpcCommandError,
+                "prompt_result.*upgrade the RPC runtime",
+            ) as raised:
+                client.prompt_and_wait("unsupported", timeout=0.1)
+
+            self.assertEqual(raised.exception.code, "capability_unavailable")
+
+    def test_extension_prompt_waits_for_correlated_task_and_surfaces_prestart_error(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            turns: list[PromptTurn] = []
+            failures: list[BaseException] = []
+            finished = threading.Event()
+
+            def wait_for_extension() -> None:
+                try:
+                    turns.append(
+                        client.prompt_and_wait("extension-delayed", timeout=2.0)
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    finished.set()
+
+            waiter = threading.Thread(target=wait_for_extension)
+            waiter.start()
+            deadline = time.monotonic() + 2.0
+            with client._event_condition:
+                while not any(
+                    outcome.acknowledged
+                    for outcome in client._pending_prompt_outcomes.values()
+                ):
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0)
+                    client._event_condition.wait(remaining)
+
+            self.assertFalse(finished.is_set())
+            client.request_raw("release_extension")
+            self.assertTrue(finished.wait(2.0))
+            waiter.join()
+            self.assertEqual(failures, [])
+            self.assertEqual(
+                [event.type for event in turns[0].events],
+                ["agent_start", "agent_end"],
+            )
+
+            with self.assertRaises(RpcCommandError) as raised:
+                client.prompt_and_wait("extension-prestart-error", timeout=2.0)
+            self.assertEqual(raised.exception.code, "prompt_scheduling_failed")
+            client.wait_for_idle(timeout=0.5)
+
+    def test_local_abort_and_guest_current_dispositions_do_not_strand_idle(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.abort_and_prompt("local-only")
+            client.wait_for_idle(timeout=0.5)
+
+            client.prompt_with_result("active")
+            client.follow_up("guest-current")
+            client.request_raw("finish_active")
+            client.wait_for_idle(timeout=0.5)
+
+    def test_plain_prompt_cleans_outcome_after_normal_agent_lifecycle(self) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            client.prompt("normal")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_immediate_local_prompt_returns_empty_turn_and_stays_idle(self) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            acknowledgement = client.prompt_with_result("ack")
+            self.assertEqual(acknowledgement.request_id, "req_1")
+            self.assertIs(acknowledgement.agent_invoked, False)
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+            started = time.monotonic()
+            turn = client.prompt_and_wait("immediate", timeout=0.5)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(turn.events, ())
+            self.assertEqual(turn.messages, ())
+            self.assertIsNone(turn.assistant_message)
+            self.assertIsNone(turn.assistant_text)
+            client.wait_for_idle(timeout=0.5)
+
+            acknowledgement = client.prompt_with_result("immediate-true")
+            self.assertIs(acknowledgement.agent_invoked, True)
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+            turn = client.prompt_and_wait("immediate-true", timeout=0.5)
+            self.assertEqual(
+                [event.type for event in turn.events],
+                ["agent_start", "agent_end"],
+            )
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_async_local_prompt_result_is_correlated_across_frame_orderings(
+        self,
+    ) -> None:
+        notifications: list[PromptResultEvent] = []
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            client.on_notification(
+                lambda event: (
+                    notifications.append(event)
+                    if isinstance(event, PromptResultEvent)
+                    else None
+                )
+            )
+
+            started = time.monotonic()
+            turn = client.prompt_and_wait("async-before", timeout=0.5)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(turn.events, ())
+            self.assertIsNone(turn.assistant_text)
+            client.wait_for_idle(timeout=0.5)
+
+            acknowledgement = client.prompt_with_result("async-after")
+            self.assertEqual(acknowledgement.request_id, "req_2")
+            self.assertIsNone(acknowledgement.agent_invoked)
+            client.wait_for_idle(timeout=0.5)
+
+            turn = client.prompt_and_wait("normal", timeout=0.5)
+            self.assertEqual(
+                [event.type for event in turn.events],
+                ["agent_start", "agent_end"],
+            )
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+        self.assertEqual(
+            notifications,
+            [
+                PromptResultEvent(id="req_1", agent_invoked=False),
+                PromptResultEvent(id="req_2", agent_invoked=False),
+                PromptResultEvent(id="req_3", agent_invoked=True),
+            ],
+        )
+
+    def test_interleaved_prompt_results_keep_request_correlation(self) -> None:
+        outcomes: dict[str, bool] = {}
+        outcomes_received = threading.Event()
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
+            def capture_outcome(event: object) -> None:
+                if not isinstance(event, PromptResultEvent) or event.id is None:
+                    return
+                outcomes[event.id] = event.agent_invoked
+                if outcomes.keys() >= {"req_1", "req_2"}:
+                    outcomes_received.set()
+
+            client.on_notification(capture_outcome)
+            local = client.prompt_with_result("interleave-local")
+            invoked = client.prompt_with_result("interleave-agent")
+
+            self.assertIsNone(local.agent_invoked)
+            self.assertIs(invoked.agent_invoked, True)
+            self.assertTrue(outcomes_received.wait(1.0))
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(outcomes, {"req_1": False, "req_2": True})
+            self.assertEqual(client._pending_prompt_outcomes, {})
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_notification_before_response_is_returned_by_acknowledgement(
+        self,
+    ) -> None:
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+            local = client.prompt_with_result("async-before")
+            invoked = client.prompt_with_result("async-true-before")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertIs(local.agent_invoked, False)
+            self.assertIs(invoked.agent_invoked, True)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_prompt_result_listener_observes_idle_after_bookkeeping(self) -> None:
+        listener_finished = threading.Event()
+        listener_errors: list[BaseException] = []
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
+            def wait_for_idle(event: object) -> None:
+                if not isinstance(event, PromptResultEvent):
+                    return
+                try:
+                    client.wait_for_idle(timeout=0.2)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    listener_finished.set()
+
+            client.on_notification(wait_for_idle)
+            acknowledgement = client.prompt_with_result("listener-after")
+            self.assertIsNone(acknowledgement.agent_invoked)
+            self.assertTrue(listener_finished.wait(1.0))
+            self.assertEqual(listener_errors, [])
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_blocking_prompt_and_agent_start_listeners_do_not_block_reader(
+        self,
+    ) -> None:
+        prompt_listener_finished = threading.Event()
+        start_listener_finished = threading.Event()
+        listener_errors: list[BaseException] = []
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
+            def wait_from_prompt_result(event: object) -> None:
+                if not isinstance(event, PromptResultEvent) or not event.agent_invoked:
+                    return
+                try:
+                    client.wait_for_idle(timeout=0.5)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    prompt_listener_finished.set()
+
+            def wait_from_agent_start(_event: object) -> None:
+                try:
+                    client.wait_for_idle(timeout=0.5)
+                except BaseException as exc:
+                    listener_errors.append(exc)
+                finally:
+                    start_listener_finished.set()
+
+            client.on_notification(wait_from_prompt_result)
+            client.prompt_with_result("listener-true")
+            self.assertTrue(prompt_listener_finished.wait(1.0))
+
+            client.on_agent_start(wait_from_agent_start)
+            client.prompt_with_result("listener-agent-start")
+            self.assertTrue(start_listener_finished.wait(1.0))
+            self.assertEqual(listener_errors, [])
+
+    def test_listener_callbacks_preserve_wire_order(self) -> None:
+        observed: list[str] = []
+        finished = threading.Event()
+
+        with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
+
+            def record(event: object) -> None:
+                event_type = getattr(event, "type", None)
+                if event_type not in {"prompt_result", "agent_start", "agent_end"}:
+                    return
+                observed.append(event_type)
+                if event_type == "agent_end":
+                    finished.set()
+
+            client.on_notification(record)
+            client.prompt_with_result("ordered")
+            self.assertTrue(finished.wait(1.0))
+
+        self.assertEqual(observed, ["prompt_result", "agent_start", "agent_end"])
+
+    def test_active_steer_shares_the_wire_lifecycle_reservation(self) -> None:
+        start_listener_entered = threading.Event()
+        release_start_listener = threading.Event()
+
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+
+            def block_agent_start(_event: object) -> None:
+                start_listener_entered.set()
+                release_start_listener.wait(1.0)
+
+            client.on_agent_start(block_agent_start)
+            try:
+                client.prompt_with_result("active")
+                client.prompt_with_result("active-steer", streaming_behavior="steer")
+                self.assertTrue(start_listener_entered.wait(1.0))
+                client.wait_for_idle(timeout=0.5)
+                self.assertEqual(client._scheduled_agent_runs, 1)
+                self.assertEqual(client._completed_agent_runs, 1)
+                self.assertEqual(client._pending_prompt_outcomes, {})
+            finally:
+                release_start_listener.set()
+
+    def test_guest_prompt_true_finishes_without_an_agent_lifecycle(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            turn = client.prompt_and_wait("guest", timeout=0.5)
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(turn.events, ())
+            self.assertEqual(client._pending_prompt_outcomes, {})
+            self.assertEqual(client._scheduled_agent_runs, 1)
+            self.assertEqual(client._completed_agent_runs, 1)
+
+    def test_idle_steer_opens_one_lifecycle_reservation(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            client.prompt_with_result("idle-steer", streaming_behavior="steer")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._scheduled_agent_runs, 1)
+            self.assertEqual(client._completed_agent_runs, 1)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_followup_keeps_a_separate_lifecycle_reservation(self) -> None:
+        with self.make_client(server=PROMPT_ACCOUNTING_SERVER) as client:
+            client.prompt_with_result("followup-base")
+            client.prompt_with_result("queued-followup", streaming_behavior="followUp")
+            client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(client._scheduled_agent_runs, 2)
+            self.assertEqual(client._completed_agent_runs, 2)
+            self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_follow_up_reservation_spans_the_previous_run_gap(self) -> None:
+        first_end = threading.Event()
+        wait_started = threading.Event()
+        wait_finished = threading.Event()
+        wait_errors: list[BaseException] = []
+
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.on_agent_end(lambda _event: first_end.set())
+            client.prompt_with_result("active")
+            client.follow_up("queued")
+
+            def wait_for_both_runs() -> None:
+                wait_started.set()
+                try:
+                    client.wait_for_idle(timeout=1.0)
+                except BaseException as exc:
+                    wait_errors.append(exc)
+                finally:
+                    wait_finished.set()
+
+            waiter = threading.Thread(target=wait_for_both_runs)
+            waiter.start()
+            self.assertTrue(wait_started.wait(1.0))
+
+            client.request_raw("finish_active")
+            self.assertTrue(first_end.wait(1.0))
+            self.assertFalse(wait_finished.is_set())
+
+            client.request_raw("finish_follow_up")
+            self.assertTrue(wait_finished.wait(1.0))
+            waiter.join(1.0)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(wait_errors, [])
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_immediate_follow_up_rejection_rolls_back_its_reservation(self) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            with self.assertRaises(RpcCommandError) as ctx:
+                client.follow_up("reject")
+
+            self.assertEqual(ctx.exception.command, "follow_up")
+            self.assertEqual(ctx.exception.code, "follow_up_rejected")
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_non_terminal_agent_end_keeps_the_run_reserved(self) -> None:
+        intermediate_seen = threading.Event()
+        wait_started = threading.Event()
+        wait_finished = threading.Event()
+        wait_errors: list[BaseException] = []
+        terminal_states: list[bool | None] = []
+
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+
+            def capture_end(event: object) -> None:
+                terminal_states.append(getattr(event, "is_terminal", None))
+                if terminal_states[-1] is False:
+                    intermediate_seen.set()
+
+            client.on_agent_end(capture_end)
+            client.prompt_with_result("active")
+
+            def wait_for_terminal_end() -> None:
+                wait_started.set()
+                try:
+                    client.wait_for_idle(timeout=1.0)
+                except BaseException as exc:
+                    wait_errors.append(exc)
+                finally:
+                    wait_finished.set()
+
+            waiter = threading.Thread(target=wait_for_terminal_end)
+            waiter.start()
+            self.assertTrue(wait_started.wait(1.0))
+
+            client.request_raw("intermediate_end")
+            self.assertTrue(intermediate_seen.wait(1.0))
+            self.assertFalse(wait_finished.is_set())
+
+            client.request_raw("finish_continuation")
+            self.assertTrue(wait_finished.wait(1.0))
+            waiter.join(1.0)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(wait_errors, [])
+            self.assertEqual(terminal_states, [False, None])
+
+    def test_late_abort_and_prompt_failure_is_raised_once_without_protocol_noise(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.abort_and_prompt("replacement")
+
+            with self.assertRaises(RpcCommandError) as ctx:
+                client.wait_for_idle(timeout=0.5)
+
+            self.assertEqual(ctx.exception.command, "abort_and_prompt")
+            self.assertEqual(ctx.exception.error, "replacement rejected")
+            self.assertEqual(ctx.exception.code, "prompt_scheduling_failed")
+            self.assertEqual(client.protocol_errors, ())
+            client.wait_for_idle(timeout=0.5)
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
+
+    def test_unexpected_close_discards_pending_listener_callbacks(self) -> None:
+        for close_command in ("invalid", "eof"):
+            with self.subTest(close_command=close_command):
+                callback_entered = threading.Event()
+                release_callback = threading.Event()
+                observed: list[str] = []
+                client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+                client.start()
+                dispatcher = client._listener_dispatch_thread
+                self.assertIsNotNone(dispatcher)
+                assert dispatcher is not None
+
+                def block_first_callback(event: object) -> None:
+                    event_type = getattr(event, "type", "")
+                    observed.append(event_type)
+                    if event_type == "agent_start":
+                        callback_entered.set()
+                        release_callback.wait(1.0)
+
+                client.on_notification(block_first_callback)
+                try:
+                    client.request_raw("emit_one")
+                    self.assertTrue(callback_entered.wait(1.0))
+                    client.request_raw(close_command)
+                    with self.assertRaises(RpcProcessExitError):
+                        client.wait_for_idle(timeout=0.5)
+                    release_callback.set()
+                    dispatcher.join(1.0)
+                    self.assertFalse(dispatcher.is_alive())
+                    self.assertIsNone(client._listener_dispatch_thread)
+                    self.assertEqual(observed, ["agent_start"])
+                finally:
+                    release_callback.set()
+                    client.stop()
+
+    def test_normal_stop_drains_listener_callbacks_before_join(self) -> None:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        observed: list[str] = []
+        client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+        client.start()
+
+        def block_first_callback(event: object) -> None:
+            event_type = getattr(event, "type", "")
+            observed.append(event_type)
+            if event_type == "agent_start":
+                callback_entered.set()
+                release_callback.wait(1.0)
+
+        client.on_notification(block_first_callback)
+        stop_thread = threading.Thread(target=client.stop)
+        try:
+            client.request_raw("emit_pair")
+            client.request_raw("barrier")
+            self.assertTrue(callback_entered.wait(1.0))
+            stop_thread.start()
+            release_callback.set()
+            stop_thread.join(1.0)
+
+            self.assertFalse(stop_thread.is_alive())
+            self.assertEqual(observed, ["agent_start", "turn_start"])
+            self.assertIsNone(client._listener_dispatch_thread)
+        finally:
+            release_callback.set()
+            if stop_thread.is_alive():
+                stop_thread.join(1.0)
+            client.stop()
+
+    def test_reentrant_stop_blocks_restart_until_dispatcher_exits(self) -> None:
+        callback_finished = threading.Event()
+        restart_errors: list[BaseException] = []
+        client = self.make_client(server=DISPATCHER_CONTROL_SERVER)
+        client.start()
+        first_dispatcher = client._listener_dispatch_thread
+        self.assertIsNotNone(first_dispatcher)
+        assert first_dispatcher is not None
+
+        def stop_and_restart(_event: object) -> None:
+            client.stop()
+            try:
+                client.start()
+            except BaseException as exc:
+                restart_errors.append(exc)
+            finally:
+                callback_finished.set()
+
+        client.on_agent_start(stop_and_restart)
+        try:
+            client.request_raw("emit_one")
+            self.assertTrue(callback_finished.wait(2.0))
+            first_dispatcher.join(1.0)
+            self.assertFalse(first_dispatcher.is_alive())
+            self.assertEqual(len(restart_errors), 1)
+            self.assertIsInstance(restart_errors[0], RpcError)
+
+            client.start()
+            second_dispatcher = client._listener_dispatch_thread
+            self.assertIsNotNone(second_dispatcher)
+            self.assertIsNot(second_dispatcher, first_dispatcher)
+        finally:
+            client.stop()
+
+    def test_stop_joins_listener_dispatcher(self) -> None:
+        client = self.make_client(server=PROMPT_RESULTS_SERVER)
+        client.start()
+        dispatcher = client._listener_dispatch_thread
+        self.assertIsNotNone(dispatcher)
+        assert dispatcher is not None
+        self.assertTrue(dispatcher.is_alive())
+
+        client.stop()
+
+        self.assertFalse(dispatcher.is_alive())
+        self.assertIsNone(client._listener_dispatch_thread)
 
     def test_prompt_and_wait_reconstructs_compacted_terminal_messages(self) -> None:
         with self.make_client() as client:
@@ -1443,6 +2523,70 @@ class RpcClientTests(unittest.TestCase):
             client.prompt_and_wait("needs ui", timeout=2.0)
 
         self.assertEqual(seen_methods, ["input"])
+
+    def test_send_ui_ask_dialog_result_emits_exact_frame(self) -> None:
+        with self.make_client() as client:
+            client.prompt("needs ask dialog")
+            request = client.next_ui_request(timeout=2.0)
+            self.assertEqual(request.method, "askDialog")
+
+            client.send_ui_ask_dialog_result(
+                request.id,
+                ExtensionAskDialogSubmitResult(
+                    results=(
+                        ExtensionAskDialogResultItem(
+                            id="database",
+                            question="Which database should we use?",
+                            options=("Postgres", "SQLite"),
+                            multi=False,
+                            selected_options=("Postgres",),
+                        ),
+                    )
+                ),
+            )
+            client.wait_for_idle(timeout=2.0)
+
+            response_text = client.get_last_assistant_text()
+            assert response_text is not None
+            self.assertEqual(
+                json.loads(response_text),
+                {
+                    "type": "extension_ui_response",
+                    "id": "ui-ask-1",
+                    "result": {
+                        "kind": "submit",
+                        "results": [
+                            {
+                                "id": "database",
+                                "question": "Which database should we use?",
+                                "options": ["Postgres", "SQLite"],
+                                "multi": False,
+                                "selectedOptions": ["Postgres"],
+                                "customInput": None,
+                                "note": None,
+                                "timedOut": None,
+                            }
+                        ],
+                    },
+                },
+            )
+
+    def test_install_headless_ui_cancels_ask_dialog_and_keeps_client_alive(
+        self,
+    ) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui()
+            turn = client.prompt_and_wait("needs headless ask dialog", timeout=2.0)
+
+            self.assertEqual(
+                json.loads(turn.require_assistant_text()),
+                {
+                    "type": "extension_ui_response",
+                    "id": "ui-ask-2",
+                    "cancelled": True,
+                },
+            )
+            self.assertEqual(client.get_state().session_id, "fake-session")
 
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
@@ -1749,9 +2893,40 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.command, "prompt")
         self.assertEqual(ctx.exception.error, "late failure")
-        self.assertEqual(len(protocol_errors), 1)
-        self.assertIn("late failure", protocol_errors[0])
-        self.assertEqual(len(client.protocol_errors), 1)
+        self.assertEqual(protocol_errors, [])
+        self.assertEqual(client.protocol_errors, ())
+        self.assertEqual(client._pending_prompt_outcomes, {})
+        self.assertLessEqual(client._completed_agent_runs, client._scheduled_agent_runs)
+
+    def test_stop_after_prompt_response_raises_process_exit_without_lost_outcome(
+        self,
+    ) -> None:
+        client = self.make_client(server=PROMPT_RESULTS_SERVER)
+        client.start()
+        original_request_payload = client._request_payload
+
+        def request_then_stop(
+            command_type: str,
+            payload: JsonObject,
+            *,
+            request_id: str | None = None,
+        ) -> JsonObject | None:
+            response = original_request_payload(
+                command_type, payload, request_id=request_id
+            )
+            if command_type == "prompt":
+                client.stop()
+            return response
+
+        setattr(client, "_request_payload", request_then_stop)
+        try:
+            with self.assertRaises(RpcProcessExitError):
+                client.prompt_with_result("ack")
+        finally:
+            client.stop()
+
+        self.assertEqual(client._pending_prompt_outcomes, {})
+        self.assertLessEqual(client._completed_agent_runs, client._scheduled_agent_runs)
 
     def test_listener_exceptions_are_reported_without_stopping_client(self) -> None:
         listener_errors: list[tuple[str, str | None, str]] = []
@@ -1811,7 +2986,7 @@ HANGING_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     # Read one line (the prompt) and acknowledge it, then never emit agent_end.
     # The client's prompt_and_wait should sit in _wait_for_agent_end forever
     # unless stop() unblocks it.

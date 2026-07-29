@@ -266,6 +266,72 @@ export interface SessionHandoffOptions {
 	onSwitchCancelled?: () => void;
 }
 
+/** Hooks for cancellable new, switch, handoff, branch, fork, and history transitions. */
+export interface SessionTransitionOptions {
+	/**
+	 * Runs once every cancellation check has passed and before the outgoing
+	 * session is mutated, so a caller can release runtime state the transition
+	 * would otherwise strand. A transition cancelled by a hook never calls it.
+	 *
+	 * Work done here MUST be reversible: the steps that follow can still throw,
+	 * and `switchSession` can roll back entirely, leaving the outgoing session
+	 * live. Teardown that cannot be undone belongs to the caller's own handling of
+	 * the transition's outcome.
+	 */
+	beforeCommit?: () => Promise<void>;
+	/**
+	 * Runs exactly once after the transition can no longer restore the outgoing
+	 * session. It is independent of the operation's return, and throwing from
+	 * this callback does not roll back the committed session or leave it detached.
+	 */
+	onCommitted?: () => void;
+	/**
+	 * Internal rollback escape hatch: skips only the cancellable
+	 * `session_before_switch` hook. Use solely to restore a previously committed
+	 * local snapshot; persistence, reconciliation, and commit hooks still run.
+	 */
+	bypassBeforeSwitchHook?: boolean;
+}
+
+/** Result reported by one commit-aware session or history transition. */
+export interface SessionTransitionOutcome<T> {
+	result: T;
+	/** True once the destination transcript or history leaf is authoritative. */
+	committed: boolean;
+	/** True when a fresh destination may adopt the configured plan default. */
+	honorPlanDefault: boolean;
+}
+
+/** RPC-owned reconciliation policy for one session transition. */
+export interface SessionTransitionRunOptions {
+	/** Applies the plan-on-startup default only after a committed transition. */
+	honorPlanDefaultOnCommit?: boolean;
+	/** Reconciles a logical reload as the still-current session. */
+	preserveCurrentSessionOnSuccess?: boolean;
+	/** Keeps the collaboration relay while still releasing other session attachments. */
+	preserveCollabAttachmentOnCommit?: boolean;
+	/** Restores the loop configuration after its own reset transition. */
+	preserveLoopConfiguration?: boolean;
+}
+
+/** Runs a transition through the active mode's commit/reconcile boundary. */
+export type SessionTransitionRunner = <T>(
+	transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+	options?: SessionTransitionRunOptions,
+) => Promise<T>;
+
+/** Exclusive reservation used by protocols that prepare a transition asynchronously. */
+export interface SessionTransitionLease {
+	run: SessionTransitionRunner;
+	release(): void;
+}
+
+/** One serialized transition boundary installed by the active frontend mode. */
+export interface SessionTransitionCoordinator {
+	run: SessionTransitionRunner;
+	acquire(): SessionTransitionLease;
+}
+
 /** Result from cycleModel(). */
 export interface ModelCycleResult {
 	model: Model;

@@ -9,6 +9,7 @@ import {
 	type LoopLimitConfig,
 	type LoopLimitRuntime,
 } from "../loop-limit";
+import { assertRpcSessionTransitionAllowed } from "./rpc-session-guard";
 
 const LOOP_RESUBMIT_DELAY_MS = 800;
 
@@ -63,14 +64,30 @@ interface RpcLoopRuntime {
 	limit: LoopLimitRuntime | undefined;
 	timer: NodeJS.Timeout | undefined;
 	promptInFlight: boolean;
+	pendingTask: "submit" | "iterate" | undefined;
 }
 
 interface RpcRuntimeControl {
 	loop: RpcLoopRuntime;
+	suspended: boolean;
 	disposed: boolean;
 	ownsPause: boolean;
 	unsubscribeSession: () => void;
 	unsubscribePause: () => void;
+}
+
+export interface RpcLoopConfiguration {
+	action: RpcLoopAction;
+	prompt: string | undefined;
+	limit: LoopLimitRuntime | undefined;
+	promptInFlight: boolean;
+	pendingTask: "submit" | "iterate" | undefined;
+}
+
+/** Reversible runtime-control pause used by the RPC session transition boundary. */
+export interface RpcRuntimeControlSuspension {
+	commit(preserveLoopConfiguration: boolean): RpcLoopConfiguration | undefined;
+	rollback(): void;
 }
 
 const runtimes = new WeakMap<AgentSession, RpcRuntimeControl>();
@@ -83,6 +100,7 @@ function emptyLoopRuntime(): RpcLoopRuntime {
 		limit: undefined,
 		timer: undefined,
 		promptInFlight: false,
+		pendingTask: undefined,
 	};
 }
 
@@ -116,10 +134,10 @@ function isAutoSubmitBlocked(session: AgentSession): boolean {
 	return session.isStreaming || session.isCompacting || session.hasPostPromptWork;
 }
 
-function clearLoopTimer(loop: RpcLoopRuntime): void {
-	if (!loop.timer) return;
+function clearLoopTimer(loop: RpcLoopRuntime, clearPendingTask = true): void {
 	clearTimeout(loop.timer);
 	loop.timer = undefined;
+	if (clearPendingTask) loop.pendingTask = undefined;
 }
 
 function pauseLoop(runtime: RpcRuntimeControl): void {
@@ -144,25 +162,29 @@ function reportLoopFailure(runtime: RpcRuntimeControl, error: unknown): void {
 	logger.error("RPC loop iteration failed", { error: error instanceof Error ? error.message : String(error) });
 }
 
-function scheduleLoopTask(runtime: RpcRuntimeControl, task: () => Promise<void>): void {
+function scheduleLoopTask(session: AgentSession, runtime: RpcRuntimeControl, pendingTask: "submit" | "iterate"): void {
 	const { loop } = runtime;
-	if (runtime.disposed || !loop.enabled || loop.prompt === undefined || loop.timer) return;
+	if (runtime.disposed || runtime.suspended || !loop.enabled || loop.prompt === undefined || loop.timer) return;
+	loop.pendingTask = pendingTask;
 	loop.timer = setTimeout(() => {
 		loop.timer = undefined;
-		void task().catch(error => reportLoopFailure(runtime, error));
+		loop.pendingTask = undefined;
+		const task =
+			pendingTask === "submit" ? submitLoopPromptWhenReady(session, runtime) : runLoopIteration(session, runtime);
+		void task.catch(error => reportLoopFailure(runtime, error));
 	}, LOOP_RESUBMIT_DELAY_MS);
 }
 
 async function submitLoopPromptWhenReady(session: AgentSession, runtime: RpcRuntimeControl): Promise<void> {
 	const { loop } = runtime;
 	const prompt = loop.prompt;
-	if (runtime.disposed || session.isDisposed || !loop.enabled || prompt === undefined) return;
+	if (runtime.disposed || runtime.suspended || session.isDisposed || !loop.enabled || prompt === undefined) return;
 	if (isLoopDurationExpired(loop.limit)) {
 		disableLoop(runtime);
 		return;
 	}
 	if (isAutoSubmitBlocked(session)) {
-		scheduleLoopTask(runtime, () => submitLoopPromptWhenReady(session, runtime));
+		scheduleLoopTask(session, runtime, "submit");
 		return;
 	}
 
@@ -177,25 +199,52 @@ async function submitLoopPromptWhenReady(session: AgentSession, runtime: RpcRunt
 
 async function runLoopIteration(session: AgentSession, runtime: RpcRuntimeControl): Promise<void> {
 	const { loop } = runtime;
-	if (runtime.disposed || session.isDisposed || !loop.enabled || loop.prompt === undefined) return;
+	if (runtime.disposed || runtime.suspended || session.isDisposed || !loop.enabled || loop.prompt === undefined)
+		return;
 	if (isAutoSubmitBlocked(session)) {
-		scheduleLoopTask(runtime, () => runLoopIteration(session, runtime));
+		scheduleLoopTask(session, runtime, "iterate");
 		return;
 	}
-	if (loop.action === "reset" && session.getVibeModeState()?.enabled) {
-		disableLoop(runtime);
+	if (loop.action === "reset") {
+		assertRpcSessionTransitionAllowed(session);
+		if ((loop.limit?.kind === "iterations" && loop.limit.remaining <= 0) || isLoopDurationExpired(loop.limit)) {
+			disableLoop(runtime);
+			return;
+		}
+		let created: boolean;
+		try {
+			created = await session.runSessionTransition(
+				async transitionOptions => {
+					const didCreate = await session.newSession(transitionOptions);
+					return {
+						result: didCreate,
+						committed: didCreate,
+						honorPlanDefault: false,
+					};
+				},
+				{ preserveLoopConfiguration: true },
+			);
+		} catch (error) {
+			pauseLoop(runtimeFor(session));
+			throw error;
+		}
+		const destinationRuntime = runtimeFor(session);
+		if (!created) {
+			pauseLoop(destinationRuntime);
+			return;
+		}
+		if (!consumeLoopLimitIteration(destinationRuntime.loop.limit)) {
+			disableLoop(destinationRuntime);
+			return;
+		}
+		await submitLoopPromptWhenReady(session, destinationRuntime);
 		return;
 	}
 	if (!consumeLoopLimitIteration(loop.limit)) {
 		disableLoop(runtime);
 		return;
 	}
-
-	if (loop.action === "compact") {
-		await session.compact();
-	} else if (loop.action === "reset") {
-		await session.newSession();
-	}
+	if (loop.action === "compact") await session.compact();
 	await submitLoopPromptWhenReady(session, runtime);
 }
 
@@ -205,21 +254,72 @@ function runtimeFor(session: AgentSession): RpcRuntimeControl {
 
 	const runtime: RpcRuntimeControl = {
 		loop: emptyLoopRuntime(),
+		suspended: false,
 		disposed: false,
 		ownsPause: false,
 		unsubscribeSession: () => {},
 		unsubscribePause: () => {},
 	};
 	runtime.unsubscribeSession = session.subscribe(event => {
-		if (event.type !== "agent_end" || event.isTerminal === false || !runtime.loop.promptInFlight) return;
+		if (
+			runtime.suspended ||
+			event.type !== "agent_end" ||
+			event.isTerminal === false ||
+			!runtime.loop.promptInFlight
+		) {
+			return;
+		}
 		runtime.loop.promptInFlight = false;
-		scheduleLoopTask(runtime, () => runLoopIteration(session, runtime));
+		scheduleLoopTask(session, runtime, "iterate");
 	});
 	runtime.unsubscribePause = agentPauseGate.onChange(paused => {
 		if (!paused) runtime.ownsPause = false;
 	});
 	runtimes.set(session, runtime);
 	return runtime;
+}
+
+/** Suspends loop timers and event reactions without discarding rollback state. */
+export function suspendRpcRuntimeControl(session: AgentSession): RpcRuntimeControlSuspension {
+	const runtime = runtimeFor(session);
+	if (runtime.suspended) throw new Error("RPC runtime control is already suspended.");
+	runtime.suspended = true;
+	clearLoopTimer(runtime.loop, false);
+	let settled = false;
+	return {
+		commit: preserveLoopConfiguration => {
+			if (settled) return undefined;
+			settled = true;
+			if (!preserveLoopConfiguration || !runtime.loop.enabled) return undefined;
+			return {
+				action: runtime.loop.action,
+				prompt: runtime.loop.prompt,
+				limit: runtime.loop.limit,
+				promptInFlight: runtime.loop.promptInFlight,
+				pendingTask: runtime.loop.pendingTask,
+			};
+		},
+		rollback: () => {
+			if (settled) return;
+			settled = true;
+			runtime.suspended = false;
+			const pendingTask = runtime.loop.pendingTask;
+			if (pendingTask) scheduleLoopTask(session, runtime, pendingTask);
+		},
+	};
+}
+
+/** Restores loop configuration after the loop's own committed reset. */
+export function restoreRpcLoopConfiguration(session: AgentSession, configuration: RpcLoopConfiguration): void {
+	const runtime = runtimeFor(session);
+	disableLoop(runtime);
+	runtime.loop.enabled = true;
+	runtime.loop.action = configuration.action;
+	runtime.loop.prompt = configuration.prompt;
+	runtime.loop.limit = configuration.limit;
+	runtime.loop.promptInFlight = configuration.promptInFlight;
+	runtime.loop.pendingTask = configuration.pendingTask;
+	if (configuration.pendingTask) scheduleLoopTask(session, runtime, configuration.pendingTask);
 }
 
 function loopLimit(count: number | undefined, durationMs: number | undefined): LoopLimitRuntime | undefined {
@@ -269,12 +369,15 @@ export async function enableRpcLoop(
 ): Promise<RpcLoopState> {
 	if (session.isDisposed) throw new Error("Cannot enable loop on a disposed session.");
 	if (!prompt.trim()) throw new Error("Loop prompt must not be empty.");
+	const loopAction = action ?? session.settings.get("loop.mode");
+	if (loopAction === "reset") assertRpcSessionTransitionAllowed(session);
+	const limit = loopLimit(count, durationMs);
 	const runtime = runtimeFor(session);
 	disableLoop(runtime);
 	runtime.loop.enabled = true;
-	runtime.loop.action = action ?? session.settings.get("loop.mode");
+	runtime.loop.action = loopAction;
 	runtime.loop.prompt = prompt;
-	runtime.loop.limit = loopLimit(count, durationMs);
+	runtime.loop.limit = limit;
 	void submitLoopPromptWhenReady(session, runtime).catch(error => reportLoopFailure(runtime, error));
 	return loopSnapshot(runtime);
 }

@@ -81,6 +81,14 @@ export interface VibeOwnerScope {
 	parentSessionId: string;
 	parentSessionFile: string | null;
 }
+/** A two-phase detach of one parent scope's exact process-local workers. */
+export interface VibeScopeSuspension {
+	readonly count: number;
+	/** Permanently cancel and release the detached workers. */
+	commit(): Promise<void>;
+	/** Reattach the same records and in-flight jobs without journal reconstruction. */
+	rollback(): Promise<void>;
+}
 
 export interface VibeParentSession {
 	getAgentId?: () => string | null;
@@ -190,6 +198,8 @@ interface VibeRecord {
 	killed: boolean;
 	/** True while a parent switch is detaching this process-local record without terminating it. */
 	suspended: boolean;
+	/** Session/manager retained only when a turn settles while a reversible suspension is pending. */
+	settledWhileSuspended?: { session: ToolSession; manager: AsyncJobManager };
 	/** True only after a terminal lifecycle event has durably flushed. */
 	terminalPersisted: boolean;
 }
@@ -419,6 +429,7 @@ export class VibeSessionRegistry {
 	readonly #records = new Map<string, VibeRecord>();
 	readonly #terminationTails = new Map<string, Promise<void>>();
 	readonly #terminatedScopes = new Set<string>();
+	readonly #suspendedScopes = new Set<string>();
 
 	ownerScope(session: VibeParentSession): VibeOwnerScope {
 		const parentSessionId = session.getSessionId?.();
@@ -870,6 +881,9 @@ export class VibeSessionRegistry {
 		scope: VibeOwnerScope,
 		args: { cli: VibeCli; name?: string; prompt: string },
 	): Promise<VibeSpawnOutcome> {
+		if (this.#suspendedScopes.has(scopeKey(scope, ""))) {
+			throw new ToolError("Vibe session transition is in progress; retry after it completes.");
+		}
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
 		}
@@ -952,36 +966,38 @@ export class VibeSessionRegistry {
 	 */
 	async send(session: ToolSession, args: { session: string; message: string }): Promise<VibeSendOutcome> {
 		const scope = this.ownerScope(session);
-		const record = this.#record(scope, args.session);
-		if (record.state === "dead") {
-			throw new ToolError(`Vibe session "${record.id}" is dead. Spawn a new one with vibe_spawn.`);
-		}
-		const message = args.message.trim();
-		if (!message) throw new ToolError("Message must not be empty.");
-		const registered = this.#registeredAgent(record);
-		if (AgentRegistry.global().get(record.id) && !registered) {
-			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
-		}
-
-		if (record.turn) {
-			const live = registered?.session;
-			if (live?.isStreaming) {
-				await live.steer(message);
-				record.lastActivityAt = Date.now();
-				return { id: record.id, mode: "steered" };
+		return this.#withTerminationLock(scope, async () => {
+			const record = this.#record(scope, args.session);
+			if (record.state === "dead") {
+				throw new ToolError(`Vibe session "${record.id}" is dead. Spawn a new one with vibe_spawn.`);
 			}
-			record.queue.push(message);
-			record.lastActivityAt = Date.now();
-			return { id: record.id, mode: "queued" };
-		}
+			const message = args.message.trim();
+			if (!message) throw new ToolError("Message must not be empty.");
+			const registered = this.#registeredAgent(record);
+			if (AgentRegistry.global().get(record.id) && !registered) {
+				throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+			}
 
-		if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
-			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
-		}
+			if (record.turn) {
+				const live = registered?.session;
+				if (live?.isStreaming) {
+					await live.steer(message);
+					record.lastActivityAt = Date.now();
+					return { id: record.id, mode: "steered" };
+				}
+				record.queue.push(message);
+				record.lastActivityAt = Date.now();
+				return { id: record.id, mode: "queued" };
+			}
 
-		const manager = this.#manager(session);
-		const jobId = this.#registerTurnJob(session, manager, record, message, { first: false });
-		return { id: record.id, mode: "turn", jobId };
+			if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
+				throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+			}
+
+			const manager = this.#manager(session);
+			const jobId = this.#registerTurnJob(session, manager, record, message, { first: false });
+			return { id: record.id, mode: "turn", jobId };
+		});
 	}
 
 	/**
@@ -1069,36 +1085,147 @@ export class VibeSessionRegistry {
 		return { settled, stillRunning, timedOut: waited && settled.length === 0 };
 	}
 
-	/** Detach one parent's process-local workers without tombstoning their persisted conversations. */
+	/** Detach one parent's workers without tombstoning or permanently closing the scope. */
 	async suspendScope(scope: VibeOwnerScope, manager?: AsyncJobManager): Promise<number> {
-		const records = [...this.#records.values()].filter(record => matchesScope(record, scope));
-		const teardown = records.map(record => ({
-			record,
-			ref: this.#registeredAgent(record),
-			job: record.turn && manager ? manager.getJob(record.turn.jobId) : undefined,
-		}));
-		for (const { record } of teardown) {
-			record.suspended = true;
-			record.queue.length = 0;
-			record.state = "dead";
-			record.lastActivityAt = Date.now();
-			record.lastActivity = "suspended for parent-session switch";
-			this.#records.delete(scopeKey(scope, record.id));
-			if (record.turn && manager) manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
-		}
-		for (const { record, ref } of teardown) {
-			if (!ref) continue;
-			try {
-				await AgentLifecycleManager.global().release(record.id, ref);
-			} catch (error) {
-				logger.warn("vibe: failed to detach worker session", {
-					id: record.id,
-					error: error instanceof Error ? error.message : String(error),
-				});
+		const suspension = await this.#createScopeSuspension(scope, manager, false);
+		await suspension.commit();
+		return suspension.count;
+	}
+
+	/** Detach exact process-local workers for a later commit or rollback decision. */
+	async suspendScopeReversibly(scope: VibeOwnerScope, manager?: AsyncJobManager): Promise<VibeScopeSuspension> {
+		return this.#createScopeSuspension(scope, manager, true);
+	}
+
+	async #createScopeSuspension(
+		scope: VibeOwnerScope,
+		manager: AsyncJobManager | undefined,
+		terminateScope: boolean,
+	): Promise<VibeScopeSuspension> {
+		const suspendedScopeKey = scopeKey(scope, "");
+		const { snapshots: suspended, capturedJobs } = await this.#withTerminationLock(scope, async () => {
+			if (this.#suspendedScopes.has(suspendedScopeKey)) {
+				throw new ToolError("Vibe session scope is already suspended.");
 			}
-		}
-		await awaitCancelledTurnJobs(new Set(teardown.flatMap(entry => (entry.job ? [entry.job] : []))));
-		return records.length;
+			this.#suspendedScopes.add(suspendedScopeKey);
+			const snapshots = [...this.#records.values()]
+				.filter(record => matchesScope(record, scope))
+				.map(record => {
+					const jobs = [...new Set([record.turn?.jobId, record.lastJobId])]
+						.flatMap(jobId => (jobId && manager ? [manager.getJob(jobId)] : []))
+						.filter((job): job is AsyncJob => job?.status === "running" || job?.status === "cancelled");
+					return {
+						record,
+						ref: this.#registeredAgent(record),
+						jobs,
+					};
+				});
+			const capturedJobs = new Map<string, { job: AsyncJob; ownerId: string }>();
+			for (const { record, jobs } of snapshots) {
+				for (const job of jobs) capturedJobs.set(job.id, { job, ownerId: record.ownerId });
+			}
+			for (const { record } of snapshots) {
+				record.suspended = true;
+				this.#records.delete(scopeKey(scope, record.id));
+			}
+			manager?.acknowledgeDeliveries([...capturedJobs.keys()]);
+			return { snapshots, capturedJobs };
+		});
+
+		let state: "pending" | "committing" | "committed" | "rolling-back" | "rolled-back" = "pending";
+		let operation: Promise<void> | undefined;
+		const commit = (): Promise<void> => {
+			if (state === "committing" || state === "committed") return operation ?? Promise.resolve();
+			if (state !== "pending") {
+				return Promise.reject(
+					new ToolError("Vibe scope suspension was already rolled back and cannot be committed."),
+				);
+			}
+			state = "committing";
+			operation = (async () => {
+				await this.#withTerminationLock(scope, async () => {
+					for (const { record } of suspended) {
+						record.queue.length = 0;
+						record.killed = true;
+						record.state = "dead";
+						record.lastActivityAt = Date.now();
+						record.lastActivity = "suspended for parent-session switch";
+						record.settledWhileSuspended = undefined;
+					}
+					if (manager) {
+						for (const { job, ownerId } of capturedJobs.values()) {
+							manager.cancel(job.id, { ownerId });
+						}
+					}
+				});
+				for (const { record, ref } of suspended) {
+					if (!ref) continue;
+					try {
+						await AgentLifecycleManager.global().release(record.id, ref);
+					} catch (error) {
+						logger.warn("vibe: failed to detach worker session", {
+							id: record.id,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+				await awaitCancelledTurnJobs(new Set([...capturedJobs.values()].map(({ job }) => job)));
+				await this.#withTerminationLock(scope, async () => {
+					this.#suspendedScopes.delete(suspendedScopeKey);
+					if (terminateScope) this.#terminatedScopes.add(suspendedScopeKey);
+				});
+				state = "committed";
+			})();
+			return operation;
+		};
+		const rollback = (): Promise<void> => {
+			if (state === "rolling-back" || state === "rolled-back") return operation ?? Promise.resolve();
+			if (state !== "pending") {
+				return Promise.reject(
+					new ToolError("Vibe scope suspension was already committed and cannot be rolled back."),
+				);
+			}
+			state = "rolling-back";
+			operation = (async () => {
+				try {
+					await this.#withTerminationLock(scope, async () => {
+						for (const { record } of suspended) {
+							const key = scopeKey(scope, record.id);
+							const existing = this.#records.get(key);
+							if (existing && existing !== record) {
+								throw new ToolError(
+									`Cannot restore vibe session "${record.id}": the scope already owns that id.`,
+								);
+							}
+						}
+						for (const { record } of suspended) {
+							record.suspended = false;
+							if (record.turn) {
+								record.state = record.turnCount === 0 ? "starting" : "running";
+							} else if (record.state === "dead") {
+								const ref = this.#registeredAgent(record);
+								if (ref?.status === "idle" || ref?.status === "parked") record.state = "idle";
+							}
+							this.#records.set(scopeKey(scope, record.id), record);
+						}
+						this.#suspendedScopes.delete(suspendedScopeKey);
+						for (const { record } of suspended) {
+							const settlement = record.settledWhileSuspended;
+							record.settledWhileSuspended = undefined;
+							if (settlement) this.#drainQueuedTurn(settlement.session, settlement.manager, record);
+						}
+					});
+					manager?.resumeDeliveries([...capturedJobs.keys()]);
+					state = "rolled-back";
+				} catch (error) {
+					state = "pending";
+					throw error;
+				}
+			})();
+			return operation;
+		};
+
+		return { count: suspended.length, commit, rollback };
 	}
 
 	/** Terminate one worker; a tombstone failure still tears it down before reconciliation and error delivery. */
@@ -1389,6 +1516,28 @@ export class VibeSessionRegistry {
 		return jobId;
 	}
 
+	#drainQueuedTurn(session: ToolSession, manager: AsyncJobManager, record: VibeRecord): void {
+		if (
+			record.killed ||
+			record.suspended ||
+			record.state !== "idle" ||
+			record.turn !== undefined ||
+			record.queue.length === 0
+		) {
+			return;
+		}
+		const queued = record.queue.splice(0, record.queue.length);
+		try {
+			this.#registerTurnJob(session, manager, record, queued.join("\n\n"), { first: false });
+		} catch (error) {
+			record.queue.unshift(...queued);
+			logger.warn("vibe: failed to start queued follow-up turn", {
+				id: record.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	/** Post-turn bookkeeping shared by success and failure paths: clear the in-flight turn, flush the queue. */
 	async #finishTurn(
 		session: ToolSession,
@@ -1400,7 +1549,7 @@ export class VibeSessionRegistry {
 		record.turn = undefined;
 		record.live = undefined;
 		record.lastActivityAt = Date.now();
-		if (record.killed || record.suspended) {
+		if (record.killed) {
 			record.state = "dead";
 			return;
 		}
@@ -1424,18 +1573,11 @@ export class VibeSessionRegistry {
 			record.state = "dead";
 			return;
 		}
-		if (record.queue.length === 0) return;
-		const nextMessage = record.queue.splice(0, record.queue.length).join("\n\n");
-		try {
-			this.#registerTurnJob(session, manager, record, nextMessage, { first: false });
-		} catch (error) {
-			// Leave the messages recoverable: a later vibe_send flushes again.
-			record.queue.unshift(nextMessage);
-			logger.warn("vibe: failed to start queued follow-up turn", {
-				id: record.id,
-				error: error instanceof Error ? error.message : String(error),
-			});
+		if (record.suspended) {
+			record.settledWhileSuspended = { session, manager };
+			return;
 		}
+		this.#drainQueuedTurn(session, manager, record);
 	}
 
 	/** Format a settled turn into the self-delivering result text (activity trace + response). */

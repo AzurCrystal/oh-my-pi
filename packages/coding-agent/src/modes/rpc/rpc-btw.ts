@@ -94,7 +94,14 @@ function createRuntime(session: AgentSession): RpcBtwRuntime {
 			showStatus: message => failPending(bridge, message),
 			showError: message => failPending(bridge, message),
 			handleBtwBranch: async (question, assistantMessage) => {
-				bridge.branchResult = await session.branchFromBtw(question, assistantMessage);
+				bridge.branchResult = await session.runSessionTransition(async transitionOptions => {
+					const result = await session.branchFromBtw(question, assistantMessage, transitionOptions);
+					return {
+						result,
+						committed: !result.cancelled,
+						honorPlanDefault: false,
+					};
+				});
 			},
 		},
 		renderer,

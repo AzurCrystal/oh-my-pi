@@ -304,7 +304,7 @@ export class RpcFrameEncoder {
 						? encodedMessageSnapshot(singleFrame)
 						: undefined;
 			if (snapshot) this.#streamedMessages.push(snapshot.message);
-		} else if (frame.type === "agent_end" && frame.willContinue !== true) this.#streamedMessages = [];
+		} else if (frame.type === "agent_end" && frame.isTerminal !== false) this.#streamedMessages = [];
 		return frames;
 	}
 

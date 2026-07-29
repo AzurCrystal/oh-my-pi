@@ -17,7 +17,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { configureCredentialRedaction, redactSensitiveInObject } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, normalizePathForComparison, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
 import { onSettingChanged } from "../../config/settings";
@@ -40,6 +40,13 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import type { Goal } from "../../goals/state";
 import type { MCPManager } from "../../mcp/manager";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type {
+	SessionTransitionCoordinator,
+	SessionTransitionLease,
+	SessionTransitionOptions,
+	SessionTransitionOutcome,
+	SessionTransitionRunOptions,
+} from "../../session/agent-session-types";
 import { HistoryStorage } from "../../session/history-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { resolveResumableSession } from "../../session/session-listing";
@@ -53,7 +60,7 @@ import type { EventBus } from "../../utils/event-bus";
 import { buildSessionAutocompleteProvider } from "../completions";
 import { loadAllExtensions } from "../components/extensions/state-manager";
 import { shouldSkipHistory } from "../controllers/input-controller";
-import { initializeExtensions } from "../runtime-init";
+import { type ExtensionMessageLifecycleDisposition, initializeExtensions } from "../runtime-init";
 import { applySettingEffects } from "../setting-effects";
 import {
 	getAvailableThemesWithPaths,
@@ -79,6 +86,7 @@ import * as rpcMcp from "./rpc-mcp";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import * as rpcModelRoles from "./rpc-model-roles";
 import * as rpcRuntimeControl from "./rpc-runtime-control";
+import { getRpcSessionTransitionGuestBlock } from "./rpc-session-guard";
 import { buildRpcSessionView } from "./rpc-session-view";
 import { buildRpcSettingsSnapshot, validateRpcSettingValue } from "./rpc-settings";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -99,6 +107,7 @@ import type {
 	RpcJsonValue,
 	RpcPlanDecisionResult,
 	RpcPlanModeSnapshot,
+	RpcPromptLifecycleDisposition,
 	RpcProviderRequestObservationFrame,
 	RpcResponse,
 	RpcSessionState,
@@ -111,6 +120,7 @@ import { buildRpcRepoStatus, readRpcUsageReports } from "./rpc-workspace";
 
 // Re-export types for consumers
 export type * from "./rpc-types";
+export { getRpcSessionTransitionGuestBlock };
 
 export type PendingExtensionRequest = {
 	resolve: (response: RpcExtensionUIResponse) => void;
@@ -163,7 +173,67 @@ export type RpcSessionChangeResult =
 	| { type: "branch"; data: { text: string; cancelled: boolean } }
 	| { type: "fork"; data: { cancelled: boolean } };
 
-export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
+export type RpcSessionChangeSession = Pick<
+	AgentSession,
+	"sessionFile" | "newSession" | "switchSession" | "branch" | "fork"
+>;
+
+const RPC_SESSION_TRANSITION_BUSY_MESSAGE = "Another RPC session transition is already in progress.";
+/** Logical file identity used to distinguish a reload from a destructive switch. */
+export function isSameRpcSessionReload(currentSessionFile: string | undefined, targetSessionFile: string): boolean {
+	return (
+		currentSessionFile !== undefined &&
+		normalizePathForComparison(currentSessionFile) === normalizePathForComparison(targetSessionFile)
+	);
+}
+
+/**
+ * Runs a cancellable session change surrounded by one RPC reconciliation cycle.
+ *
+ * `prepare` runs at the transition's commit point, while the outgoing session is
+ * still live, and MUST stay reversible: it may only release runtime state that
+ * `reconcile` can rebuild from whichever session ends up current. Teardown that
+ * cannot be undone belongs in `reconcile`, which learns whether the transition
+ * committed — a hook that cancels the change never reaches `prepare` at all.
+ *
+ * `reconcile` also runs when `prepare` itself fails, so it owns re-establishing
+ * the runtime behaviors `prepare` may have already released. A logical reload
+ * sets `preserveCurrentSessionOnSuccess`, which deliberately reconciles like a
+ * rollback even though reloading the transcript succeeded.
+ */
+export async function runRpcSessionTransitionAtCommit<T>(
+	transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+	prepare: () => Promise<void>,
+	reconcile: (outcome: { committed: boolean; honorPlanDefault: boolean }) => Promise<void>,
+	honorPlanDefaultOnCommit = false,
+	preserveCurrentSessionOnSuccess = false,
+): Promise<T> {
+	let prepared = false;
+	const beforeCommit = async (): Promise<void> => {
+		if (prepared) return;
+		prepared = true;
+		await prepare();
+	};
+	let committed = false;
+	let honorPlanDefault = false;
+	const onCommitted = (): void => {
+		committed = true;
+		honorPlanDefault = honorPlanDefaultOnCommit;
+	};
+	try {
+		const transitionOptions: SessionTransitionOptions = preserveCurrentSessionOnSuccess
+			? { beforeCommit }
+			: { beforeCommit, onCommitted };
+		const outcome = await transition(transitionOptions);
+		if (!preserveCurrentSessionOnSuccess) {
+			committed ||= outcome.committed;
+			honorPlanDefault ||= outcome.honorPlanDefault;
+		}
+		return outcome.result;
+	} finally {
+		if (prepared) await reconcile({ committed, honorPlanDefault });
+	}
+}
 
 export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
 export type RpcSkillCommandResult = { agentInvoked: true };
@@ -192,80 +262,101 @@ export async function tryRunRpcSkillCommand(
 	return { agentInvoked: true };
 }
 
+/**
+ * Relays a guest prompt and reports its accepted terminal outcome.
+ *
+ * The collaboration relay only needs prompt content. Correlation stays on the
+ * RPC connection that accepted the request.
+ */
+export function routeRpcCollabGuestPrompt(input: {
+	id: string | undefined;
+	relay: () => void;
+	output: (frame: object) => void;
+	lifecycleDisposition: Exclude<RpcPromptLifecycleDisposition, "none">;
+}): RpcResponse {
+	try {
+		input.relay();
+	} catch (relayError) {
+		const message = relayError instanceof Error ? relayError.message : String(relayError);
+		const code = relayError instanceof rpcCollab.RpcCollabGuestRoutingError ? relayError.code : "operation_failed";
+		return { id: input.id, type: "response", command: "prompt", success: false, error: message, code };
+	}
+	const outcome = {
+		agentInvoked: true,
+		lifecycleDisposition: input.lifecycleDisposition,
+	} as const;
+	input.output({ type: "prompt_result", id: input.id, ...outcome });
+	return {
+		id: input.id,
+		type: "response",
+		command: "prompt",
+		success: true,
+		data: outcome,
+	};
+}
+
+type RpcExtensionAgentMessageTask = {
+	task: Promise<unknown>;
+	disposition: ExtensionMessageLifecycleDisposition;
+};
+
 export function reportLocalOnlyPromptResult(input: {
 	id: string | undefined;
 	prompt: Promise<boolean>;
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
-	hasExtensionAgentMessageTask?: () => boolean;
-	waitForExtensionAgentMessageTasks?: () => Promise<void>;
+	promptLifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">;
+	extensionAgentMessageTasks?: () => readonly RpcExtensionAgentMessageTask[];
 }): void {
-	void input.prompt
-		.then(async agentInvoked => {
-			if (agentInvoked) return;
-			await input.waitForExtensionAgentMessageTasks?.();
-			if (!input.hasExtensionAgentMessageTask?.()) {
-				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
-			}
-		})
-		.catch(error => {
+	void (async () => {
+		try {
+			const agentInvoked = await input.prompt;
+			const extensionTasks = input.extensionAgentMessageTasks?.() ?? [];
+			await Promise.all(extensionTasks.map(extensionTask => extensionTask.task));
+			const lifecycleDisposition: RpcPromptLifecycleDisposition = agentInvoked
+				? (input.promptLifecycleDisposition ?? "future")
+				: extensionTasks.some(extensionTask => extensionTask.disposition === "future")
+					? "future"
+					: extensionTasks.length > 0
+						? "current"
+						: "none";
+			input.output({
+				type: "prompt_result",
+				id: input.id,
+				agentInvoked: lifecycleDisposition !== "none",
+				lifecycleDisposition,
+			});
+		} catch (error) {
 			input.onError(error instanceof Error ? error : new Error(String(error)));
-		});
+		}
+	})();
 }
 
 type RpcExtensionUserMessageScope = {
-	hasAgentMessageTask: boolean;
-	pendingAgentMessageTasks: Set<Promise<void>>;
+	agentMessageTasks: RpcExtensionAgentMessageTask[];
 };
 
 /**
  * Tracks extension-originated messages while an RPC prompt is executing.
  * A slash command can resolve the outer prompt as local-only while also
  * scheduling agent work through pi.sendUserMessage() or pi.sendMessage()
- * with triggerTurn; that prompt must not report agentInvoked:false to the host.
+ * with triggerTurn; the terminal result must include that nested agent work.
  */
 export class RpcExtensionUserMessageTracker {
 	#activePromptScopes = new Set<RpcExtensionUserMessageScope>();
 
-	markAgentMessageTask(): void {
+	trackAgentMessageTask(task: Promise<unknown>, disposition: ExtensionMessageLifecycleDisposition): void {
 		for (const scope of this.#activePromptScopes) {
-			scope.hasAgentMessageTask = true;
-		}
-	}
-
-	trackAgentMessageTask(task: Promise<unknown>): void {
-		for (const scope of this.#activePromptScopes) {
-			this.#trackAgentMessageTaskForScope(scope, task);
-		}
-	}
-
-	#trackAgentMessageTaskForScope(scope: RpcExtensionUserMessageScope, task: Promise<unknown>): void {
-		const scopedTask = task.then(
-			() => {
-				scope.hasAgentMessageTask = true;
-			},
-			() => {},
-		);
-		scope.pendingAgentMessageTasks.add(scopedTask);
-		void scopedTask.finally(() => {
-			scope.pendingAgentMessageTasks.delete(scopedTask);
-		});
-	}
-
-	async #waitForAgentMessageTasks(scope: RpcExtensionUserMessageScope): Promise<void> {
-		while (scope.pendingAgentMessageTasks.size > 0) {
-			await Promise.allSettled(Array.from(scope.pendingAgentMessageTasks));
+			scope.agentMessageTasks.push({ task, disposition });
 		}
 	}
 
 	watchPrompt<T>(startPrompt: () => Promise<T>): {
 		prompt: Promise<T>;
-		hasAgentMessageTask: () => boolean;
-		waitForAgentMessageTasks: () => Promise<void>;
+		agentMessageTasks: () => readonly RpcExtensionAgentMessageTask[];
 	} {
 		const scope: RpcExtensionUserMessageScope = {
-			hasAgentMessageTask: false,
-			pendingAgentMessageTasks: new Set(),
+			agentMessageTasks: [],
 		};
 		this.#activePromptScopes.add(scope);
 		let prompt: Promise<T>;
@@ -279,8 +370,7 @@ export class RpcExtensionUserMessageTracker {
 			prompt: prompt.finally(() => {
 				this.#activePromptScopes.delete(scope);
 			}),
-			hasAgentMessageTask: () => scope.hasAgentMessageTask,
-			waitForAgentMessageTasks: () => this.#waitForAgentMessageTasks(scope),
+			agentMessageTasks: () => scope.agentMessageTasks,
 		};
 	}
 }
@@ -291,6 +381,8 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+	promptLifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">;
+	additionalAgentMessageTasks?: readonly RpcExtensionAgentMessageTask[];
 }): void {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
 	reportLocalOnlyPromptResult({
@@ -298,8 +390,11 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 		prompt: trackedPrompt.prompt,
 		output: input.output,
 		onError: input.onError,
-		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
-		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
+		promptLifecycleDisposition: input.promptLifecycleDisposition,
+		extensionAgentMessageTasks: () => [
+			...(input.additionalAgentMessageTasks ?? []),
+			...trackedPrompt.agentMessageTasks(),
+		],
 	});
 }
 
@@ -310,7 +405,7 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 export interface RpcInputFrameDeps {
 	handleCommand: (command: RpcCommand) => Promise<RpcResponse>;
 	output: RpcOutput;
-	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
+	errorResponse: (id: string | undefined, command: string, message: string, code?: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
 	pendingExtensionRequests: Map<string, PendingExtensionRequest>;
 	onHostToolResult: (frame: RpcHostToolResult) => void;
@@ -369,6 +464,7 @@ const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = 
 	handoff: true,
 	approve_plan_proposal: true,
 	reject_plan_proposal: true,
+	begin_guided_goal: true,
 	prompt_agent: true,
 	generate_ttsr_rule: true,
 	mcp_add_server: true,
@@ -383,6 +479,194 @@ const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = 
 	mcp_search_registry: true,
 	mcp_deploy_registry_result: true,
 };
+
+/**
+ * Guest RPC policy is exhaustive by command discriminant: adding a command
+ * fails compilation until its replica-safety is reviewed explicitly.
+ */
+const RPC_COLLAB_GUEST_COMMAND_POLICY = {
+	negotiate_protocol: "allow",
+	prompt: "allow",
+	steer: "allow",
+	follow_up: "allow",
+	abort: "allow",
+	abort_and_prompt: "allow",
+	ask_btw: "block",
+	get_last_btw_answer: "allow",
+	cancel_btw: "block",
+	branch_btw: "block",
+	complete: "allow",
+	apply_completion: "allow",
+	publish_editor_text: "allow",
+	new_session: "block",
+	get_state: "allow",
+	get_available_commands: "allow",
+	get_settings: "allow",
+	set_setting: "block",
+	get_extensions: "allow",
+	get_repo_status: "allow",
+	get_usage_reports: "allow",
+	set_todos: "block",
+	set_host_tools: "block",
+	set_host_uri_schemes: "block",
+	subscribe_provider_request_observations: "allow",
+	unsubscribe_provider_request_observations: "allow",
+	set_subagent_subscription: "allow",
+	get_subagents: "allow",
+	get_subagent_messages: "allow",
+	enter_plan_mode: "block",
+	pause_plan_mode: "block",
+	resume_plan_mode: "block",
+	exit_plan_mode: "block",
+	get_plan_mode_state: "allow",
+	submit_plan_review: "block",
+	approve_plan_proposal: "block",
+	reject_plan_proposal: "block",
+	create_goal: "block",
+	pause_goal: "block",
+	resume_goal: "block",
+	switch_goal: "block",
+	clear_goal: "block",
+	set_goal_budget: "block",
+	get_goal_state: "allow",
+	begin_guided_goal: "block",
+	enter_vibe_mode: "block",
+	exit_vibe_mode: "block",
+	get_vibe_mode_state: "allow",
+	get_work_mode_state: "allow",
+	enable_loop: "block",
+	disable_loop: "block",
+	get_loop_state: "allow",
+	cancel_loop_iteration: "block",
+	pause_agents: "block",
+	resume_agents: "block",
+	get_pause_state: "allow",
+	get_session_tree: "allow",
+	get_controllable_agents: "allow",
+	revive_agent: "block",
+	kill_agent: "block",
+	prompt_agent: "block",
+	spawn_background_agent: "block",
+	get_advisor_config: "allow",
+	set_advisor_config: "block",
+	generate_ttsr_rule: "block",
+	build_ttsr_rule: "block",
+	register_ttsr_rule: "block",
+	get_ttsr_rules: "allow",
+	remove_ttsr_rule: "block",
+	get_agent_definitions: "allow",
+	get_agent_definition: "allow",
+	set_agent_definition: "block",
+	delete_agent_definition: "block",
+	get_mental_models: "allow",
+	get_mental_model: "allow",
+	create_mental_model: "block",
+	refresh_mental_model: "block",
+	refresh_auto_mental_models: "block",
+	get_mental_model_history: "allow",
+	seed_mental_models: "block",
+	delete_mental_model: "block",
+	reload_mental_models: "block",
+	get_theme: "allow",
+	get_keybindings: "allow",
+	get_session_view: "allow",
+	set_model: "block",
+	set_model_temporary: "block",
+	cycle_model: "block",
+	cycle_role_models: "block",
+	get_available_models: "allow",
+	get_model_roles: "allow",
+	set_model_role: "block",
+	clear_model_role: "block",
+	set_thinking_level: "block",
+	cycle_thinking_level: "block",
+	set_steering_mode: "block",
+	set_follow_up_mode: "block",
+	set_interrupt_mode: "block",
+	get_queued_messages: "allow",
+	pop_queued_message: "block",
+	clear_queue: "block",
+	compact: "block",
+	set_auto_compaction: "block",
+	retry: "block",
+	set_auto_retry: "block",
+	abort_retry: "block",
+	bash: "block",
+	abort_bash: "block",
+	python: "block",
+	abort_python: "block",
+	get_session_stats: "allow",
+	export_html: "allow",
+	switch_session: "block",
+	get_sessions: "allow",
+	delete_session: "block",
+	get_prompt_history: "allow",
+	branch: "block",
+	fork: "block",
+	navigate_tree: "block",
+	resume_after_ask_reanswer: "block",
+	get_branch_messages: "allow",
+	get_last_assistant_text: "allow",
+	set_session_name: "block",
+	generate_title: "block",
+	handoff: "block",
+	get_messages: "allow",
+	get_messages_page: "allow",
+	get_login_providers: "allow",
+	login: "block",
+	logout: "block",
+	remove_login_account: "block",
+	remove_provider_credentials: "block",
+	mcp_add_server: "block",
+	mcp_remove_server: "block",
+	mcp_set_server_enabled: "block",
+	mcp_reload: "block",
+	mcp_reconnect_server: "block",
+	mcp_unauth_server: "block",
+	mcp_begin_reauth: "block",
+	mcp_complete_reauth: "block",
+	mcp_cancel_reauth: "block",
+	mcp_begin_smithery_login: "block",
+	mcp_complete_smithery_login: "block",
+	mcp_logout_smithery: "block",
+	mcp_search_registry: "block",
+	mcp_deploy_registry_result: "block",
+	start_cpu_profile: "block",
+	stop_cpu_profile: "block",
+	create_heap_profile: "block",
+	create_support_bundle: "block",
+	create_work_profile: "block",
+	get_recent_logs: "allow",
+	get_raw_sse: "allow",
+	subscribe_raw_sse: "allow",
+	unsubscribe_raw_sse: "allow",
+	start_inspector: "block",
+	get_system_info: "allow",
+	get_startup_warnings: "allow",
+	get_artifacts_directory: "allow",
+	clear_artifact_cache: "block",
+	get_mcp_auth_challenges: "allow",
+	resolve_mcp_auth_challenge: "block",
+	start_live: "block",
+	stop_live: "block",
+	get_live_status: "allow",
+	toggle_live_mute: "block",
+	start_stt: "block",
+	stop_stt: "block",
+	toggle_stt: "block",
+	get_stt_status: "allow",
+	speak_text: "block",
+	clear_speech: "block",
+	duck_speech: "block",
+	unduck_speech: "block",
+	get_speech_status: "allow",
+	set_speech_settings: "block",
+	start_collab_hosting: "block",
+	stop_collab_hosting: "block",
+	get_collab_status: "allow",
+	join_collab_session: "block",
+	leave_collab_session: "allow",
+} as const satisfies Record<RpcCommand["type"], "allow" | "block">;
 
 /**
  * Dispatch a single parsed frame from the RPC input stream.
@@ -414,7 +698,14 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 				deps.output(await deps.handleCommand(command));
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
-				deps.output(deps.errorResponse(command.id, command.type, message));
+				deps.output(
+					deps.errorResponse(
+						command.id,
+						command.type,
+						message,
+						message === RPC_SESSION_TRANSITION_BUSY_MESSAGE ? "session_busy" : undefined,
+					),
+				);
 			}
 		})();
 		deps.trackBackgroundTask?.(task);
@@ -478,7 +769,14 @@ export class RpcInputDispatcher {
 			if (awaited) await awaited;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
+			this.#deps.output(
+				this.#deps.errorResponse(
+					command.id,
+					command.type,
+					message,
+					message === RPC_SESSION_TRANSITION_BUSY_MESSAGE ? "session_busy" : undefined,
+				),
+			);
 		} finally {
 			await this.#afterSerialCommand?.();
 		}
@@ -549,29 +847,36 @@ export async function handleRpcSessionChange(
 	session: RpcSessionChangeSession,
 	command: RpcSessionChangeCommand,
 	subagentRegistry?: RpcSubagentResetRegistry,
+	transitionOptions?: SessionTransitionOptions,
 ): Promise<RpcSessionChangeResult> {
 	switch (command.type) {
 		case "new_session": {
-			const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
+			const options = command.parentSession
+				? { parentSession: command.parentSession, ...transitionOptions }
+				: transitionOptions;
 			const cancelled = !(await session.newSession(options));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "new_session", data: { cancelled } };
 		}
 
 		case "switch_session": {
-			const cancelled = !(await session.switchSession(command.sessionPath));
-			if (!cancelled) subagentRegistry?.clear();
+			const activeSessionFile = session.sessionFile;
+			const sameSessionReload = isSameRpcSessionReload(activeSessionFile, command.sessionPath);
+			const switchSessionFile =
+				sameSessionReload && activeSessionFile !== undefined ? activeSessionFile : command.sessionPath;
+			const cancelled = !(await session.switchSession(switchSessionFile, transitionOptions));
+			if (!cancelled && !sameSessionReload) subagentRegistry?.clear();
 			return { type: "switch_session", data: { cancelled } };
 		}
 
 		case "branch": {
-			const result = await session.branch(command.entryId);
+			const result = await session.branch(command.entryId, transitionOptions);
 			if (!result.cancelled) subagentRegistry?.clear();
 			return { type: "branch", data: { text: result.selectedText, cancelled: result.cancelled } };
 		}
 
 		case "fork": {
-			const cancelled = !(await session.fork());
+			const cancelled = !(await session.fork(transitionOptions));
 			if (!cancelled) subagentRegistry?.clear();
 			return { type: "fork", data: { cancelled } };
 		}
@@ -919,6 +1224,7 @@ export async function runRpcMode(
 			type: "ready",
 			protocolVersion: 1,
 			supportedProtocolVersions: [1, 2],
+			capabilities: ["prompt_result", "prompt_lifecycle_disposition"],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		}),
@@ -945,6 +1251,7 @@ export async function runRpcMode(
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
 	const moduleErrorCode = (command: RpcCommand["type"], message: string): string => {
+		if (message === RPC_SESSION_TRANSITION_BUSY_MESSAGE) return "session_busy";
 		if (message.startsWith("Unknown controllable agent:")) return "unknown_agent";
 		if (
 			(command === "revive_agent" || command === "kill_agent" || command === "prompt_agent") &&
@@ -1056,10 +1363,28 @@ export async function runRpcMode(
 		}
 	};
 
-	let disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
-	let idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
+	const emitIdleRecap: rpcIdle.RpcIdleRecapSink = recap => {
 		output({ type: "idle_recap", recap });
-	});
+	};
+	let disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+	let idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, emitIdleRecap);
+
+	/** Releases the runtime-control and idle handles the current session owns. */
+	const disposeRpcRuntimeBehaviors = (): void => {
+		disposeRuntimeControl();
+		idleBehavior.dispose();
+	};
+
+	/**
+	 * Rebinds both runtime behaviors to the current session. Releasing first keeps
+	 * exactly one idle handle alive: unlike runtime control, idle behavior is not
+	 * idempotent, and a teardown that failed halfway may still hold a live handle.
+	 */
+	const installRpcRuntimeBehaviors = (): void => {
+		disposeRpcRuntimeBehaviors();
+		disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
+		idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, emitIdleRecap);
+	};
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1371,8 +1696,8 @@ export async function runRpcMode(
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
+		trackAgentInvokingMessage: (task, disposition) => {
+			extensionUserMessageTracker.trackAgentMessageTask(task, disposition);
 		},
 		uiContext: rpcUiContext,
 	});
@@ -1478,10 +1803,15 @@ export async function runRpcMode(
 		requestId: string | undefined,
 		commandName: "prompt" | "steer" | "follow_up" | "abort" | "abort_and_prompt",
 		route: () => void,
+		lifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">,
+		emitPromptResult = false,
 	): RpcResponse => {
 		try {
 			route();
-			return success(requestId, commandName);
+			if (!lifecycleDisposition) return success(requestId, commandName);
+			const outcome = { agentInvoked: true, lifecycleDisposition };
+			if (emitPromptResult) output({ type: "prompt_result", id: requestId, ...outcome });
+			return success(requestId, commandName, outcome);
 		} catch (routeError) {
 			const message = routeError instanceof Error ? routeError.message : String(routeError);
 			const code = routeError instanceof rpcCollab.RpcCollabGuestRoutingError ? routeError.code : "operation_failed";
@@ -1528,18 +1858,20 @@ export async function runRpcMode(
 
 	const reconcileRpcWorkModes = async (honorPlanDefault: boolean): Promise<void> => {
 		const sessionContext = session.sessionManager.buildSessionContext();
-		rpcWorkModes.disposeRpcWorkModes(session);
-		session.setPlanModeState(undefined);
-		session.setGoalModeState(undefined);
-		session.setVibeModeState(undefined);
+		// Always hydrate from a clean base: whatever transient runtime the previous
+		// session left behind hands its tools and model back before the recorded
+		// mode below re-enters and takes its own snapshot.
+		await rpcWorkModes.clearRpcTransientModeState(session);
 
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			if (!session.settings.get("goal.enabled")) {
+				session.goalRuntime.clearAccounting();
 				session.sessionManager.appendModeChange("none");
 				return;
 			}
 			const goal = readRpcPersistedGoal(sessionContext.modeData);
 			if (!goal) {
+				session.goalRuntime.clearAccounting();
 				session.sessionManager.appendModeChange("none");
 				return;
 			}
@@ -1553,6 +1885,7 @@ export async function runRpcMode(
 			return;
 		}
 
+		session.goalRuntime.clearAccounting();
 		if (sessionContext.mode === "vibe") {
 			await rpcWorkModes.enterRpcVibeMode(session);
 			return;
@@ -1588,59 +1921,173 @@ export async function runRpcMode(
 			await rpcWorkModes.enterRpcPlanMode(session);
 		}
 	};
-
-	const runReconciledRpcSessionTransition = async <T>(
-		_freshSession: boolean,
-		transition: () => Promise<{ result: T; honorPlanDefault: boolean }>,
-	): Promise<T> => {
-		const previousCwd = session.sessionManager.getCwd();
-
-		// Vibe workers are process-level; tear them down before any session change.
-		if (session.getVibeModeState()?.enabled) {
-			await rpcWorkModes.exitRpcVibeMode(session);
-		}
-
-		// Dispose infrastructure that should not span sessions.
-		await rpcCollab.disposeRpcCollab(session);
-		await releaseVoice();
-		disposeRuntimeControl();
-		idleBehavior.dispose();
-
-		let honorPlanDefault = false;
-		try {
-			const outcome = await transition();
-			honorPlanDefault = outcome.honorPlanDefault;
-			return outcome.result;
-		} finally {
-			// Tear down work modes AFTER the transition commits.
-			// If the transition was cancelled (e.g. by a session_before_switch hook),
-			// the old session's persisted plan/goal state is intact and
-			// reconcileRpcWorkModes restores it from the mode_change log.
-			rpcWorkModes.disposeRpcWorkModes(session);
-			session.setPlanModeState(undefined);
-			session.setGoalModeState(undefined);
-			session.setVibeModeState(undefined);
-
+	/** Releases attachments owned by the outgoing session after commit. */
+	const releaseRpcSessionAttachments = async (preserveCollabAttachment = false): Promise<void> => {
+		if (!preserveCollabAttachment) {
 			try {
-				await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
-			} finally {
-				try {
-					await reconcileRpcWorkModes(honorPlanDefault);
-				} finally {
-					disposeRuntimeControl = rpcRuntimeControl.installRpcRuntimeControl(session);
-					idleBehavior = rpcIdle.installRpcIdleBehavior(session, eventBus, recap => {
-						output({ type: "idle_recap", recap });
-					});
-				}
+				await rpcCollab.disposeRpcCollab(session);
+			} catch (collabError) {
+				logger.error("RPC collaboration teardown failed", { error: String(collabError) });
 			}
 		}
+		await releaseVoice();
 	};
+
+	let activeRpcSessionTransitionOwner: object | undefined;
+
+	function acquireRpcSessionTransition(): SessionTransitionLease {
+		if (activeRpcSessionTransitionOwner) throw new Error(RPC_SESSION_TRANSITION_BUSY_MESSAGE);
+		const owner = {};
+		activeRpcSessionTransitionOwner = owner;
+		let running = false;
+		let released = false;
+		let releaseRequested = false;
+		const releaseOwner = (): void => {
+			if (activeRpcSessionTransitionOwner === owner) activeRpcSessionTransitionOwner = undefined;
+		};
+		return {
+			run: async <T>(
+				transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+				options?: SessionTransitionRunOptions,
+			): Promise<T> => {
+				if (released || activeRpcSessionTransitionOwner !== owner || running) {
+					throw new Error(RPC_SESSION_TRANSITION_BUSY_MESSAGE);
+				}
+				running = true;
+				try {
+					return await runOwnedRpcSessionTransition(transition, options);
+				} finally {
+					running = false;
+					if (releaseRequested) releaseOwner();
+				}
+			},
+			release: () => {
+				if (released) return;
+				released = true;
+				if (running) {
+					releaseRequested = true;
+				} else {
+					releaseOwner();
+				}
+			},
+		};
+	}
+
+	async function runReconciledRpcSessionTransition<T>(
+		transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+		options?: SessionTransitionRunOptions,
+	): Promise<T> {
+		const lease = acquireRpcSessionTransition();
+		try {
+			return await lease.run(transition, options);
+		} finally {
+			lease.release();
+		}
+	}
+
+	async function runOwnedRpcSessionTransition<T>(
+		transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
+		options: SessionTransitionRunOptions = {},
+	): Promise<T> {
+		const previousCwd = session.sessionManager.getCwd();
+		let workModeSuspension: rpcWorkModes.RpcTransientModeSuspension | undefined;
+		let runtimeSuspension: rpcRuntimeControl.RpcRuntimeControlSuspension | undefined;
+		let idleSuspension: rpcIdle.RpcIdleBehaviorSuspension | undefined;
+		return runRpcSessionTransitionAtCommit(
+			transition,
+			async () => {
+				runtimeSuspension = rpcRuntimeControl.suspendRpcRuntimeControl(session);
+				idleSuspension = idleBehavior.suspend();
+				await session.goalRuntime.onTaskAborted({ reason: "internal" });
+				workModeSuspension = await rpcWorkModes.clearRpcTransientModeState(session, {
+					reversibleVibeSuspension: true,
+				});
+			},
+			async ({ committed, honorPlanDefault }) => {
+				if (!committed) {
+					try {
+						await workModeSuspension?.rollback();
+					} finally {
+						try {
+							runtimeSuspension?.rollback();
+						} finally {
+							idleSuspension?.rollback();
+						}
+					}
+					return;
+				}
+
+				let loopConfiguration: rpcRuntimeControl.RpcLoopConfiguration | undefined;
+				let reconciliationFailed = false;
+				let reconciliationError: unknown;
+				const captureReconciliationFailure = (error: unknown): void => {
+					if (reconciliationFailed) return;
+					reconciliationFailed = true;
+					reconciliationError = error;
+				};
+				try {
+					try {
+						await workModeSuspension?.commit();
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+					try {
+						loopConfiguration = runtimeSuspension?.commit(options.preserveLoopConfiguration === true);
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+					try {
+						idleSuspension?.commit();
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+					try {
+						await releaseRpcSessionAttachments(options.preserveCollabAttachmentOnCommit === true);
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+					try {
+						await reconcileRpcCwd(previousCwd, session.sessionManager.getCwd());
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+					try {
+						await reconcileRpcWorkModes(honorPlanDefault);
+					} catch (error) {
+						captureReconciliationFailure(error);
+					}
+				} finally {
+					installRpcRuntimeBehaviors();
+					if (loopConfiguration) {
+						rpcRuntimeControl.restoreRpcLoopConfiguration(session, loopConfiguration);
+					}
+				}
+				if (reconciliationFailed) throw reconciliationError;
+			},
+			options.honorPlanDefaultOnCommit === true,
+			options.preserveCurrentSessionOnSuccess === true,
+		);
+	}
+
+	const rpcSessionTransitionCoordinator: SessionTransitionCoordinator = {
+		run: runReconciledRpcSessionTransition,
+		acquire: acquireRpcSessionTransition,
+	};
+	session.setSessionTransitionCoordinator(rpcSessionTransitionCoordinator);
 
 	await reconcileRpcWorkModes(true);
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (rpcCollab.isRpcCollabGuest(session) && RPC_COLLAB_GUEST_COMMAND_POLICY[command.type] === "block") {
+			return error(
+				id,
+				command.type,
+				"This command is unavailable while joined as a collaboration guest. Leave the collab session first.",
+				"operation_failed",
+			);
+		}
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1654,49 +2101,89 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
+				const resolvedPrompt = (
+					agentInvoked: boolean,
+					lifecycleDisposition: RpcPromptLifecycleDisposition = agentInvoked ? "future" : "none",
+				): RpcResponse => {
+					const outcome = { agentInvoked, lifecycleDisposition };
+					output({ type: "prompt_result", id, ...outcome });
+					return success(id, "prompt", outcome);
+				};
 				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "prompt", () =>
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
-					);
+					return routeRpcCollabGuestPrompt({
+						id,
+						relay: () => rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+						output,
+						lifecycleDisposition: rpcCollab.getRpcCollabGuestLifecycleDisposition(session) ?? "future",
+					});
 				}
 				let message = command.message.trim();
 				let images = command.images ? [...command.images] : undefined;
+				let inputAgentMessageTasks: readonly RpcExtensionAgentMessageTask[] = [];
+				const resolveWithoutPrompt = (
+					agentInvoked = false,
+					lifecycleDisposition: Exclude<RpcPromptLifecycleDisposition, "none"> = "future",
+				): RpcResponse => {
+					if (inputAgentMessageTasks.length === 0) {
+						return resolvedPrompt(agentInvoked, agentInvoked ? lifecycleDisposition : "none");
+					}
+					reportLocalOnlyPromptResult({
+						id,
+						prompt: Promise.resolve(agentInvoked),
+						output,
+						onError: promptError => output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
+						promptLifecycleDisposition: lifecycleDisposition,
+						extensionAgentMessageTasks: () => inputAgentMessageTasks,
+					});
+					return success(id, "prompt");
+				};
 				const runner = session.extensionRunner;
 				if (runner?.hasHandlers("input")) {
-					const inputResult = await runner.emitInput(message, images, "rpc");
+					const trackedInput = extensionUserMessageTracker.watchPrompt(() =>
+						runner.emitInput(message, images, "rpc"),
+					);
+					const inputResult = await trackedInput.prompt;
+					inputAgentMessageTasks = trackedInput.agentMessageTasks();
 					if (inputResult?.handled) {
-						return success(id, "prompt", { agentInvoked: false });
+						return resolveWithoutPrompt();
 					}
 					if (inputResult?.text !== undefined) message = inputResult.text.trim();
 					if (inputResult?.images !== undefined) images = inputResult.images;
 				}
 				if (!message && !images?.length) {
-					return success(id, "prompt", { agentInvoked: false });
+					return resolveWithoutPrompt();
 				}
 
 				recordPromptHistory(message);
+				const skillDisposition =
+					session.isStreaming && command.streamingBehavior !== "followUp" ? "current" : "future";
 				const skillResult = await tryRunRpcSkillCommand(session, message, command.streamingBehavior);
 				if (skillResult) {
-					return success(id, "prompt", skillResult);
+					return resolveWithoutPrompt(skillResult.agentInvoked, skillDisposition);
 				}
 				const builtinResult = await executeRpcBuiltinSlashCommand(message);
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
+						const promptLifecycleDisposition = session.isStreaming ? "current" : "future";
 						watchAndReportLocalOnlyPromptResult({
 							id,
 							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
 							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
+							onError: promptError =>
+								output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
 							extensionUserMessageTracker,
+							promptLifecycleDisposition,
+							additionalAgentMessageTasks: inputAgentMessageTasks,
 						});
 						return success(id, "prompt");
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					return resolveWithoutPrompt();
 				}
 
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
+				// Don't await - events will stream. Extension-injected agent tasks settle
+				// before the correlated outcome, while the acknowledgement remains immediate.
+				const promptLifecycleDisposition =
+					session.isStreaming && command.streamingBehavior !== "followUp" ? "current" : "future";
 				watchAndReportLocalOnlyPromptResult({
 					id,
 					startPrompt: () =>
@@ -1705,8 +2192,10 @@ export async function runRpcMode(
 							streamingBehavior: command.streamingBehavior,
 						}),
 					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
+					onError: promptError => output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
 					extensionUserMessageTracker,
+					promptLifecycleDisposition,
+					additionalAgentMessageTasks: inputAgentMessageTasks,
 				});
 				return success(id, "prompt");
 			}
@@ -1723,12 +2212,16 @@ export async function runRpcMode(
 
 			case "follow_up": {
 				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "follow_up", () =>
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+					const lifecycleDisposition = rpcCollab.getRpcCollabGuestLifecycleDisposition(session) ?? "future";
+					return routeCollabGuestCommand(
+						id,
+						"follow_up",
+						() => rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+						lifecycleDisposition,
 					);
 				}
 				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
+				return success(id, "follow_up", { agentInvoked: true, lifecycleDisposition: "future" });
 			}
 
 			case "abort": {
@@ -1741,15 +2234,27 @@ export async function runRpcMode(
 
 			case "abort_and_prompt": {
 				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "abort_and_prompt", () => {
-						rpcCollab.sendRpcCollabGuestAbort(session);
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images);
-					});
+					return routeCollabGuestCommand(
+						id,
+						"abort_and_prompt",
+						() => {
+							rpcCollab.sendRpcCollabGuestAbort(session);
+							rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images);
+						},
+						"future",
+						true,
+					);
 				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
+				watchAndReportLocalOnlyPromptResult({
+					id,
+					startPrompt: () => session.prompt(command.message, { images: command.images }),
+					output,
+					onError: promptError =>
+						output(error(id, "abort_and_prompt", promptError.message, "prompt_scheduling_failed")),
+					extensionUserMessageTracker,
+					promptLifecycleDisposition: "future",
+				});
 				return success(id, "abort_and_prompt");
 			}
 
@@ -1768,8 +2273,13 @@ export async function runRpcMode(
 			case "cancel_btw":
 				return moduleCommand(id, "cancel_btw", () => rpcBtw.cancelRpcBtw(session));
 
-			case "branch_btw":
+			case "branch_btw": {
+				const guestBlock = getRpcSessionTransitionGuestBlock(session);
+				if (guestBlock) {
+					return error(id, "branch_btw", guestBlock.message, guestBlock.code);
+				}
 				return moduleCommand(id, "branch_btw", () => rpcBtw.branchRpcBtw(session));
+			}
 
 			case "complete": {
 				const provider = buildRpcAutocompleteProvider();
@@ -1839,21 +2349,40 @@ export async function runRpcMode(
 			case "switch_session":
 			case "branch":
 			case "fork": {
+				const guestBlock = getRpcSessionTransitionGuestBlock(session);
+				if (guestBlock) {
+					return error(id, command.type, guestBlock.message, guestBlock.code);
+				}
+				let sameSessionReload = false;
 				let resolvedCommand: RpcSessionChangeCommand = command;
 				if (command.type === "switch_session") {
 					const sessionPath = await resolveRpcSessionReference(command.sessionPath);
 					if (!sessionPath) {
 						return error(id, "switch_session", `Session "${command.sessionPath}" not found`, "unknown_session");
 					}
+					sameSessionReload = isSameRpcSessionReload(session.sessionFile, sessionPath);
 					resolvedCommand = { ...command, sessionPath };
 				}
-				const result = await runReconciledRpcSessionTransition(command.type === "new_session", async () => {
-					const changed = await handleRpcSessionChange(session, resolvedCommand, subagentRegistry);
-					return {
-						result: changed,
-						honorPlanDefault: command.type === "new_session" && !changed.data.cancelled,
-					};
-				});
+				const result = await runReconciledRpcSessionTransition(
+					async transitionOptions => {
+						const changed = await handleRpcSessionChange(
+							session,
+							resolvedCommand,
+							subagentRegistry,
+							transitionOptions,
+						);
+						const committed = !changed.data.cancelled;
+						return {
+							result: changed,
+							committed,
+							honorPlanDefault: command.type === "new_session" && committed,
+						};
+					},
+					{
+						honorPlanDefaultOnCommit: command.type === "new_session",
+						preserveCurrentSessionOnSuccess: sameSessionReload,
+					},
+				);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
 			}
@@ -2120,6 +2649,10 @@ export async function runRpcMode(
 			case "get_goal_state":
 				return moduleCommand(id, "get_goal_state", () => rpcWorkModes.readRpcGoalState(session));
 
+			case "begin_guided_goal":
+				return moduleCommand(id, "begin_guided_goal", () =>
+					rpcWorkModes.beginRpcGuidedGoal(session, command.initialObjective),
+				);
 
 			case "enter_vibe_mode":
 				return moduleCommand(id, "enter_vibe_mode", () => rpcWorkModes.enterRpcVibeMode(session));
@@ -2569,16 +3102,23 @@ export async function runRpcMode(
 				const activeSessionFile = session.sessionManager.getSessionFile();
 				const active = activeSessionFile !== undefined && target === path.resolve(activeSessionFile);
 				if (active) {
+					const guestBlock = getRpcSessionTransitionGuestBlock(session);
+					if (guestBlock) {
+						return error(id, "delete_session", guestBlock.message, guestBlock.code);
+					}
 					try {
 						if (session.isCompacting) {
 							session.abortCompaction();
 							while (session.isCompacting) await Bun.sleep(10);
 						}
-						const deleted = await runReconciledRpcSessionTransition(true, async () => {
-							const created = await session.newSession({ drop: true });
-							if (created) subagentRegistry?.clear();
-							return { result: created, honorPlanDefault: created };
-						});
+						const deleted = await runReconciledRpcSessionTransition(
+							async transitionOptions => {
+								const created = await session.newSession({ drop: true, ...transitionOptions });
+								if (created) subagentRegistry?.clear();
+								return { result: created, committed: created, honorPlanDefault: created };
+							},
+							{ honorPlanDefaultOnCommit: true },
+						);
 						if (!deleted) {
 							return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
 						}
@@ -2619,11 +3159,22 @@ export async function runRpcMode(
 			}
 
 			case "navigate_tree": {
-				const result = await session.navigateTree(command.targetId, {
-					summarize: command.summarize,
-					customInstructions: command.customInstructions,
-					allowAskReopen: command.allowAskReopen,
-					reanswerAskResult: command.reanswerAskResult,
+				const previousLeafId = session.sessionManager.getLeafId();
+				const result = await session.runSessionTransition(async transitionOptions => {
+					const navigation = await session.navigateTree(
+						command.targetId,
+						{
+							summarize: command.summarize,
+							customInstructions: command.customInstructions,
+							allowAskReopen: command.allowAskReopen,
+							reanswerAskResult: command.reanswerAskResult,
+						},
+						transitionOptions,
+					);
+					const committed =
+						navigation.askReanswerCommitted === true ||
+						(!navigation.cancelled && session.sessionManager.getLeafId() !== previousLeafId);
+					return { result: navigation, committed, honorPlanDefault: false };
 				});
 				return success(id, "navigate_tree", {
 					...(result.editorText === undefined ? {} : { editorText: result.editorText }),
@@ -3046,11 +3597,10 @@ export async function runRpcMode(
 			unsubscribeSettings();
 			unsubscribeRawSse?.();
 			unsubscribeProviderRequestObservations?.();
-			disposeRuntimeControl();
-			idleBehavior.dispose();
+			session.setSessionTransitionCoordinator(null);
+			disposeRpcRuntimeBehaviors();
 			rpcWorkModes.disposeRpcWorkModes(session);
-			await rpcCollab.disposeRpcCollab(session);
-			await releaseVoice();
+			await releaseRpcSessionAttachments();
 			await session.dispose();
 			// See the EOF path: queued frames must reach stdout before the process dies.
 			await stdoutQueue;
@@ -3106,11 +3656,10 @@ export async function runRpcMode(
 	unsubscribeSettings();
 	unsubscribeRawSse?.();
 	unsubscribeProviderRequestObservations?.();
-	disposeRuntimeControl();
-	idleBehavior.dispose();
+	session.setSessionTransitionCoordinator(null);
+	disposeRpcRuntimeBehaviors();
 	rpcWorkModes.disposeRpcWorkModes(session);
-	await rpcCollab.disposeRpcCollab(session);
-	await releaseVoice();
+	await releaseRpcSessionAttachments();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle

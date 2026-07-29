@@ -20,8 +20,9 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
-import { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
+import type { SessionTransitionOptions } from "../session/agent-session-types";
 import type { SessionEntry } from "../session/session-entries";
 import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
 import { setSessionTerminalTitle } from "../utils/title-generator";
@@ -82,6 +83,11 @@ interface PendingSnapshot {
 	isResync: boolean;
 }
 
+interface AgentMirrorSnapshot {
+	refs: AgentRef[];
+	transcripts: Map<string, boolean>;
+}
+
 /** Minimal context surface the idle-state reconciler mutates. */
 export interface GuestIdleReconcilerCtx {
 	statusLine?: { markActivityEnd: () => void };
@@ -133,6 +139,13 @@ export class CollabGuestLink {
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
 	#left = false;
+	/** True once the replica switch committed and the local session needs restoring. */
+	#replicaCommitted = false;
+	/** Original local mirror restored after leaving or rolling back a failed join. */
+	#returnAgentMirror: AgentMirrorSnapshot | null = null;
+	/** Shared cleanup attempt: concurrent/repeated leave calls await the same restoration. */
+	#restorePromise: Promise<void> | null = null;
+	#restoreComplete = false;
 	/**
 	 * Buffer for the in-flight chunked welcome. Set by the small `welcome`
 	 * frame, accumulated by every `snapshot-chunk`, drained when the final
@@ -154,6 +167,8 @@ export class CollabGuestLink {
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
+	/** Authoritative logical host lifecycle, independent of the replica AgentSession. */
+	#remoteAgentActive = false;
 	state: CollabSessionState | null = null;
 	/** Local mirror of the host's agent ecosystem (refs carry `session: null`). */
 	readonly agentRegistry = new AgentRegistry();
@@ -209,6 +224,16 @@ export class CollabGuestLink {
 	/** Whether the guest currently has an open relay link for a routed action. */
 	get isConnected(): boolean {
 		return this.#socket?.isOpen === true;
+	}
+
+	/** Whether relayed input would join the host's current logical agent run. */
+	get remoteAgentActive(): boolean {
+		return this.#remoteAgentActive;
+	}
+
+	/** Whether cleanup still owes a switch away from the committed replica. */
+	get hasCommittedReplica(): boolean {
+		return this.#replicaCommitted;
 	}
 
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
@@ -326,9 +351,14 @@ export class CollabGuestLink {
 		try {
 			await firstWelcome.promise;
 		} catch (err) {
-			this.#left = true;
-			socket.close();
-			this.#socket = null;
+			try {
+				await this.#restoreLocalSession();
+			} catch (restoreError) {
+				throw new AggregateError(
+					[err, restoreError],
+					"Collab join failed and the original local session could not be restored.",
+				);
+			}
 			throw err;
 		} finally {
 			this.#joinReject = null;
@@ -342,8 +372,6 @@ export class CollabGuestLink {
 
 	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
 	async leave(_reason: string): Promise<void> {
-		if (this.#left) return;
-		this.#socket?.close();
 		await this.#restoreLocalSession();
 	}
 
@@ -412,9 +440,31 @@ export class CollabGuestLink {
 		// Resume sequence (selector-controller.handleResumeSession) minus
 		// applyCwdChange: the guest process never chdirs to a host path. The
 		// SessionManager still adopts the header cwd for display/relativization.
+		if (!this.#replicaCommitted && !this.#returnAgentMirror) {
+			this.#returnAgentMirror = this.#captureAgentMirror();
+		}
+		const switchReplica = async (transitionOptions: SessionTransitionOptions) => {
+			const didSwitch = await this.#ctx.session.switchSession(replicaPath, {
+				...transitionOptions,
+				onCommitted: () => {
+					this.#replicaCommitted = true;
+					transitionOptions.onCommitted?.();
+				},
+			});
+			if (didSwitch) this.#replicaCommitted = true;
+			return {
+				result: didSwitch,
+				committed: didSwitch,
+				honorPlanDefault: false,
+			};
+		};
+		const switched = this.#ctx.runSessionTransition
+			? await this.#ctx.runSessionTransition(switchReplica, { preserveCollabAttachmentOnCommit: true })
+			: await switchReplica({});
+		if (!switched) throw new Error("Collab replica session switch was cancelled.");
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
-		await this.#ctx.session.switchSession(replicaPath);
+		this.#remoteAgentActive = pending.state.isStreaming;
 		this.state = pending.state;
 		if (this.#ctx.statusLine) reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#applyHostState(pending.state);
@@ -538,6 +588,11 @@ export class CollabGuestLink {
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
+		if (event.type === "agent_start") {
+			this.#remoteAgentActive = true;
+		} else if (event.type === "agent_end") {
+			this.#remoteAgentActive = event.isTerminal === false;
+		}
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start
@@ -611,11 +666,40 @@ export class CollabGuestLink {
 		}
 	}
 
+	#captureAgentMirror(): AgentMirrorSnapshot {
+		return {
+			refs: this.agentRegistry.list().map(ref => ({ ...ref })),
+			transcripts: new Map(this.#agentHasTranscript),
+		};
+	}
+
 	#clearAgentMirror(): void {
 		for (const ref of this.agentRegistry.list()) {
 			this.agentRegistry.unregister(ref.id);
 		}
 		this.#agentHasTranscript.clear();
+	}
+
+	#restoreAgentMirror(): void {
+		const snapshot = this.#returnAgentMirror;
+		if (!snapshot) return;
+		this.#clearAgentMirror();
+		for (const ref of snapshot.refs) {
+			const restored = this.agentRegistry.register({
+				id: ref.id,
+				displayName: ref.displayName,
+				kind: ref.kind,
+				parentId: ref.parentId,
+				session: ref.session,
+				sessionFile: ref.sessionFile,
+				status: ref.status,
+			});
+			Object.assign(restored, ref);
+		}
+		for (const [id, hasTranscript] of snapshot.transcripts) {
+			this.#agentHasTranscript.set(id, hasTranscript);
+		}
+		this.#returnAgentMirror = null;
 	}
 
 	/** Resolve every in-flight transcript request with null (resolvers clear their own timers). */
@@ -713,24 +797,117 @@ export class CollabGuestLink {
 	}
 
 	async #restoreLocalSession(): Promise<void> {
-		if (this.#left) return;
-		this.#left = true;
-		this.#socket = null;
+		if (this.#restoreComplete) return;
+		if (this.#restorePromise) return this.#restorePromise;
+		const restore = this.#performLocalSessionRestore();
+		this.#restorePromise = restore;
+		try {
+			await restore;
+			this.#restoreComplete = true;
+		} catch (error) {
+			if (!this.#replicaCommitted) this.#restoreComplete = true;
+			throw error;
+		} finally {
+			if (this.#restoreComplete) {
+				this.#left = true;
+				this.#remoteAgentActive = false;
+				const socket = this.#socket;
+				this.#socket = null;
+				socket?.close();
+			}
+			if (this.#restorePromise === restore) this.#restorePromise = null;
+		}
+	}
+
+	async #performLocalSessionRestore(): Promise<void> {
+		const restoringReplica = this.#replicaCommitted;
+		let committedRestoreError: unknown;
+		if (restoringReplica) {
+			try {
+				await this.#switchToLocalSession();
+			} catch (error) {
+				if (this.#replicaCommitted) throw error;
+				committedRestoreError = error;
+			}
+			this.#restoreAgentMirror();
+		}
 		this.#ctx.collabGuest = undefined;
 		this.#ctx.statusLine?.setCollabStatus(null);
 		this.#flushPendingTranscripts();
-		this.#clearAgentMirror();
-		this.#ctx.syncRunningSubagentBadge?.();
-		this.#ctx.resetObserverRegistry?.();
-		this.#clearTransientUi();
-		// Replica file stays on disk: it is a valid session file outside the
-		// sessions dir, so it never shows up in /resume but remains readable.
-		if (this.#returnSessionFile) {
-			if (this.#ctx.handleResumeSession) await this.#ctx.handleResumeSession(this.#returnSessionFile);
-			else await this.#ctx.session.switchSession(this.#returnSessionFile);
+		this.state = null;
+		this.#welcomed = false;
+		if (restoringReplica) {
+			this.#ctx.syncRunningSubagentBadge?.();
+			this.#ctx.resetObserverRegistry?.();
+		}
+		if (committedRestoreError) throw committedRestoreError;
+	}
+
+	async #switchToLocalSession(): Promise<void> {
+		const returnSessionFile = this.#returnSessionFile;
+		if (returnSessionFile) {
+			if (this.#ctx.runSessionTransition) {
+				const switched = await this.#ctx.runSessionTransition(
+					async transitionOptions => {
+						const didSwitch = await this.#ctx.session.switchSession(returnSessionFile, {
+							...transitionOptions,
+							bypassBeforeSwitchHook: true,
+							onCommitted: () => {
+								this.#replicaCommitted = false;
+								transitionOptions.onCommitted?.();
+							},
+						});
+						if (didSwitch) this.#replicaCommitted = false;
+						return {
+							result: didSwitch,
+							committed: didSwitch,
+							honorPlanDefault: false,
+						};
+					},
+					{ preserveCollabAttachmentOnCommit: true },
+				);
+				if (!switched) throw new Error("Local session restore was cancelled.");
+			} else if (this.#ctx.handleResumeSession) {
+				await this.#ctx.handleResumeSession(returnSessionFile);
+				this.#replicaCommitted = false;
+			} else {
+				const switched = await this.#ctx.session.switchSession(returnSessionFile, {
+					bypassBeforeSwitchHook: true,
+					onCommitted: () => {
+						this.#replicaCommitted = false;
+					},
+				});
+				if (!switched) throw new Error("Local session restore was cancelled.");
+				this.#replicaCommitted = false;
+			}
 			return;
 		}
-		await this.#ctx.session.newSession();
+		const created = this.#ctx.runSessionTransition
+			? await this.#ctx.runSessionTransition(
+					async transitionOptions => {
+						const didCreate = await this.#ctx.session.newSession({
+							...transitionOptions,
+							onCommitted: () => {
+								this.#replicaCommitted = false;
+								transitionOptions.onCommitted?.();
+							},
+						});
+						if (didCreate) this.#replicaCommitted = false;
+						return {
+							result: didCreate,
+							committed: didCreate,
+							honorPlanDefault: didCreate,
+						};
+					},
+					{ preserveCollabAttachmentOnCommit: true },
+				)
+			: await this.#ctx.session.newSession({
+					onCommitted: () => {
+						this.#replicaCommitted = false;
+					},
+				});
+		if (!created) throw new Error("Local session creation was cancelled.");
+		this.#replicaCommitted = false;
 		if (this.#ctx.statusLine) {
 			setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
 			this.#ctx.statusLine.invalidate();
