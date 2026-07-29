@@ -7,6 +7,8 @@ from omp_rpc import (
     ExtensionAskDialogOption,
     ExtensionAskDialogQuestion,
     ExtensionUiRequest,
+    PromptResultEvent,
+    ReadyEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -97,6 +99,37 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.model.thinking.default_level, "medium")
         self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
         self.assertTrue(state.model.thinking.supports_display)
+
+    def test_ready_capabilities_are_additive(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "ready",
+                "capabilities": [
+                    "prompt_result",
+                    "prompt_lifecycle_disposition",
+                    "future_capability",
+                ],
+            }
+        )
+
+        self.assertIsInstance(notification, ReadyEvent)
+        self.assertEqual(
+            notification.capabilities,
+            ("prompt_result", "prompt_lifecycle_disposition"),
+        )
+
+    def test_parse_prompt_lifecycle_disposition(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "prompt_result",
+                "id": "request-1",
+                "agentInvoked": True,
+                "lifecycleDisposition": "current",
+            }
+        )
+
+        self.assertIsInstance(notification, PromptResultEvent)
+        self.assertEqual(notification.lifecycle_disposition, "current")
 
     def test_parse_agent_end_notification(self) -> None:
         notification = parse_notification(

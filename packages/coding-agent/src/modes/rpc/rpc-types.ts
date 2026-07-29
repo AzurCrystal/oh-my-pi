@@ -653,10 +653,16 @@ export interface RpcVoiceEventFrame {
 	event: RpcVoiceEvent;
 }
 
+export type RpcPromptLifecycleDisposition = "none" | "current" | "future";
+
+export type RpcCapability = "prompt_result" | "prompt_lifecycle_disposition";
+
 /** Prompt outcome carried in the server acknowledgement payload. */
 export interface RpcPromptAcknowledgement {
 	/** Set when the server can determine the outcome before acknowledging the prompt. */
 	agentInvoked?: boolean;
+	/** How this input relates to agent lifecycle reservations. */
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
 }
 
 /** Client-side prompt submission result; `requestId` is the response envelope id, not wire payload data. */
@@ -664,9 +670,10 @@ export interface RpcPromptSubmissionResult extends RpcPromptAcknowledgement {
 	requestId: string;
 }
 
-/** Client-side acknowledgement for an asynchronous command that may report a later same-id failure. */
+/** Client-side acknowledgement for an asynchronous command that may report a later same-id outcome. */
 export interface RpcAsyncCommandSubmissionResult {
 	requestId: string;
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
 }
 
 /** Prompt scheduling failure emitted after the initial prompt or abort-and-prompt acknowledgement. */
@@ -683,12 +690,14 @@ export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
 	agentInvoked: boolean;
+	lifecycleDisposition?: RpcPromptLifecycleDisposition;
 }
 
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
+	capabilities?: RpcCapability[];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
 }
@@ -792,9 +801,9 @@ export type RpcResponse =
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	| { id?: string; type: "response"; command: "follow_up"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "abort"; success: true }
-	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true; data?: RpcPromptAcknowledgement }
 	| { id?: string; type: "response"; command: "ask_btw"; success: true; data: RpcBtwAskResult }
 	| {
 			id?: string;

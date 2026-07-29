@@ -7,6 +7,8 @@
  * Used by rpc-client lifecycle tests that need to exercise start/stop/start
  * without booting the full agent runtime (which requires provider credentials).
  */
+import { readLines } from "@oh-my-pi/pi-utils";
+
 if (Bun.env.MOCK_RPC_PID_FILE) {
 	await Bun.write(Bun.env.MOCK_RPC_PID_FILE, String(process.pid));
 }
@@ -15,8 +17,17 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 }
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
+const supportsPromptResult = Bun.env.MOCK_RPC_OLD_RUNTIME !== "1";
 let protocolV2Enabled = false;
-let lifecycleScenario: "queued" | "continuing" | undefined;
+let lifecycleScenario:
+	| "queued"
+	| "continuing"
+	| "extension-delayed"
+	| "extension-error"
+	| "duplicate-current"
+	| undefined;
+let lifecyclePromptId: string | undefined;
+const tombstonePromptIds: string[] = [];
 process.stdout.write(
 	`${JSON.stringify(
 		supportsProtocolV2
@@ -24,10 +35,14 @@ process.stdout.write(
 					type: "ready",
 					protocolVersion: 1,
 					supportedProtocolVersions: [1, 2],
+					...(supportsPromptResult ? { capabilities: ["prompt_result", "prompt_lifecycle_disposition"] } : {}),
 					maxFrameBytes: 1024 * 1024,
 					maxReassembledFrameBytes: 64 * 1024 * 1024,
 				}
-			: { type: "ready" },
+			: {
+					type: "ready",
+					...(supportsPromptResult ? { capabilities: ["prompt_result", "prompt_lifecycle_disposition"] } : {}),
+				},
 	)}\n`,
 );
 
@@ -53,8 +68,9 @@ function writeFrame(frame: Record<string, unknown>): void {
 	}
 }
 
-// Bun's `console` is an AsyncIterable over stdin lines.
-for await (const raw of console) {
+const decoder = new TextDecoder();
+for await (const line of readLines(Bun.stdin.stream())) {
+	const raw = decoder.decode(line).trim();
 	if (!raw) continue;
 	try {
 		const frame = JSON.parse(raw) as Record<string, unknown>;
@@ -80,19 +96,99 @@ for await (const raw of console) {
 				protocolV2Enabled = true;
 				continue;
 			}
+			if (Bun.env.MOCK_RPC_TOMBSTONES === "1") {
+				if (frame.type === "prompt" && id) {
+					tombstonePromptIds.push(id);
+					writeFrame({ id, type: "response", command: frame.type, success: true });
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "late prompt failure",
+						code: "prompt_scheduling_failed",
+					});
+					continue;
+				}
+				if (frame.type === "get_state") {
+					const newestId = tombstonePromptIds.at(-1);
+					const oldestId = tombstonePromptIds[0];
+					for (const promptId of [newestId, oldestId]) {
+						if (!promptId) continue;
+						writeFrame({
+							id: promptId,
+							type: "response",
+							command: "prompt",
+							success: false,
+							error: "duplicate late prompt failure",
+							code: "prompt_scheduling_failed",
+						});
+					}
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+			}
 			if (Bun.env.MOCK_RPC_LIFECYCLE === "1") {
 				if (frame.type === "prompt") {
-					writeFrame({ id, type: "response", command: frame.type, success: true });
+					if (frame.message === "duplicate-current") {
+						lifecycleScenario = "duplicate-current";
+						writeFrame({
+							type: "prompt_result",
+							id,
+							agentInvoked: true,
+							lifecycleDisposition: "current",
+						});
+						writeFrame({
+							id,
+							type: "response",
+							command: frame.type,
+							success: true,
+							data: { agentInvoked: true, lifecycleDisposition: "current" },
+						});
+						continue;
+					}
+					await writeFrame({ id, type: "response", command: frame.type, success: true });
 					if (frame.message === "local-only") {
-						writeFrame({ type: "prompt_result", id, agentInvoked: false });
+						writeFrame({
+							type: "prompt_result",
+							id,
+							agentInvoked: false,
+							lifecycleDisposition: "none",
+						});
 					} else if (frame.message === "queued-B") {
 						lifecycleScenario = "queued";
-						writeFrame({ type: "prompt_result", id, agentInvoked: true });
+						writeFrame({
+							type: "prompt_result",
+							id,
+							agentInvoked: true,
+							lifecycleDisposition: "future",
+						});
+					} else if (frame.message === "extension-delayed") {
+						lifecycleScenario = "extension-delayed";
+						lifecyclePromptId = id;
+					} else if (frame.message === "extension-prestart-error") {
+						lifecycleScenario = "extension-error";
+						lifecyclePromptId = id;
 					} else {
 						if (frame.message === "continuing") lifecycleScenario = "continuing";
 						writeFrame({ type: "agent_start" });
-						writeFrame({ type: "prompt_result", id, agentInvoked: true });
+						writeFrame({
+							type: "prompt_result",
+							id,
+							agentInvoked: true,
+							lifecycleDisposition: "future",
+						});
 					}
+					continue;
+				}
+				if (frame.type === "follow_up" && frame.message === "guest-current") {
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: true,
+						data: { agentInvoked: true, lifecycleDisposition: "current" },
+					});
 					continue;
 				}
 				if (frame.type === "abort_and_prompt") {
@@ -104,6 +200,16 @@ for await (const raw of console) {
 							success: false,
 							error: "Replacement rejected immediately",
 							code: "operation_failed",
+						});
+						continue;
+					}
+					if (frame.message === "local-only") {
+						writeFrame({ id, type: "response", command: frame.type, success: true });
+						writeFrame({
+							type: "prompt_result",
+							id,
+							agentInvoked: false,
+							lifecycleDisposition: "none",
 						});
 						continue;
 					}
@@ -120,15 +226,47 @@ for await (const raw of console) {
 					continue;
 				}
 				if (frame.type === "get_state") {
-					writeFrame({
-						type: "agent_end",
-						messages: [],
-						...(lifecycleScenario === "continuing" ? { isTerminal: false } : {}),
-					});
+					if (lifecycleScenario === "extension-delayed") {
+						writeFrame({ type: "agent_start" });
+						writeFrame({ type: "agent_end", messages: [] });
+						if (lifecyclePromptId) {
+							writeFrame({
+								type: "prompt_result",
+								id: lifecyclePromptId,
+								agentInvoked: true,
+								lifecycleDisposition: "future",
+							});
+						}
+						lifecycleScenario = undefined;
+						lifecyclePromptId = undefined;
+					} else if (lifecycleScenario === "extension-error") {
+						if (lifecyclePromptId) {
+							writeFrame({
+								id: lifecyclePromptId,
+								type: "response",
+								command: "prompt",
+								success: false,
+								error: "Extension task failed before agent start",
+								code: "prompt_scheduling_failed",
+							});
+						}
+						lifecycleScenario = undefined;
+						lifecyclePromptId = undefined;
+					} else {
+						writeFrame({
+							type: "agent_end",
+							messages: [],
+							...(lifecycleScenario === "continuing" ? { isTerminal: false } : {}),
+						});
+					}
 					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
 					continue;
 				}
 				if (frame.type === "get_settings") {
+					if (lifecycleScenario === "duplicate-current") {
+						writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+						continue;
+					}
 					writeFrame({ type: "agent_start" });
 					writeFrame({ type: "agent_end", messages: [] });
 					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
@@ -156,7 +294,12 @@ for await (const raw of console) {
 					});
 					continue;
 				}
-				writeFrame({ type: "prompt_result", id, agentInvoked: agentInvoked ?? false });
+				writeFrame({
+					type: "prompt_result",
+					id,
+					agentInvoked: agentInvoked ?? false,
+					lifecycleDisposition: agentInvoked ? "future" : "none",
+				});
 				continue;
 			}
 			if (frame.type === "get_messages_page") {

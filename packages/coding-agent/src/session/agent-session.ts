@@ -312,7 +312,7 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
+import { cleanupEmptyMoveSession, type SessionManager, type SessionManagerStateSnapshot } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -4220,9 +4220,9 @@ export class AgentSession {
 	}
 
 	/** Register post-prompt work in tests without driving a full agent turn. */
-	trackPostPromptTaskForTests(task: Promise<unknown>): void {
+	trackPostPromptTaskForTests(task: Promise<unknown> | ((signal: AbortSignal) => Promise<unknown>)): void {
 		if (!isBunTestRuntime()) throw new Error("trackPostPromptTaskForTests is test-only");
-		this.#trackPostPromptTask(task);
+		this.#trackPostPromptTask(typeof task === "function" ? task(this.#postPromptTasksAbortController.signal) : task);
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -6480,8 +6480,19 @@ export class AgentSession {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		return this.#handoff.handoff(customInstructions, options);
+	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		return this.runSessionTransition(async transitionOptions => {
+			let committed = false;
+			const onCommitted = transitionOptions.onCommitted;
+			const result = await this.#handoff.handoff(customInstructions, options, {
+				beforeCommit: transitionOptions.beforeCommit,
+				onCommitted: () => {
+					committed = true;
+					onCommitted?.();
+				},
+			});
+			return { result, committed, honorPlanDefault: false };
+		});
 	}
 
 	#isTerminalYieldToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
@@ -7144,7 +7155,7 @@ export class AgentSession {
 			previousSessionFile === undefined ||
 			normalizePathForComparison(previousSessionFile) !== normalizePathForComparison(sessionPath);
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+		if (!options?.bypassBeforeSwitchHook && this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
 				reason: "resume",
@@ -7446,22 +7457,36 @@ export class AgentSession {
 		await this.#drainAutolearnCapture();
 		await options?.beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("branch the session");
+		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#bash.beginSessionTransition();
-
-		let sessionTransitioned = false;
 		try {
 			if (!selectedEntry.parentId) {
 				await this.sessionManager.newSession({ parentSession: previousSessionFile });
 			} else {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
-			sessionTransitioned = true;
-			options?.onCommitted?.();
-			this.#bash.markSessionTransition(bashTransition);
-			this.#advisors.clearCost();
-		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
+			await this.sessionManager.ensureOnDisk();
+			await this.sessionManager.flush();
+		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
+			this.#bash.finishSessionTransition(bashTransition, false);
+			throw error;
 		}
+
+		let onCommittedError: unknown;
+		let onCommittedFailed = false;
+		try {
+			options?.onCommitted?.();
+		} catch (error) {
+			onCommittedError = error;
+			onCommittedFailed = true;
+		}
+		try {
+			this.#bash.markSessionTransition(bashTransition);
+		} finally {
+			this.#bash.finishSessionTransition(bashTransition, true);
+		}
+		this.#advisors.clearCost();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#cancelOwnAsyncJobs();
@@ -7492,6 +7517,7 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
+		if (onCommittedFailed) throw onCommittedError;
 		return { selectedText, selectedImages, cancelled: false };
 	}
 
@@ -7531,7 +7557,6 @@ export class AgentSession {
 			}
 		}
 
-		await this.#cancelPostPromptTasks();
 		if (
 			this.isBashRunning ||
 			this.isEvalRunning ||
@@ -7543,60 +7568,117 @@ export class AgentSession {
 		}
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
+		await this.#drainAutolearnCapture();
 		await options?.beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("branch the session");
+
+		// Build and publish the destination through an independent manager. Until
+		// close succeeds, the live manager, provider stream, queues, and post-prompt
+		// controller still belong to the source and remain fully runnable.
+		const destinationManager = this.sessionManager.cloneCurrentSession();
+		let destinationState: SessionManagerStateSnapshot;
+		try {
+			destinationManager.createBranchedSession(leafId);
+			destinationManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: question }],
+				timestamp: Date.now(),
+			});
+			destinationManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
+			await destinationManager.flush();
+			await destinationManager.close();
+			destinationState = destinationManager.captureState();
+		} catch (error) {
+			await destinationManager.close().catch(() => undefined);
+			throw error;
+		}
+
+		// Durability is the commit boundary. From here onward the destination is
+		// authoritative: failures are remembered, but activation must still finish.
+		const committedErrors: unknown[] = [];
+		const rememberCommittedError = (error: unknown): void => {
+			committedErrors.push(error);
+		};
+		const bashTransitionResult = (() => {
+			try {
+				return { transition: this.#bash.beginSessionTransition() };
+			} catch (error) {
+				rememberCommittedError(error);
+				return {};
+			}
+		})();
 
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
-		if (this.isStreaming) {
-			await this.abort({ goalReason: "internal", reason: "branching /btw" });
-			this.agent.replaceQueues([], []);
+		try {
+			if (this.isStreaming) {
+				await this.abort({ goalReason: "internal", reason: "branching /btw" });
+			} else {
+				await this.#cancelPostPromptTasks();
+			}
+		} catch (error) {
+			rememberCommittedError(error);
 		}
-		const bashTransition = this.#bash.beginSessionTransition();
+		this.agent.replaceQueues([], []);
+
+		this.sessionManager.restoreState(destinationState);
+		try {
+			options?.onCommitted?.();
+		} catch (error) {
+			rememberCommittedError(error);
+		}
+		if (bashTransitionResult.transition) {
+			try {
+				this.#bash.markSessionTransition(bashTransitionResult.transition);
+			} catch (error) {
+				rememberCommittedError(error);
+			}
+			try {
+				this.#bash.finishSessionTransition(bashTransitionResult.transition, true);
+			} catch (error) {
+				rememberCommittedError(error);
+			}
+		}
+
 		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
-		let sessionTransitioned = false;
-		try {
-			this.sessionManager.createBranchedSession(leafId);
-			sessionTransitioned = true;
-			options?.onCommitted?.();
-			this.#bash.markSessionTransition(bashTransition);
-			this.#advisors.clearCost();
-		} finally {
-			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
-		}
-
+		this.#advisors.clearCost();
 		this.#clearSessionScopedToolState();
-
 		this.#rehydrateCheckpointRewindState();
-		this.sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: question }],
-			timestamp: Date.now(),
-		});
-		this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
 		this.#todo.syncFromBranch();
 		this.#freshProviderSessionId = undefined;
 		this.#syncAgentSessionId();
 		this.#memory.rekeyForCurrentSessionId();
-		await this.#memory.resetContextForNewTranscript();
+		try {
+			await this.#memory.resetContextForNewTranscript();
+		} catch (error) {
+			rememberCommittedError(error);
+		}
 
-		const sessionContext = this.buildDisplaySessionContext();
-
+		let sessionContext: SessionContext;
+		try {
+			sessionContext = this.buildDisplaySessionContext();
+		} catch (error) {
+			rememberCommittedError(error);
+			sessionContext = destinationManager.buildSessionContext();
+		}
 		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_branch",
-				previousSessionFile,
-			});
+			try {
+				await this.#extensionRunner.emit({
+					type: "session_branch",
+					previousSessionFile,
+				});
+			} catch (error) {
+				rememberCommittedError(error);
+			}
 		}
 
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#advisors.resetSessionState();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
+		if (committedErrors.length > 0) throw committedErrors[0];
 		return { cancelled: false, sessionFile: this.sessionFile };
 	}
 
@@ -7873,10 +7955,10 @@ export class AgentSession {
 		// Summary is attached at the navigation target position (newLeafId), not the old branch
 		await transitionOptions?.beforeCommit?.();
 		this.#assertVibeSessionTransitionAllowed("navigate session history");
+		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#bash.beginSessionTransition();
 		let summaryEntry: BranchSummaryEntry | undefined;
-		let branchTransitioned = false;
-		try {
+		const applyNavigation = (): void => {
 			if (askReanswerMessage) {
 				newLeafId = this.sessionManager.appendMessageToBranch(askReanswerMessage, newLeafId);
 			}
@@ -7894,11 +7976,32 @@ export class AgentSession {
 			} else {
 				this.sessionManager.branch(newLeafId);
 			}
-			branchTransitioned = true;
+		};
+		try {
+			if (askReanswerMessage || summaryText) {
+				await this.sessionManager.appendEntriesAtomically(applyNavigation);
+			} else {
+				applyNavigation();
+			}
+		} catch (error) {
+			this.sessionManager.restoreState(previousSessionState);
+			this.#branchSummaryAbortController = undefined;
+			this.#bash.finishSessionTransition(bashTransition, false);
+			throw error;
+		}
+
+		let onCommittedError: unknown;
+		let onCommittedFailed = false;
+		try {
 			transitionOptions?.onCommitted?.();
+		} catch (error) {
+			onCommittedError = error;
+			onCommittedFailed = true;
+		}
+		try {
 			this.#bash.markSessionTransition(bashTransition);
 		} finally {
-			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
+			this.#bash.finishSessionTransition(bashTransition, true);
 		}
 
 		// Update agent state — build display context to populate agent messages.
@@ -7911,6 +8014,7 @@ export class AgentSession {
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;
+		if (onCommittedFailed) throw onCommittedError;
 
 		// Report a committed `ask` re-answer so the interactive caller can resume
 		// the agent via `resumeAfterAskReanswer()` *after* rebuilding its

@@ -12,7 +12,21 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { Snowflake } from "@oh-my-pi/pi-utils";
+
+class FailingBtwBranchStorage extends MemorySessionStorage {
+	nextSyncWriteError: Error | undefined;
+
+	override writeTextSync(filePath: string, content: string): void {
+		const error = this.nextSyncWriteError;
+		if (error) {
+			this.nextSyncWriteError = undefined;
+			throw error;
+		}
+		super.writeTextSync(filePath, content);
+	}
+}
 
 function createBtwAssistant(): AssistantMessage {
 	return {
@@ -70,6 +84,7 @@ describe("AgentSession.branchFromBtw", () => {
 		persisted?: boolean;
 		extensionRunner?: ExtensionRunner;
 		handler?: MockHandler;
+		storage?: MemorySessionStorage;
 	}) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: options?.handler ?? (() => ({ content: ["unused"] })) });
@@ -79,7 +94,9 @@ describe("AgentSession.branchFromBtw", () => {
 			streamFn: mock.stream,
 		});
 		const sessionManager =
-			options?.persisted === false ? SessionManager.inMemory() : SessionManager.create(tempDir, tempDir);
+			options?.persisted === false
+				? SessionManager.inMemory()
+				: SessionManager.create(tempDir, tempDir, options?.storage);
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
@@ -121,9 +138,11 @@ describe("AgentSession.branchFromBtw", () => {
 		const originalRaw = fs.readFileSync(originalFile!, "utf8");
 		const assistantMessage = createBtwAssistant();
 
-		const result = await activeSession.branchFromBtw("why did this fail?", assistantMessage);
+		const onCommitted = vi.fn();
+		const result = await activeSession.branchFromBtw("why did this fail?", assistantMessage, { onCommitted });
 
 		expect(result.cancelled).toBe(false);
+		expect(onCommitted).toHaveBeenCalledTimes(1);
 		expect(result.sessionFile).toBe(activeSession.sessionFile);
 		expect(result.sessionFile).toBeDefined();
 		expect(result.sessionFile).not.toBe(originalFile);
@@ -301,6 +320,163 @@ describe("AgentSession.branchFromBtw", () => {
 
 		expect(result.cancelled).toBe(false);
 		expect(activeSession.hasPostPromptWork).toBe(false);
+	});
+
+	it("keeps an active provider turn and its queues live when branch persistence fails", async () => {
+		const storage = new FailingBtwBranchStorage();
+		const providerStarted = Promise.withResolvers<void>();
+		const providerRelease = Promise.withResolvers<{ content: ["main response survived"] }>();
+		let providerSignal: AbortSignal | undefined;
+		const activeSession = await createSession({
+			storage,
+			handler: (_context, options) => {
+				providerSignal = options?.signal;
+				providerStarted.resolve();
+				return Promise.race([
+					providerRelease.promise,
+					new Promise<never>((_resolve, reject) => {
+						options?.signal?.addEventListener("abort", () => reject(new Error("provider aborted")), {
+							once: true,
+						});
+					}),
+				]);
+			},
+		});
+		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		await activeSession.sessionManager.flush();
+
+		const sourceTurnPersisted = Promise.withResolvers<void>();
+		const previousOnEntryAppended = activeSession.sessionManager.onEntryAppended;
+		activeSession.sessionManager.onEntryAppended = entry => {
+			previousOnEntryAppended?.(entry);
+			if (entry.type !== "message" || entry.message.role !== "user") return;
+			activeSession.sessionManager.onEntryAppended = previousOnEntryAppended;
+			sourceTurnPersisted.resolve();
+		};
+		const promptPromise = activeSession.prompt("main prompt");
+		await Promise.all([providerStarted.promise, sourceTurnPersisted.promise]);
+		await activeSession.followUp("queued source follow-up");
+		const sourceSessionFile = activeSession.sessionFile;
+		const sourceSessionId = activeSession.sessionId;
+		const sourceHeader = structuredClone(activeSession.sessionManager.getHeader());
+		const sourceEntries = structuredClone(activeSession.sessionManager.getEntries());
+		const sourceLeafId = activeSession.sessionManager.getLeafId();
+		const sourceMessages = [...activeSession.messages];
+		const sourceSteering = [...activeSession.agent.peekSteeringQueue()];
+		const sourceFollowUp = [...activeSession.agent.peekFollowUpQueue()];
+		const onCommitted = vi.fn();
+		const writeFailure = new Error("btw branch write failed");
+		storage.nextSyncWriteError = writeFailure;
+
+		await expect(
+			activeSession.branchFromBtw("promote side answer", createBtwAssistant(), { onCommitted }),
+		).rejects.toBe(writeFailure);
+
+		expect(providerSignal?.aborted).toBe(false);
+		expect(activeSession.isStreaming).toBe(true);
+		expect(activeSession.sessionFile).toBe(sourceSessionFile);
+		expect(activeSession.sessionId).toBe(sourceSessionId);
+		expect(activeSession.sessionManager.getHeader()).toEqual(sourceHeader);
+		expect(activeSession.sessionManager.getEntries()).toEqual(sourceEntries);
+		expect(activeSession.sessionManager.getLeafId()).toBe(sourceLeafId);
+		expect(activeSession.messages).toEqual(sourceMessages);
+		expect(activeSession.agent.peekSteeringQueue()).toEqual(sourceSteering);
+		expect(activeSession.agent.peekFollowUpQueue()).toEqual(sourceFollowUp);
+		expect(onCommitted).not.toHaveBeenCalled();
+
+		providerRelease.resolve({ content: ["main response survived"] });
+		await promptPromise;
+		await activeSession.waitForIdle();
+		expect(JSON.stringify(activeSession.messages)).toContain("main response survived");
+	});
+
+	it("keeps pending post-prompt work live when branch persistence fails", async () => {
+		const storage = new FailingBtwBranchStorage();
+		const activeSession = await createSession({ storage });
+		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		await activeSession.sessionManager.flush();
+
+		const taskRelease = Promise.withResolvers<void>();
+		let taskSignal: AbortSignal | undefined;
+		let taskCompleted = false;
+		activeSession.trackPostPromptTaskForTests(signal => {
+			taskSignal = signal;
+			return Promise.race([
+				taskRelease.promise,
+				new Promise<never>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("post-prompt task aborted")), { once: true });
+				}),
+			]).then(() => {
+				taskCompleted = true;
+			});
+		});
+		expect(activeSession.hasPostPromptWork).toBe(true);
+
+		const sourceSessionFile = activeSession.sessionFile;
+		const sourceHeader = structuredClone(activeSession.sessionManager.getHeader());
+		const sourceEntries = structuredClone(activeSession.sessionManager.getEntries());
+		const sourceLeafId = activeSession.sessionManager.getLeafId();
+		const sourceMessages = [...activeSession.messages];
+		const onCommitted = vi.fn();
+		const writeFailure = new Error("post-prompt branch write failed");
+		storage.nextSyncWriteError = writeFailure;
+
+		await expect(
+			activeSession.branchFromBtw("promote side answer", createBtwAssistant(), { onCommitted }),
+		).rejects.toBe(writeFailure);
+
+		expect(taskSignal?.aborted).toBe(false);
+		expect(taskCompleted).toBe(false);
+		expect(activeSession.hasPostPromptWork).toBe(true);
+		expect(activeSession.sessionFile).toBe(sourceSessionFile);
+		expect(activeSession.sessionManager.getHeader()).toEqual(sourceHeader);
+		expect(activeSession.sessionManager.getEntries()).toEqual(sourceEntries);
+		expect(activeSession.sessionManager.getLeafId()).toBe(sourceLeafId);
+		expect(activeSession.messages).toEqual(sourceMessages);
+		expect(onCommitted).not.toHaveBeenCalled();
+
+		taskRelease.resolve();
+		await activeSession.waitForIdle();
+		expect(taskCompleted).toBe(true);
+	});
+
+	it("bypasses only session_before_switch when explicitly restoring a committed snapshot", async () => {
+		const emit = vi.fn(async (event: { type: string }) =>
+			event.type === "session_before_switch" ? { cancel: true } : undefined,
+		);
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_switch"),
+			emit,
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		activeSession.sessionManager.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await activeSession.sessionManager.ensureOnDisk();
+		const sourceSessionFile = activeSession.sessionFile;
+
+		const targetManager = SessionManager.create(tempDir, tempDir);
+		targetManager.appendMessage({ role: "user", content: "committed target", timestamp: 2 });
+		await targetManager.ensureOnDisk();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		if (!targetSessionFile) throw new Error("Expected persisted target session");
+
+		expect(await activeSession.switchSession(targetSessionFile)).toBe(false);
+		expect(activeSession.sessionFile).toBe(sourceSessionFile);
+
+		const beforeCommit = vi.fn(async () => undefined);
+		const onCommitted = vi.fn();
+		expect(
+			await activeSession.switchSession(targetSessionFile, {
+				bypassBeforeSwitchHook: true,
+				beforeCommit,
+				onCommitted,
+			}),
+		).toBe(true);
+
+		expect(activeSession.sessionFile).toBe(targetSessionFile);
+		expect(beforeCommit).toHaveBeenCalledTimes(1);
+		expect(onCommitted).toHaveBeenCalledTimes(1);
+		expect(emit.mock.calls.filter(([event]) => event.type === "session_before_switch")).toHaveLength(1);
 	});
 
 	it("throws for in-memory sessions", async () => {

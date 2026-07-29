@@ -1100,7 +1100,7 @@ const progress = {
 	cost: 0,
 	durationMs: 0
 };
-write({ type: "ready" });
+write({ type: "ready", capabilities: ["prompt_result", "prompt_lifecycle_disposition"] });
 process.stdin.on("data", chunk => {
 	buffer += chunk.toString("utf8");
 	let index = buffer.indexOf("\\n");
@@ -1126,6 +1126,7 @@ function handle(frame) {
 	}
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
+		write({ type: "prompt_result", id: frame.id, agentInvoked: true, lifecycleDisposition: "future" });
 		write({ type: "notice", level: "info", message: "subagent test" });
 		write({ type: "subagent_lifecycle", payload: { id: "SubagentA", index: 0, agent: "task", agentSource: "bundled", status: "started", sessionFile: "/tmp/subagent.jsonl" } });
 		write({ type: "subagent_progress", payload: { index: 0, agent: "task", agentSource: "bundled", task: "Do work", assignment: "Implement work", sessionFile: "/tmp/subagent.jsonl", progress } });

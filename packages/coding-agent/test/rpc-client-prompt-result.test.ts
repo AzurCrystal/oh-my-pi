@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import {
+	RPC_TOMBSTONE_LIMIT,
 	type RpcAsyncCommandSubmissionResult,
 	RpcClient,
 	RpcCommandError,
@@ -36,9 +37,9 @@ describe("RpcClient prompt results", () => {
 			expect(immediateNoAgent).toEqual({ requestId: "req_3", agentInvoked: false });
 			await allCompletions.promise;
 			expect(completions).toEqual([
-				{ type: "prompt_result", id: "req_1", agentInvoked: false },
-				{ type: "prompt_result", id: "req_2", agentInvoked: true },
-				{ type: "prompt_result", id: "req_3", agentInvoked: false },
+				{ type: "prompt_result", id: "req_1", agentInvoked: false, lifecycleDisposition: "none" },
+				{ type: "prompt_result", id: "req_2", agentInvoked: true, lifecycleDisposition: "future" },
+				{ type: "prompt_result", id: "req_3", agentInvoked: false, lifecycleDisposition: "none" },
 			]);
 		} finally {
 			unsubscribe();
@@ -104,6 +105,29 @@ describe("RpcClient prompt results", () => {
 					code: "prompt_scheduling_failed",
 				},
 			]);
+		} finally {
+			unsubscribe();
+		}
+	}, 5_000);
+
+	test("completes a local-only abort-and-prompt reservation from its same-id outcome", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_LIFECYCLE: "1" },
+		});
+		await client.start();
+
+		const outcome = Promise.withResolvers<RpcPromptResultFrame>();
+		const unsubscribe = client.onPromptResult(frame => outcome.resolve(frame));
+		try {
+			const acknowledgement = await client.abortAndPromptWithResult("local-only");
+			await client.waitForIdle();
+			expect(await outcome.promise).toEqual({
+				type: "prompt_result",
+				id: acknowledgement.requestId,
+				agentInvoked: false,
+				lifecycleDisposition: "none",
+			});
 		} finally {
 			unsubscribe();
 		}
@@ -187,6 +211,122 @@ describe("RpcClient prompt results", () => {
 			unsubscribe();
 		}
 	}, 5_000);
+
+	test("waits for delayed extension work and surfaces a correlated pre-start failure", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_LIFECYCLE: "1" },
+		});
+		await client.start();
+
+		const delayed = client.promptAndWait("extension-delayed", undefined, 2_000);
+		let delayedSettled = false;
+		void delayed.finally(() => {
+			delayedSettled = true;
+		});
+		await Promise.resolve();
+		expect(delayedSettled).toBe(false);
+		await client.getState();
+		expect((await delayed).map(event => event.type)).toEqual(["agent_start", "agent_end"]);
+
+		const failing = client.promptAndWait("extension-prestart-error", undefined, 2_000);
+		await client.getState();
+		await expect(failing).rejects.toMatchObject({
+			command: "prompt",
+			code: "prompt_scheduling_failed",
+		});
+		await client.waitForIdle();
+	}, 5_000);
+
+	test("merges guest follow-up into the active remote lifecycle reservation", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_LIFECYCLE: "1" },
+		});
+		await client.start();
+
+		await client.promptWithResult("active-guest");
+		await client.followUp("guest-current");
+		const idle = client.waitForIdle(2_000);
+		await client.getState();
+		await idle;
+	}, 5_000);
+
+	test("applies a duplicated current disposition only once per prompt request", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_LIFECYCLE: "1" },
+		});
+		await client.start();
+
+		const activeRunStarted = Promise.withResolvers<void>();
+		const unsubscribe = client.onPromptResult(frame => {
+			if (frame.lifecycleDisposition === "future") activeRunStarted.resolve();
+		});
+		try {
+			await client.promptWithResult("active-guest");
+			await activeRunStarted.promise;
+			await client.promptWithResult("duplicate-current");
+
+			const idle = client.waitForIdle(2_000);
+			let idleSettled = false;
+			void idle.then(
+				() => {
+					idleSettled = true;
+				},
+				() => {
+					idleSettled = true;
+				},
+			);
+			await client.getSettings();
+			expect(idleSettled).toBe(false);
+
+			await client.getState();
+			await idle;
+		} finally {
+			unsubscribe();
+		}
+	}, 5_000);
+
+	test("rejects only promptAndWait when an old runtime omits prompt_result capability", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_OLD_RUNTIME: "1" },
+		});
+		await client.start();
+
+		await client.getState();
+		await client.prompt("legacy fire-and-forget");
+		await client.waitForIdle();
+		await expect(client.promptAndWait("unsupported")).rejects.toMatchObject({
+			command: "prompt",
+			code: "capability_unavailable",
+		});
+	}, 5_000);
+
+	test("bounds prompt-error tombstones while suppressing retained duplicate frames", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_TOMBSTONES: "1" },
+		});
+		await client.start();
+
+		const errors: RpcPromptErrorResponse[] = [];
+		const unsubscribe = client.onPromptError(error => errors.push(error));
+		try {
+			for (let index = 0; index <= RPC_TOMBSTONE_LIMIT; index++) {
+				await client.promptWithResult(`late-${index}`);
+			}
+			await client.getSettings();
+			expect(errors).toHaveLength(RPC_TOMBSTONE_LIMIT + 1);
+
+			await client.getState();
+			expect(errors).toHaveLength(RPC_TOMBSTONE_LIMIT + 2);
+			expect(errors.at(-1)?.id).toBe("req_1");
+		} finally {
+			unsubscribe();
+		}
+	}, 10_000);
 
 	test("ignores non-terminal agent_end while waiting for the correlated run", async () => {
 		using client = new RpcClient({

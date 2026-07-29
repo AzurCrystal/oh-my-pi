@@ -52,6 +52,7 @@ from .protocol import (
     RetryFallbackAppliedEvent,
     McpAuthChallengeEvent,
     PromptResultEvent,
+    PromptLifecycleDisposition,
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
     RpcNotification,
@@ -157,6 +158,7 @@ _RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024
 _RPC_MESSAGES_PAGE_BUSY_ERROR = "Cannot page messages while the session is changing"
 _RPC_MESSAGES_PAGE_STALE_ERROR = "RPC message cursor is stale"
 _RPC_MESSAGES_PAGE_FALLBACK_CODES = frozenset({"session_busy", "stale_cursor"})
+_RPC_TOMBSTONE_LIMIT = 1024
 
 
 @dataclass(slots=True)
@@ -339,6 +341,23 @@ class RpcError(RuntimeError):
     """Base exception for the Python RPC client."""
 
 
+def _parse_prompt_lifecycle_disposition(
+    data: JsonObject | None,
+) -> PromptLifecycleDisposition | None:
+    raw_disposition = (data or {}).get("lifecycleDisposition")
+    if raw_disposition is None:
+        return None
+    if not isinstance(raw_disposition, str) or raw_disposition not in {
+        "none",
+        "current",
+        "future",
+    }:
+        raise RpcError(
+            "prompt lifecycleDisposition must be one of none, current, or future"
+        )
+    return cast(PromptLifecycleDisposition, raw_disposition)
+
+
 class RpcTimeoutError(RpcError):
     """Raised when the server does not respond before a timeout."""
 
@@ -386,6 +405,27 @@ class RpcProtocolError(RpcError):
         super().__init__(" ".join(fragments))
 
 
+class _BoundedTombstones:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._ids: dict[str, None] = {}
+
+    def __contains__(self, request_id: str) -> bool:
+        return request_id in self._ids
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def add(self, request_id: str) -> None:
+        self._ids.pop(request_id, None)
+        self._ids[request_id] = None
+        while len(self._ids) > self._limit:
+            self._ids.pop(next(iter(self._ids)))
+
+    def clear(self) -> None:
+        self._ids.clear()
+
+
 @dataclass(slots=True, frozen=True)
 class ListenerErrorEvent:
     listener_kind: str
@@ -398,6 +438,7 @@ class ListenerErrorEvent:
 class PromptAcknowledgement:
     request_id: str
     agent_invoked: bool | None
+    lifecycle_disposition: PromptLifecycleDisposition | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -430,6 +471,7 @@ class _AgentRunReservation:
     hold_for_start: bool = False
     request_id: str | None = None
     completed: bool = False
+    current_run: _AgentRunReservation | None = None
 
 
 @dataclass(slots=True)
@@ -442,6 +484,7 @@ class _PendingPromptOutcome:
     acknowledged: bool = False
     terminal_received: bool = False
     reservation: _AgentRunReservation | None = None
+    lifecycle_disposition: PromptLifecycleDisposition | None = None
     completed: bool = False
 
 
@@ -574,8 +617,9 @@ class RpcClient:
         self._event_condition = threading.Condition()
         self._ready = threading.Event()
         self._pending: dict[str, _PendingRequest] = {}
-        self._expired_request_ids: set[str] = set()
+        self._expired_request_ids = _BoundedTombstones(_RPC_TOMBSTONE_LIMIT)
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
+        self._reported_prompt_error_ids = _BoundedTombstones(_RPC_TOMBSTONE_LIMIT)
         self._host_tool_dispatch_names: dict[str, str] = {}
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
         self._request_id = 0
@@ -597,6 +641,7 @@ class RpcClient:
         self._ready_event: ReadyEvent | None = None
         self._protocol_version = 1
         self._protocol_v2_enabled = False
+        self._prompt_result_supported = False
         self._frame_decoder = _RpcFrameDecoder()
         self._protocol_errors = _BoundedHistory[RpcProtocolError](
             _DEFAULT_ERROR_HISTORY_LIMIT
@@ -681,6 +726,7 @@ class RpcClient:
         self._ready_event = None
         self._protocol_version = 1
         self._protocol_v2_enabled = False
+        self._prompt_result_supported = False
         self._frame_decoder = _RpcFrameDecoder()
         self._events.clear()
         self._async_errors.clear()
@@ -697,6 +743,7 @@ class RpcClient:
             self._protocol_errors.clear()
             self._listener_errors.clear()
             self._expired_request_ids.clear()
+            self._reported_prompt_error_ids.clear()
 
         process = subprocess.Popen(
             list(self._build_command()),
@@ -761,6 +808,11 @@ class RpcClient:
             )
 
         ready_event = self._ready_event
+        self._prompt_result_supported = bool(
+            ready_event is not None
+            and ready_event.capabilities is not None
+            and "prompt_result" in ready_event.capabilities
+        )
         if (
             ready_event is not None
             and ready_event.supported_protocol_versions is not None
@@ -2174,6 +2226,12 @@ class RpcClient:
         streaming_behavior: StreamingBehavior | None = None,
         timeout: float | None = None,
     ) -> PromptTurn:
+        if not self._prompt_result_supported:
+            raise RpcCommandError(
+                "prompt",
+                "prompt_and_wait requires RPC capability 'prompt_result'; upgrade the RPC runtime",
+                "capability_unavailable",
+            )
         operation = "prompt_and_wait"
         request_id: str | None = None
         self._prompt_lifecycle.acquire(operation)
@@ -2304,6 +2362,14 @@ class RpcClient:
         agent_invoked = (
             raw_agent_invoked if isinstance(raw_agent_invoked, bool) else None
         )
+        try:
+            lifecycle_disposition = _parse_prompt_lifecycle_disposition(data)
+        except BaseException:
+            with self._event_condition:
+                outcome = self._pending_prompt_outcomes.pop(request_id, None)
+                if outcome is not None:
+                    self._complete_prompt_outcome(outcome)
+            raise
 
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(request_id)
@@ -2319,7 +2385,21 @@ class RpcClient:
             outcome.acknowledged = True
             if outcome.result is None and agent_invoked is not None:
                 outcome.result = agent_invoked
+                outcome.lifecycle_disposition = (
+                    lifecycle_disposition
+                    if lifecycle_disposition is not None
+                    else ("none" if not agent_invoked else None)
+                )
+                if outcome.lifecycle_disposition is not None:
+                    self._apply_prompt_lifecycle_disposition(
+                        outcome, outcome.lifecycle_disposition
+                    )
+            if not self._prompt_result_supported and lifecycle_disposition is None:
+                if agent_invoked is True and outcome.reservation is not None:
+                    outcome.reservation.hold_for_start = True
+                self._complete_prompt_outcome(outcome)
             resolved = outcome.result
+            resolved_disposition = outcome.lifecycle_disposition
             if resolved is False:
                 self._complete_prompt_outcome(outcome)
             if outcome.completed and not outcome.retain_result:
@@ -2329,6 +2409,7 @@ class RpcClient:
         return PromptAcknowledgement(
             request_id=request_id,
             agent_invoked=resolved,
+            lifecycle_disposition=resolved_disposition,
         )
 
     def _wait_for_prompt_result(
@@ -2403,15 +2484,16 @@ class RpcClient:
         if outcome.reservation is not None:
             return
         reservation: _AgentRunReservation | None = None
+        current_run = next(
+            (
+                candidate
+                for candidate in self._agent_run_reservations
+                if candidate.started and not candidate.completed
+            ),
+            None,
+        )
         if outcome.streaming_behavior == "steer":
-            reservation = next(
-                (
-                    candidate
-                    for candidate in self._agent_run_reservations
-                    if candidate.started and not candidate.completed
-                ),
-                None,
-            )
+            reservation = current_run
             if reservation is None:
                 reservation = next(
                     (
@@ -2422,9 +2504,72 @@ class RpcClient:
                     None,
                 )
         if reservation is None:
-            reservation = self._reserve_agent_run_locked(request_id=request_id)
+            reservation = self._reserve_agent_run_locked(
+                request_id=request_id, current_run=current_run
+            )
         reservation.prompt_count += 1
         outcome.reservation = reservation
+
+    def _apply_prompt_lifecycle_disposition(
+        self,
+        outcome: _PendingPromptOutcome,
+        disposition: PromptLifecycleDisposition,
+    ) -> None:
+        outcome.lifecycle_disposition = disposition
+        reservation = outcome.reservation
+        if reservation is None or disposition == "none":
+            return
+        if disposition == "future":
+            reservation.hold_for_start = True
+            return
+        if reservation.started:
+            return
+        current_run = reservation.current_run or next(
+            (
+                candidate
+                for candidate in self._agent_run_reservations
+                if candidate is not reservation
+                and candidate.started
+                and not candidate.completed
+            ),
+            None,
+        )
+        if current_run is None:
+            reservation.started = True
+            reservation.hold_for_start = False
+            return
+        reservation.prompt_count -= 1
+        if reservation.prompt_count == 0:
+            self._complete_agent_run_reservation(reservation)
+        current_run.prompt_count += 1
+        outcome.reservation = current_run
+
+    def _apply_agent_run_lifecycle_disposition(
+        self,
+        reservation: _AgentRunReservation,
+        disposition: PromptLifecycleDisposition,
+    ) -> None:
+        if disposition == "future":
+            reservation.hold_for_start = True
+            return
+        if disposition == "none":
+            self._complete_agent_run_reservation(reservation)
+            return
+        current_run = reservation.current_run or next(
+            (
+                candidate
+                for candidate in self._agent_run_reservations
+                if candidate is not reservation
+                and candidate.started
+                and not candidate.completed
+            ),
+            None,
+        )
+        if current_run is None:
+            reservation.started = True
+            reservation.hold_for_start = False
+            return
+        self._complete_agent_run_reservation(reservation)
 
     def _complete_prompt_outcome(self, outcome: _PendingPromptOutcome) -> None:
         if outcome.completed:
@@ -2442,20 +2587,32 @@ class RpcClient:
         self._event_condition.notify_all()
 
     def _reserve_agent_run(
-        self, *, request_id: str | None = None, hold_for_start: bool = False
+        self,
+        *,
+        request_id: str | None = None,
+        hold_for_start: bool = False,
+        current_run: _AgentRunReservation | None = None,
     ) -> _AgentRunReservation:
         with self._event_condition:
             reservation = self._reserve_agent_run_locked(
-                request_id=request_id, hold_for_start=hold_for_start
+                request_id=request_id,
+                hold_for_start=hold_for_start,
+                current_run=current_run,
             )
             self._event_condition.notify_all()
             return reservation
 
     def _reserve_agent_run_locked(
-        self, *, request_id: str | None = None, hold_for_start: bool = False
+        self,
+        *,
+        request_id: str | None = None,
+        hold_for_start: bool = False,
+        current_run: _AgentRunReservation | None = None,
     ) -> _AgentRunReservation:
         reservation = _AgentRunReservation(
-            hold_for_start=hold_for_start, request_id=request_id
+            hold_for_start=hold_for_start,
+            request_id=request_id,
+            current_run=current_run,
         )
         self._agent_run_reservations.append(reservation)
         self._scheduled_agent_runs += 1
@@ -2535,11 +2692,23 @@ class RpcClient:
         images: Sequence[ImageContent] | None,
     ) -> None:
         request_id = self._next_request_id()
-        reservation = self._reserve_agent_run(
-            request_id=request_id, hold_for_start=True
-        )
+        with self._event_condition:
+            current_run = next(
+                (
+                    candidate
+                    for candidate in self._agent_run_reservations
+                    if candidate.started and not candidate.completed
+                ),
+                None,
+            )
+            reservation = self._reserve_agent_run_locked(
+                request_id=request_id,
+                hold_for_start=True,
+                current_run=current_run,
+            )
+            self._event_condition.notify_all()
         try:
-            self._request_payload(
+            data = self._request_payload(
                 command_type,
                 {
                     "message": message,
@@ -2551,6 +2720,21 @@ class RpcClient:
                 },
                 request_id=request_id,
             )
+            disposition = _parse_prompt_lifecycle_disposition(data)
+            if disposition is not None:
+                with self._event_condition:
+                    self._apply_agent_run_lifecycle_disposition(
+                        reservation, disposition
+                    )
+                    self._event_condition.notify_all()
+            elif not self._prompt_result_supported:
+                raw_agent_invoked = (data or {}).get("agentInvoked")
+                with self._event_condition:
+                    if raw_agent_invoked is True:
+                        reservation.hold_for_start = True
+                    elif not reservation.started:
+                        self._complete_agent_run_reservation(reservation)
+                    self._event_condition.notify_all()
         except BaseException:
             with self._event_condition:
                 self._complete_agent_run_reservation(reservation)
@@ -2743,15 +2927,34 @@ class RpcClient:
             return
         with self._event_condition:
             outcome = self._pending_prompt_outcomes.get(event.id)
-            if (
-                outcome is None
-                or outcome.error is not None
-                or outcome.terminal_received
-            ):
+            if outcome is None:
+                reservation = next(
+                    (
+                        candidate
+                        for candidate in self._agent_run_reservations
+                        if candidate.request_id == event.id and not candidate.completed
+                    ),
+                    None,
+                )
+                if reservation is None:
+                    return
+                if event.lifecycle_disposition is not None:
+                    self._apply_agent_run_lifecycle_disposition(
+                        reservation, event.lifecycle_disposition
+                    )
+                elif not event.agent_invoked:
+                    self._complete_agent_run_reservation(reservation)
+                self._event_condition.notify_all()
+                return
+            if outcome.error is not None or outcome.terminal_received:
                 return
             outcome.result = event.agent_invoked
             outcome.terminal_received = True
-            if (
+            if event.lifecycle_disposition is not None:
+                self._apply_prompt_lifecycle_disposition(
+                    outcome, event.lifecycle_disposition
+                )
+            elif (
                 event.agent_invoked
                 and outcome.streaming_behavior == "followUp"
                 and outcome.reservation is not None
@@ -3585,10 +3788,14 @@ class RpcClient:
         if isinstance(request_id, str):
             with self._state_lock:
                 if request_id in self._expired_request_ids:
-                    self._expired_request_ids.remove(request_id)
                     return
                 pending = self._pending.pop(request_id, None)
             if pending is not None:
+                if (
+                    not bool(payload.get("success", False))
+                    and pending.command in _ASYNC_COMMANDS
+                ):
+                    self._reported_prompt_error_ids.add(request_id)
                 pending.response_queue.put(payload)
                 return
 
@@ -3603,6 +3810,11 @@ class RpcClient:
             protocol_error.command in _ASYNC_COMMANDS
             and protocol_error.remote_error is not None
         ):
+            if (
+                protocol_error.request_id is not None
+                and protocol_error.request_id in self._reported_prompt_error_ids
+            ):
+                return
             raw_code = payload.get("code")
             command_error = RpcCommandError(
                 protocol_error.command,
@@ -3651,9 +3863,12 @@ class RpcClient:
                         surface_async = True
                         self._complete_agent_run_reservation(reservation)
                         self._event_condition.notify_all()
+                        self._reported_prompt_error_ids.add(protocol_error.request_id)
             if handled:
                 if surface_async:
                     self._append_async_error(command_error)
+                if protocol_error.request_id is not None:
+                    self._reported_prompt_error_ids.add(protocol_error.request_id)
                 return
 
         self._record_protocol_error(protocol_error)

@@ -15,6 +15,7 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 
 /** Action name for an extension-originated send failure. */
 export type ExtensionSendAction = "extension_send" | "extension_send_user";
+export type ExtensionMessageLifecycleDisposition = "current" | "future";
 
 export interface InitializeExtensionsOptions {
 	/** Reports an error thrown by an extension-initiated send. */
@@ -28,7 +29,7 @@ export interface InitializeExtensionsOptions {
 	/** Optional lifecycle hook for extension-originated messages that can start an agent turn. */
 	markAgentInvokingMessage?: () => void;
 	/** Optional lifecycle hook for extension-originated sends whose success/failure determines turn ownership. */
-	trackAgentInvokingMessage?: (task: Promise<unknown>) => void;
+	trackAgentInvokingMessage?: (task: Promise<unknown>, disposition: ExtensionMessageLifecycleDisposition) => void;
 }
 
 /**
@@ -55,10 +56,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		// ExtensionActions
 		{
 			sendMessage: (message, sendOptions) => {
+				const disposition = session.isStreaming ? "current" : "future";
 				const sendTask = session.sendCustomMessage(message, sendOptions);
 				if (sendOptions?.triggerTurn) {
 					if (trackAgentInvokingMessage) {
-						trackAgentInvokingMessage(sendTask);
+						trackAgentInvokingMessage(sendTask, disposition);
 					} else {
 						markAgentInvokingMessage?.();
 					}
@@ -68,9 +70,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				});
 			},
 			sendUserMessage: (content, sendOptions) => {
+				const disposition = session.isStreaming ? "current" : "future";
 				const sendTask = session.sendUserMessage(content, sendOptions);
 				if (trackAgentInvokingMessage) {
-					trackAgentInvokingMessage(sendTask);
+					trackAgentInvokingMessage(sendTask, disposition);
 				} else {
 					markAgentInvokingMessage?.();
 				}

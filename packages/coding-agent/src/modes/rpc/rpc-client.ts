@@ -106,6 +106,7 @@ import type {
 	RpcPromptAcknowledgement,
 	RpcPromptErrorResponse,
 	RpcPromptHistoryEntry,
+	RpcPromptLifecycleDisposition,
 	RpcPromptResultFrame,
 	RpcPromptSubmissionResult,
 	RpcProviderRequestObservationFrame,
@@ -346,12 +347,17 @@ function isRpcIdleRecapFrame(value: unknown): value is RpcIdleRecapFrame {
 	return isRecord(value) && value.type === "idle_recap" && typeof value.recap === "string";
 }
 
+function isRpcPromptLifecycleDisposition(value: unknown): value is RpcPromptLifecycleDisposition {
+	return value === "none" || value === "current" || value === "future";
+}
+
 function isRpcPromptResultFrame(value: unknown): value is RpcPromptResultFrame {
 	return (
 		isRecord(value) &&
 		value.type === "prompt_result" &&
 		(value.id === undefined || typeof value.id === "string") &&
-		typeof value.agentInvoked === "boolean"
+		typeof value.agentInvoked === "boolean" &&
+		(value.lifecycleDisposition === undefined || isRpcPromptLifecycleDisposition(value.lifecycleDisposition))
 	);
 }
 
@@ -464,6 +470,18 @@ interface RpcAgentRunReservation {
 	started: boolean;
 	holdForStart: boolean;
 	completed: boolean;
+	currentRun?: RpcAgentRunReservation;
+}
+export const RPC_TOMBSTONE_LIMIT = 1024;
+
+function addRpcTombstone(tombstones: Set<string>, id: string): void {
+	tombstones.delete(id);
+	tombstones.add(id);
+	while (tombstones.size > RPC_TOMBSTONE_LIMIT) {
+		const oldest = tombstones.values().next();
+		if (oldest.done) return;
+		tombstones.delete(oldest.value);
+	}
 }
 
 // ============================================================================
@@ -498,6 +516,7 @@ export class RpcClient {
 	#hostUriHandler: RpcClientHostUriHandler | undefined;
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
+	#promptResultSupported = false;
 	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
 	#extensionUiCancelListeners = new Set<RpcExtensionUICancelListener>();
 	#providerRequestObservationListeners = new Set<RpcProviderRequestObservationListener>();
@@ -506,6 +525,7 @@ export class RpcClient {
 	#promptReservations = new Map<string, RpcAgentRunReservation>();
 	#asyncCommandReservations = new Map<string, RpcAgentRunReservation>();
 	#reportedPromptErrorIds = new Set<string>();
+	#appliedLifecycleDispositionIds = new Set<string>();
 	#lifecycleChangedListeners = new Set<() => void>();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -530,10 +550,12 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#promptResultSupported = false;
 		this.#agentRunReservations = [];
 		this.#promptReservations.clear();
 		this.#asyncCommandReservations.clear();
 		this.#reportedPromptErrorIds.clear();
+		this.#appliedLifecycleDispositionIds.clear();
 		this.#expiredRequestIds.clear();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
@@ -594,6 +616,8 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					this.#promptResultSupported =
+						Array.isArray(line.capabilities) && line.capabilities.includes("prompt_result");
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -983,8 +1007,8 @@ export class RpcClient {
 	/** Abort and schedule a replacement prompt, retaining the id used by late {@link onPromptError} failures. */
 	async abortAndPromptWithResult(message: string, images?: ImageContent[]): Promise<RpcAsyncCommandSubmissionResult> {
 		const response = await this.#send({ type: "abort_and_prompt", message, images });
-		this.#getData<undefined>(response);
-		return { requestId: response.id! };
+		const acknowledgement = this.#getData<RpcPromptAcknowledgement | undefined>(response);
+		return { ...acknowledgement, requestId: response.id! };
 	}
 
 	/** Get completions for the current editor state. */
@@ -2437,6 +2461,13 @@ export class RpcClient {
 		timeout = 60000,
 		streamingBehavior?: RpcPromptStreamingBehavior,
 	): Promise<AgentEvent[]> {
+		if (!this.#promptResultSupported) {
+			throw new RpcCommandError(
+				'promptAndWait requires RPC capability "prompt_result"; upgrade the RPC runtime.',
+				"prompt",
+				"capability_unavailable",
+			);
+		}
 		const events: AgentEvent[] = [];
 		const results = new Map<string, boolean>();
 		const errors = new Map<string, RpcPromptErrorResponse>();
@@ -2533,8 +2564,8 @@ export class RpcClient {
 		for (const listener of this.#lifecycleChangedListeners) listener();
 	}
 
-	#reserveAgentRun(holdForStart = false): RpcAgentRunReservation {
-		const reservation = { started: false, holdForStart, completed: false };
+	#reserveAgentRun(holdForStart = false, currentRun?: RpcAgentRunReservation): RpcAgentRunReservation {
+		const reservation = { started: false, holdForStart, completed: false, currentRun };
 		this.#agentRunReservations.push(reservation);
 		this.#notifyLifecycleChanged();
 		return reservation;
@@ -2555,11 +2586,12 @@ export class RpcClient {
 	}
 
 	#beginCommandLifecycle(id: string, command: RpcCommandBody): void {
+		const currentRun = this.#agentRunReservations.find(candidate => candidate.started && !candidate.completed);
 		if (command.type === "prompt") {
-			const reservation = this.#reserveAgentRun(command.streamingBehavior === "followUp");
+			const reservation = this.#reserveAgentRun(command.streamingBehavior === "followUp", currentRun);
 			this.#promptReservations.set(id, reservation);
 		} else if (command.type === "follow_up" || command.type === "abort_and_prompt") {
-			this.#asyncCommandReservations.set(id, this.#reserveAgentRun(true));
+			this.#asyncCommandReservations.set(id, this.#reserveAgentRun(true, currentRun));
 		}
 	}
 
@@ -2570,20 +2602,77 @@ export class RpcClient {
 		this.#asyncCommandReservations.delete(id);
 	}
 
+	#applyLifecycleDisposition(
+		id: string,
+		reservation: RpcAgentRunReservation,
+		disposition: RpcPromptLifecycleDisposition,
+	): void {
+		if (this.#appliedLifecycleDispositionIds.has(id)) return;
+		addRpcTombstone(this.#appliedLifecycleDispositionIds, id);
+		if (disposition === "none") {
+			this.#completeAgentRun(reservation);
+			return;
+		}
+		if (disposition === "future") {
+			reservation.holdForStart = true;
+			this.#notifyLifecycleChanged();
+			return;
+		}
+
+		const currentRun =
+			reservation.currentRun ??
+			this.#agentRunReservations.find(
+				candidate => candidate !== reservation && candidate.started && !candidate.completed,
+			);
+		const isPromptReservation = this.#promptReservations.get(id) === reservation;
+		const isAsyncReservation = this.#asyncCommandReservations.get(id) === reservation;
+		this.#completeAgentRun(reservation);
+		if (!currentRun || currentRun.completed) return;
+		if (isPromptReservation) this.#promptReservations.set(id, currentRun);
+		if (isAsyncReservation) this.#asyncCommandReservations.set(id, currentRun);
+	}
+
 	#handleCommandResponse(id: string, command: RpcCommandBody, response: RpcResponse): void {
 		if (!response.success) {
+			if (command.type === "prompt" || command.type === "abort_and_prompt") {
+				addRpcTombstone(this.#reportedPromptErrorIds, id);
+			}
 			this.#rollbackCommandLifecycle(id);
 			return;
 		}
-		if (command.type !== "prompt" || response.command !== "prompt" || !isRecord(response.data)) return;
-		if (response.data.agentInvoked === false) this.#rollbackCommandLifecycle(id);
+		const reservation = this.#promptReservations.get(id) ?? this.#asyncCommandReservations.get(id);
+		if (!reservation) return;
+		const responseData: unknown = "data" in response ? response.data : undefined;
+		if (!this.#promptResultSupported && !isRecord(responseData)) {
+			if (!reservation.started) this.#completeAgentRun(reservation);
+			return;
+		}
+		if (!isRecord(responseData)) return;
+		if (isRpcPromptLifecycleDisposition(responseData.lifecycleDisposition)) {
+			this.#applyLifecycleDisposition(id, reservation, responseData.lifecycleDisposition);
+			return;
+		}
+		if (!this.#promptResultSupported && responseData.lifecycleDisposition === undefined) {
+			if (responseData.agentInvoked === true) {
+				reservation.holdForStart = true;
+				this.#notifyLifecycleChanged();
+			} else if (!reservation.started) {
+				this.#completeAgentRun(reservation);
+			}
+			return;
+		}
+		if (command.type === "prompt" && responseData.agentInvoked === false) {
+			this.#rollbackCommandLifecycle(id);
+		}
 	}
 
 	#handlePromptResult(frame: RpcPromptResultFrame): void {
 		if (!frame.id) return;
-		const reservation = this.#promptReservations.get(frame.id);
+		const reservation = this.#promptReservations.get(frame.id) ?? this.#asyncCommandReservations.get(frame.id);
 		if (!reservation) return;
-		if (!frame.agentInvoked || (!reservation.started && !reservation.holdForStart)) {
+		if (frame.lifecycleDisposition) {
+			this.#applyLifecycleDisposition(frame.id, reservation, frame.lifecycleDisposition);
+		} else if (!frame.agentInvoked || (!reservation.started && !reservation.holdForStart)) {
 			this.#completeAgentRun(reservation);
 		}
 	}
@@ -2614,7 +2703,7 @@ export class RpcClient {
 
 	#handleLatePromptError(response: RpcPromptErrorResponse): void {
 		if (this.#reportedPromptErrorIds.has(response.id)) return;
-		this.#reportedPromptErrorIds.add(response.id);
+		addRpcTombstone(this.#reportedPromptErrorIds, response.id);
 		this.#rollbackCommandLifecycle(response.id);
 		for (const listener of this.#promptErrorListeners) listener(response);
 	}
@@ -2623,7 +2712,7 @@ export class RpcClient {
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
 			const id = data.id;
-			if (id && this.#expiredRequestIds.delete(id)) return;
+			if (id && this.#expiredRequestIds.has(id)) return;
 			if (id && this.#pendingRequests.has(id)) {
 				const pending = this.#pendingRequests.get(id)!;
 				this.#pendingRequests.delete(id);
@@ -2799,7 +2888,7 @@ export class RpcClient {
 				: this.#startTimeout(timeoutMs, () => {
 						if (settled) return;
 						this.#pendingRequests.delete(id);
-						this.#expiredRequestIds.add(id);
+						addRpcTombstone(this.#expiredRequestIds, id);
 						this.#rollbackCommandLifecycle(id);
 						settled = true;
 						reject(

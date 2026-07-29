@@ -15,7 +15,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeSwitchResult } from "../extensibility/extensions";
 import { obfuscateProviderContext, type SecretObfuscator } from "../secrets/obfuscator";
-import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
+import type { HandoffResult, SessionHandoffOptions, SessionTransitionOptions } from "./agent-session-types";
 import type { BashSessionTransition } from "./bash-runner";
 import type { SessionContext } from "./session-context";
 import type { SessionManager } from "./session-manager";
@@ -97,8 +97,11 @@ export class SessionHandoff {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		this.#host.assertVibeSessionTransitionAllowed("handoff to a new session");
+	async handoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		transitionOptions: SessionTransitionOptions = {},
+	): Promise<HandoffResult | undefined> {
 		const entries = this.#host.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -209,7 +212,6 @@ export class SessionHandoff {
 				return undefined;
 			}
 
-			// Start a new session
 			const previousSessionFile = this.#host.sessionFile();
 			if (this.#host.extensionRunner?.hasHandlers("session_before_switch")) {
 				const result = (await this.#host.extensionRunner.emit({
@@ -224,28 +226,47 @@ export class SessionHandoff {
 			}
 			await this.#host.flushPendingBash();
 			await this.#host.sessionManager.flush();
+			await transitionOptions.beforeCommit?.();
+			this.#host.assertVibeSessionTransitionAllowed("handoff to a new session");
+
+			const previousSessionState = this.#host.sessionManager.captureState();
 			const bashTransition = this.#host.beginBashSessionTransition();
-			this.#host.cancelOwnAsyncJobs();
-			let sessionTransitioned = false;
+			const handoffContent = createHandoffContext(handoffText);
 			try {
 				await this.#host.sessionManager.newSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
-				this.#host.markBashSessionTransition(bashTransition);
-				sessionTransitioned = true;
-			} finally {
-				this.#host.finishBashSessionTransition(bashTransition, sessionTransitioned);
+				this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
+				await this.#host.sessionManager.ensureOnDisk();
+			} catch (error) {
+				this.#host.sessionManager.restoreState(previousSessionState);
+				this.#host.finishBashSessionTransition(bashTransition, false);
+				throw error;
 			}
 
-			this.#host.clearSessionScopedToolState();
+			let onCommittedError: unknown;
+			let onCommittedFailed = false;
+			try {
+				transitionOptions.onCommitted?.();
+			} catch (error) {
+				onCommittedError = error;
+				onCommittedFailed = true;
+			}
+			try {
+				this.#host.markBashSessionTransition(bashTransition);
+			} finally {
+				this.#host.finishBashSessionTransition(bashTransition, true);
+			}
 
+			this.#host.cancelOwnAsyncJobs();
+			this.#host.clearSessionScopedToolState();
 			this.#host.clearCheckpointRuntimeState();
 			// agent.reset() clears the core steering/follow-up queues. Preserve any queued
 			// steers/follow-ups (RPC/SDK steer()/followUp() issued during the handoff, or a
 			// pre-loader TUI steer) so they survive into the post-handoff session instead of
 			// being silently dropped. Capture is synchronous immediately before reset and
 			// restore is synchronous immediately after — no await gap — so a steer arriving
-			// later (during ensureOnDisk/Bun.write below) appends to the restored queue
+			// later (during the remaining async setup below) appends to the restored queue
 			// rather than being clobbered.
 			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
 			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
@@ -258,10 +279,6 @@ export class SessionHandoff {
 			this.#host.clearPendingNextTurnMessages();
 			this.#host.resetTodoCycle();
 
-			// Inject the handoff document as a custom message
-			const handoffContent = createHandoffContext(handoffText);
-			this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
-			await this.#host.sessionManager.ensureOnDisk();
 			let savedPath: string | undefined;
 			if (options?.autoTriggered && this.#host.settings.get("compaction.handoffSaveToDisk")) {
 				const artifactsDir = this.#host.sessionManager.getArtifactsDir();
@@ -293,7 +310,7 @@ export class SessionHandoff {
 					previousSessionFile,
 				});
 			}
-
+			if (onCommittedFailed) throw onCommittedError;
 			return { document: handoffText, savedPath };
 		} catch (error) {
 			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {

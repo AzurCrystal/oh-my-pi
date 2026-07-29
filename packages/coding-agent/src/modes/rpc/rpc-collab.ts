@@ -46,6 +46,11 @@ type RpcCollabContext = CollabHostContext &
 		collabHostStart?: Promise<CollabHost>;
 		collabGuestStart?: Promise<CollabGuestLink>;
 		disposed?: boolean;
+		collabGuestOwnership?: {
+			guest: CollabGuestLink;
+			startup: Promise<CollabGuestLink>;
+			releaseTransition: () => void;
+		};
 	};
 
 const contexts = new WeakMap<AgentSession, RpcCollabContext>();
@@ -119,9 +124,26 @@ async function ownedGuest(context: RpcCollabContext | undefined): Promise<Collab
 	}
 }
 
+/** Release the transition lease only after a failed join no longer owns a committed replica. */
+function releaseGuestOwnership(session: AgentSession, context: RpcCollabContext, guest: CollabGuestLink): void {
+	const ownership = context.collabGuestOwnership;
+	if (!ownership || ownership.guest !== guest) return;
+	if (context.collabGuestStart === ownership.startup) context.collabGuestStart = undefined;
+	context.runSessionTransition = (transition, options) => session.runSessionTransition(transition, options);
+	context.collabGuestOwnership = undefined;
+	ownership.releaseTransition();
+}
+
 /** Whether this session is currently a collaboration guest replica. */
 export function isRpcCollabGuest(session: AgentSession): boolean {
 	return contexts.get(session)?.collabGuest !== undefined;
+}
+
+/** How guest input relates to the authoritative host's logical agent lifecycle. */
+export function getRpcCollabGuestLifecycleDisposition(session: AgentSession): "current" | "future" | undefined {
+	const guest = contexts.get(session)?.collabGuest;
+	if (!guest) return undefined;
+	return guest.remoteAgentActive ? "current" : "future";
 }
 
 /**
@@ -241,18 +263,24 @@ export async function joinRpcCollabSession(
 			await guest.join(link);
 			return guest;
 		} catch (error) {
-			await guest.leave("join failed").catch(() => {});
+			if (!guest.hasCommittedReplica) await guest.leave("join failed").catch(() => {});
+			if (guest.hasCommittedReplica) context.collabGuest = guest;
 			throw error;
 		}
 	})();
 	context.collabGuestStart = startup;
+	context.collabGuestOwnership = {
+		guest,
+		startup,
+		releaseTransition: transitionLease.release,
+	};
+	let joined = false;
 	try {
 		await startup;
+		joined = true;
 		return getRpcCollabStatus(session);
 	} finally {
-		if (context.collabGuestStart === startup) context.collabGuestStart = undefined;
-		context.runSessionTransition = (transition, options) => session.runSessionTransition(transition, options);
-		transitionLease.release();
+		if (joined || !guest.hasCommittedReplica) releaseGuestOwnership(session, context, guest);
 	}
 }
 
@@ -261,7 +289,14 @@ export async function leaveRpcCollabSession(session: AgentSession): Promise<void
 	const context = contexts.get(session);
 	const guest = await ownedGuest(context);
 	if (guest) {
-		await guest.leave("left");
+		try {
+			await guest.leave("left");
+		} finally {
+			if (context && !guest.hasCommittedReplica) {
+				releaseGuestOwnership(session, context, guest);
+				if (context.disposed) contexts.delete(session);
+			}
+		}
 		return;
 	}
 	await (await ownedHost(context))?.stop("host stopped");
@@ -276,10 +311,13 @@ export async function disposeRpcCollab(session: AgentSession): Promise<void> {
 	try {
 		await guest?.leave("session ended");
 	} finally {
-		try {
-			await (await ownedHost(context))?.stop("session ended");
-		} finally {
-			contexts.delete(session);
+		if (!guest?.hasCommittedReplica) {
+			if (guest) releaseGuestOwnership(session, context, guest);
+			try {
+				await (await ownedHost(context))?.stop("session ended");
+			} finally {
+				contexts.delete(session);
+			}
 		}
 	}
 }

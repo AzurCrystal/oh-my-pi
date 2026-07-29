@@ -253,17 +253,29 @@ print(acknowledgement.request_id, acknowledgement.agent_invoked)
 
 `agent_invoked` is `True` when the agent-facing input path accepted the prompt,
 `False` when it completed locally, and `None` while the outcome is still
-resolving. The server then emits exactly one `PromptResultEvent` with the same
-request id and either value. A `True` outcome does not by itself promise a new
-agent lifecycle: an active `streaming_behavior="steer"` prompt joins the current
-run, while `followUp` reserves a separate run. `prompt_and_wait()` uses the
-correlated outcome plus wire lifecycle bookkeeping; accepted guest-relay input
-without a local `agent_start` returns an empty `PromptTurn`.
+resolving. Every successfully acknowledged `prompt` or `abort_and_prompt` then
+emits one same-id `PromptResultEvent`; a late scheduling failure instead raises
+one correlated `RpcCommandError`. `lifecycle_disposition` is `"none"` when no
+run was scheduled, `"current"` when work joined the active run, and `"future"`
+when the input owns a queued or newly starting run. `prompt_and_wait()` uses
+that server-owned disposition, so a guest follow-up relayed as host steering
+waits on the active run without reserving a nonexistent future run, and an
+extension-injected send cannot return before its tracked scheduling task
+completes or fails.
 
-`follow_up()` reserves a distinct future run before writing the request. A
-successful acknowledgement keeps that reservation across the previous run's
-`agent_end` / next `agent_start` gap; an immediate rejection rolls back that
-exact reservation. `wait_for_idle()` therefore waits through the gap. Wire
+`prompt_and_wait()` requires the runtime to advertise the additive
+`prompt_result` capability in its ready frame. Against an older runtime that
+omits it, the helper raises `RpcCommandError(code="capability_unavailable")`
+immediately with an upgrade message instead of hanging. `prompt()`,
+`prompt_with_result()`, and unrelated client APIs remain compatible; only the
+high-level correlated waiter requires the capability.
+
+`follow_up()` normally reserves a distinct future run before writing the
+request. A successful acknowledgement keeps that reservation across the
+previous run's `agent_end` / next `agent_start` gap; an immediate rejection
+rolls it back. When the response reports `"current"`, the client merges the
+request into the active reservation instead. `wait_for_idle()` therefore spans
+the correct run without waiting for a future lifecycle that will never start.
 `agent_end.isTerminal: false` is exposed as `AgentEndEvent.is_terminal is
 False` and does not complete the reservation; the final absent/true value does.
 
@@ -314,6 +326,7 @@ allows:
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed
   through `client.listener_errors` and `client.on_listener_error(...)`
+- timed-out request ids and already-reported prompt-error ids use separate insertion-ordered tombstone windows capped at 1,024 entries; retained late duplicates stay suppressed without lifetime growth
 
 User callbacks run on one ordered dispatcher generation after reader-side
 bookkeeping. Normal `stop()` drains that generation before joining it.

@@ -17,6 +17,7 @@ from omp_rpc import (
     ExtensionAskDialogResultItem,
     ExtensionAskDialogSubmitResult,
     PromptResultEvent,
+    PromptTurn,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
@@ -25,7 +26,11 @@ from omp_rpc import (
     RpcError,
     host_tool,
 )
-from omp_rpc.client import _RpcFrameDecoder
+from omp_rpc.client import (
+    _BoundedTombstones,
+    _RPC_TOMBSTONE_LIMIT,
+    _RpcFrameDecoder,
+)
 from omp_rpc.protocol import JsonObject
 
 
@@ -258,7 +263,7 @@ FAKE_SERVER = textwrap.dedent(
             payload["error"] = error
         print(json.dumps(payload), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     todo_phases = []
     messages = []
     branch_messages = [{"entryId": "entry-1", "text": "branch message"}]
@@ -497,7 +502,7 @@ FAKE_SERVER = textwrap.dedent(
                 delay=0.3 if message == "slow" else 0.0,
                 include_extra_events=message == "all events",
                 compact_terminal=message == "compacted turn",
-                prompt_request_id=request_id if command_type == "prompt" else None,
+                prompt_request_id=request_id,
             )
         elif command_type == "host_tool_update":
             print(
@@ -575,6 +580,7 @@ V2_MESSAGES_SERVER = textwrap.dedent(
                 "type": "ready",
                 "protocolVersion": 1,
                 "supportedProtocolVersions": [1, 2],
+                "capabilities": ["prompt_result", "prompt_lifecycle_disposition"],
                 "maxFrameBytes": 1024 * 1024,
                 "maxReassembledFrameBytes": 64 * 1024 * 1024,
             }
@@ -687,7 +693,7 @@ IDLESS_ERROR_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -728,7 +734,7 @@ LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -799,7 +805,7 @@ STDERR_SERVER = textwrap.dedent(
     sys.stderr.flush()
     sys.stderr.write("second\\n")
     sys.stderr.flush()
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -857,7 +863,7 @@ ASYNC_FRAMES_SERVER = textwrap.dedent(
             "data": data,
         }), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         request_id = command["id"]
@@ -980,7 +986,7 @@ PROMPT_RESULTS_SERVER = textwrap.dedent(
         timer.daemon = True
         timer.start()
 
-    emit({"type": "ready"})
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         request_id = command["id"]
@@ -1076,7 +1082,7 @@ PROMPT_ACCOUNTING_SERVER = textwrap.dedent(
             "agentInvoked": True,
         })
 
-    emit({"type": "ready"})
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         request_id = command["id"]
@@ -1115,7 +1121,7 @@ LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
     def emit(payload):
         print(json.dumps(payload), flush=True)
 
-    def respond(command, *, success=True, error=None, code=None):
+    def respond(command, *, success=True, error=None, code=None, data=None):
         payload = {
             "id": command["id"],
             "type": "response",
@@ -1126,21 +1132,39 @@ LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
             payload["error"] = error
         if code is not None:
             payload["code"] = code
+        if data is not None:
+            payload["data"] = data
         emit(payload)
 
-    emit({"type": "ready"})
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
+    pending_extension_id = None
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         command_type = command["type"]
 
         if command_type == "prompt":
-            respond(command)
-            emit({"type": "agent_start"})
-            emit({
-                "type": "prompt_result",
-                "id": command["id"],
-                "agentInvoked": True,
-            })
+            if command["message"] == "extension-delayed":
+                pending_extension_id = command["id"]
+                respond(command)
+            elif command["message"] == "extension-prestart-error":
+                respond(command)
+                emit({
+                    "id": command["id"],
+                    "type": "response",
+                    "command": "prompt",
+                    "success": False,
+                    "error": "Extension task failed before agent start",
+                    "code": "prompt_scheduling_failed",
+                })
+            else:
+                respond(command)
+                emit({"type": "agent_start"})
+                emit({
+                    "type": "prompt_result",
+                    "id": command["id"],
+                    "agentInvoked": True,
+                    "lifecycleDisposition": "future",
+                })
         elif command_type == "follow_up":
             if command["message"] == "reject":
                 respond(
@@ -1149,18 +1173,52 @@ LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
                     error="follow-up rejected",
                     code="follow_up_rejected",
                 )
+            elif command["message"] == "guest-current":
+                respond(
+                    command,
+                    data={
+                        "agentInvoked": True,
+                        "lifecycleDisposition": "current",
+                    },
+                )
             else:
-                respond(command)
+                respond(
+                    command,
+                    data={
+                        "agentInvoked": True,
+                        "lifecycleDisposition": "future",
+                    },
+                )
         elif command_type == "abort_and_prompt":
             respond(command)
-            emit({
-                "id": command["id"],
-                "type": "response",
-                "command": command_type,
-                "success": False,
-                "error": "replacement rejected",
-                "code": "prompt_scheduling_failed",
-            })
+            if command["message"] == "local-only":
+                emit({
+                    "type": "prompt_result",
+                    "id": command["id"],
+                    "agentInvoked": False,
+                    "lifecycleDisposition": "none",
+                })
+            else:
+                emit({
+                    "id": command["id"],
+                    "type": "response",
+                    "command": command_type,
+                    "success": False,
+                    "error": "replacement rejected",
+                    "code": "prompt_scheduling_failed",
+                })
+        elif command_type == "release_extension":
+            emit({"type": "agent_start"})
+            emit({"type": "agent_end", "messages": []})
+            if pending_extension_id is not None:
+                emit({
+                    "type": "prompt_result",
+                    "id": pending_extension_id,
+                    "agentInvoked": True,
+                    "lifecycleDisposition": "future",
+                })
+                pending_extension_id = None
+            respond(command)
         elif command_type == "finish_active":
             emit({"type": "agent_end", "messages": []})
             respond(command)
@@ -1180,6 +1238,24 @@ LIFECYCLE_RESERVATION_SERVER = textwrap.dedent(
     """
 )
 
+OLD_RUNTIME_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        print(json.dumps({
+            "id": command["id"],
+            "type": "response",
+            "command": command["type"],
+            "success": True,
+            "data": {},
+        }), flush=True)
+    """
+)
+
 DISPATCHER_CONTROL_SERVER = textwrap.dedent(
     """
     import json
@@ -1188,7 +1264,7 @@ DISPATCHER_CONTROL_SERVER = textwrap.dedent(
     def emit(payload):
         print(json.dumps(payload), flush=True)
 
-    emit({"type": "ready"})
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         command_type = command["type"]
@@ -1220,7 +1296,7 @@ DELTA_COMMANDS_SERVER = textwrap.dedent(
     import sys
 
     published_text = None
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         if command["type"] == "publish_editor_text":
@@ -1243,7 +1319,7 @@ NULLABLE_RESPONSE_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         data = (
@@ -1279,7 +1355,7 @@ EXECUTION_TIMEOUT_SERVER = textwrap.dedent(
     def emit(payload):
         print(json.dumps(payload), flush=True)
 
-    emit({"type": "ready"})
+    emit({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]})
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
         command_type = command["type"]
@@ -1373,6 +1449,15 @@ class RpcClientTests(unittest.TestCase):
             )
 
         self.assertEqual(decoded, frame)
+
+    def test_bounded_tombstones_evict_only_the_oldest_ids(self) -> None:
+        tombstones = _BoundedTombstones(_RPC_TOMBSTONE_LIMIT)
+        for index in range(_RPC_TOMBSTONE_LIMIT + 1):
+            tombstones.add(f"request-{index}")
+
+        self.assertEqual(len(tombstones), _RPC_TOMBSTONE_LIMIT)
+        self.assertNotIn("request-0", tombstones)
+        self.assertIn(f"request-{_RPC_TOMBSTONE_LIMIT}", tombstones)
 
     def test_bash_and_python_response_timeouts_are_opt_in_and_out_of_band(
         self,
@@ -1774,6 +1859,78 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(turn.require_assistant_text(), "pong")
             self.assertGreaterEqual(len(turn.events), 3)
             self.assertEqual(client._pending_prompt_outcomes, {})
+
+    def test_prompt_and_wait_requires_negotiated_prompt_result_capability(
+        self,
+    ) -> None:
+        with self.make_client(server=OLD_RUNTIME_SERVER) as client:
+            self.assertEqual(client.request_raw("legacy_probe"), {})
+            client.prompt("legacy fire-and-forget")
+            client.wait_for_idle(timeout=0.5)
+            with self.assertRaisesRegex(
+                RpcCommandError,
+                "prompt_result.*upgrade the RPC runtime",
+            ) as raised:
+                client.prompt_and_wait("unsupported", timeout=0.1)
+
+            self.assertEqual(raised.exception.code, "capability_unavailable")
+
+    def test_extension_prompt_waits_for_correlated_task_and_surfaces_prestart_error(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            turns: list[PromptTurn] = []
+            failures: list[BaseException] = []
+            finished = threading.Event()
+
+            def wait_for_extension() -> None:
+                try:
+                    turns.append(
+                        client.prompt_and_wait("extension-delayed", timeout=2.0)
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    finished.set()
+
+            waiter = threading.Thread(target=wait_for_extension)
+            waiter.start()
+            deadline = time.monotonic() + 2.0
+            with client._event_condition:
+                while not any(
+                    outcome.acknowledged
+                    for outcome in client._pending_prompt_outcomes.values()
+                ):
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0)
+                    client._event_condition.wait(remaining)
+
+            self.assertFalse(finished.is_set())
+            client.request_raw("release_extension")
+            self.assertTrue(finished.wait(2.0))
+            waiter.join()
+            self.assertEqual(failures, [])
+            self.assertEqual(
+                [event.type for event in turns[0].events],
+                ["agent_start", "agent_end"],
+            )
+
+            with self.assertRaises(RpcCommandError) as raised:
+                client.prompt_and_wait("extension-prestart-error", timeout=2.0)
+            self.assertEqual(raised.exception.code, "prompt_scheduling_failed")
+            client.wait_for_idle(timeout=0.5)
+
+    def test_local_abort_and_guest_current_dispositions_do_not_strand_idle(
+        self,
+    ) -> None:
+        with self.make_client(server=LIFECYCLE_RESERVATION_SERVER) as client:
+            client.abort_and_prompt("local-only")
+            client.wait_for_idle(timeout=0.5)
+
+            client.prompt_with_result("active")
+            client.follow_up("guest-current")
+            client.request_raw("finish_active")
+            client.wait_for_idle(timeout=0.5)
 
     def test_plain_prompt_cleans_outcome_after_normal_agent_lifecycle(self) -> None:
         with self.make_client(server=PROMPT_RESULTS_SERVER) as client:
@@ -2829,7 +2986,7 @@ HANGING_SERVER = textwrap.dedent(
     import json
     import sys
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(json.dumps({"type": "ready", "capabilities": ["prompt_result", "prompt_lifecycle_disposition"]}), flush=True)
     # Read one line (the prompt) and acknowledge it, then never emit agent_end.
     # The client's prompt_and_wait should sit in _wait_for_agent_end forever
     # unless stop() unblocks it.

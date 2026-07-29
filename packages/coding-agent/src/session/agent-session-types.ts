@@ -266,7 +266,7 @@ export interface SessionHandoffOptions {
 	onSwitchCancelled?: () => void;
 }
 
-/** Hooks for the cancellable session transitions: new, switch, branch, and fork. */
+/** Hooks for cancellable new, switch, handoff, branch, fork, and history transitions. */
 export interface SessionTransitionOptions {
 	/**
 	 * Runs once every cancellation check has passed and before the outgoing
@@ -285,6 +285,12 @@ export interface SessionTransitionOptions {
 	 * this callback does not roll back the committed session or leave it detached.
 	 */
 	onCommitted?: () => void;
+	/**
+	 * Internal rollback escape hatch: skips only the cancellable
+	 * `session_before_switch` hook. Use solely to restore a previously committed
+	 * local snapshot; persistence, reconciliation, and commit hooks still run.
+	 */
+	bypassBeforeSwitchHook?: boolean;
 }
 
 /** Result reported by one commit-aware session or history transition. */

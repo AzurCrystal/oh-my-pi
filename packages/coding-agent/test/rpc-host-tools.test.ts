@@ -128,7 +128,7 @@ function write(frame) {
 	process.stdout.write(JSON.stringify(frame) + "\\n");
 }
 
-write({ type: "ready" });
+write({ type: "ready", capabilities: ["prompt_result", "prompt_lifecycle_disposition"] });
 
 process.stdin.on("data", chunk => {
 	buffer += chunk.toString("utf8");
@@ -154,6 +154,7 @@ function handle(frame) {
 	}
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
+		write({ type: "prompt_result", id: frame.id, agentInvoked: true, lifecycleDisposition: "future" });
 		write({ type: "agent_start" });
 		write({
 			type: "host_tool_call",

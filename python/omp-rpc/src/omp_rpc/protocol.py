@@ -16,6 +16,8 @@ ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
+PromptLifecycleDisposition: TypeAlias = Literal["none", "current", "future"]
+RpcCapability: TypeAlias = Literal["prompt_result", "prompt_lifecycle_disposition"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
@@ -76,6 +78,9 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_PROMPT_LIFECYCLE_DISPOSITION_VALUES: Final[frozenset[str]] = frozenset(
+    {"none", "current", "future"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -892,6 +897,7 @@ class SessionStats:
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
+    capabilities: tuple[RpcCapability, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
     type: Literal["ready"] = "ready"
@@ -1218,6 +1224,7 @@ class TtsrGenerationEvent:
 class PromptResultEvent:
     agent_invoked: bool
     id: str | None = None
+    lifecycle_disposition: PromptLifecycleDisposition | None = None
     type: Literal["prompt_result"] = "prompt_result"
 
 
@@ -1837,9 +1844,25 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities: tuple[RpcCapability, ...] | None = None
+        if raw_capabilities is not None:
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(capability, str) for capability in raw_capabilities
+            ):
+                raise ValueError("ready.capabilities must contain strings")
+            capabilities = cast(
+                tuple[RpcCapability, ...],
+                tuple(
+                    capability
+                    for capability in raw_capabilities
+                    if capability in {"prompt_result", "prompt_lifecycle_disposition"}
+                ),
+            )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
+            capabilities=capabilities,
             max_frame_bytes=_optional_int(payload, "maxFrameBytes"),
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
@@ -1888,6 +1911,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return PromptResultEvent(
             agent_invoked=agent_invoked,
             id=_optional_str(payload, "id"),
+            lifecycle_disposition=cast(
+                PromptLifecycleDisposition | None,
+                _optional_literal(
+                    payload.get("lifecycleDisposition"),
+                    _PROMPT_LIFECYCLE_DISPOSITION_VALUES,
+                    field="prompt_result.lifecycleDisposition",
+                ),
+            ),
         )
     if event_type == "settings_update":
         return SettingsUpdateEvent(

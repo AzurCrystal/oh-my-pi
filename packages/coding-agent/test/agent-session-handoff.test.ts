@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SessionTransitionCoordinator } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -259,6 +260,47 @@ describe("AgentSession handoff", () => {
 				handoffEntryCount: 1,
 			},
 		]);
+	});
+
+	it("commits handoff through the transition coordinator without applying the plan default", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		const sourceSessionFile = session.sessionFile;
+		const calls: string[] = [];
+		let committedOutcome: { committed: boolean; honorPlanDefault: boolean } | undefined;
+		const coordinator: SessionTransitionCoordinator = {
+			run: async transition => {
+				const outcome = await transition({
+					beforeCommit: async () => {
+						calls.push("beforeCommit");
+						expect(session.sessionFile).toBe(sourceSessionFile);
+					},
+					onCommitted: () => {
+						calls.push("onCommitted");
+						expect(session.sessionFile).not.toBe(sourceSessionFile);
+						expect(
+							session.sessionManager
+								.getEntries()
+								.filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+						).toHaveLength(1);
+					},
+				});
+				committedOutcome = {
+					committed: outcome.committed,
+					honorPlanDefault: outcome.honorPlanDefault,
+				};
+				return outcome.result;
+			},
+			acquire: () => {
+				throw new Error("Unexpected nested transition lease");
+			},
+		};
+		session.setSessionTransitionCoordinator(coordinator);
+
+		const result = await session.handoff();
+
+		expect(result?.document).toBe("## Goal\nContinue from here");
+		expect(calls).toEqual(["beforeCommit", "onCommitted"]);
+		expect(committedOutcome).toEqual({ committed: true, honorPlanDefault: false });
 	});
 
 	it("runs handoff generation through the configured side stream function", async () => {

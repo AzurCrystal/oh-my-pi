@@ -60,7 +60,7 @@ import type { EventBus } from "../../utils/event-bus";
 import { buildSessionAutocompleteProvider } from "../completions";
 import { loadAllExtensions } from "../components/extensions/state-manager";
 import { shouldSkipHistory } from "../controllers/input-controller";
-import { initializeExtensions } from "../runtime-init";
+import { type ExtensionMessageLifecycleDisposition, initializeExtensions } from "../runtime-init";
 import { applySettingEffects } from "../setting-effects";
 import {
 	getAvailableThemesWithPaths,
@@ -107,6 +107,7 @@ import type {
 	RpcJsonValue,
 	RpcPlanDecisionResult,
 	RpcPlanModeSnapshot,
+	RpcPromptLifecycleDisposition,
 	RpcProviderRequestObservationFrame,
 	RpcResponse,
 	RpcSessionState,
@@ -271,6 +272,7 @@ export function routeRpcCollabGuestPrompt(input: {
 	id: string | undefined;
 	relay: () => void;
 	output: (frame: object) => void;
+	lifecycleDisposition: Exclude<RpcPromptLifecycleDisposition, "none">;
 }): RpcResponse {
 	try {
 		input.relay();
@@ -279,38 +281,59 @@ export function routeRpcCollabGuestPrompt(input: {
 		const code = relayError instanceof rpcCollab.RpcCollabGuestRoutingError ? relayError.code : "operation_failed";
 		return { id: input.id, type: "response", command: "prompt", success: false, error: message, code };
 	}
-	input.output({ type: "prompt_result", id: input.id, agentInvoked: true });
+	const outcome = {
+		agentInvoked: true,
+		lifecycleDisposition: input.lifecycleDisposition,
+	} as const;
+	input.output({ type: "prompt_result", id: input.id, ...outcome });
 	return {
 		id: input.id,
 		type: "response",
 		command: "prompt",
 		success: true,
-		data: { agentInvoked: true },
+		data: outcome,
 	};
 }
+
+type RpcExtensionAgentMessageTask = {
+	task: Promise<unknown>;
+	disposition: ExtensionMessageLifecycleDisposition;
+};
 
 export function reportLocalOnlyPromptResult(input: {
 	id: string | undefined;
 	prompt: Promise<boolean>;
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
-	hasExtensionAgentMessageTask?: () => boolean;
+	promptLifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">;
+	extensionAgentMessageTasks?: () => readonly RpcExtensionAgentMessageTask[];
 }): void {
-	void input.prompt
-		.then(agentInvoked => {
+	void (async () => {
+		try {
+			const agentInvoked = await input.prompt;
+			const extensionTasks = input.extensionAgentMessageTasks?.() ?? [];
+			await Promise.all(extensionTasks.map(extensionTask => extensionTask.task));
+			const lifecycleDisposition: RpcPromptLifecycleDisposition = agentInvoked
+				? (input.promptLifecycleDisposition ?? "future")
+				: extensionTasks.some(extensionTask => extensionTask.disposition === "future")
+					? "future"
+					: extensionTasks.length > 0
+						? "current"
+						: "none";
 			input.output({
 				type: "prompt_result",
 				id: input.id,
-				agentInvoked: agentInvoked || (input.hasExtensionAgentMessageTask?.() ?? false),
+				agentInvoked: lifecycleDisposition !== "none",
+				lifecycleDisposition,
 			});
-		})
-		.catch(error => {
+		} catch (error) {
 			input.onError(error instanceof Error ? error : new Error(String(error)));
-		});
+		}
+	})();
 }
 
 type RpcExtensionUserMessageScope = {
-	hasAgentMessageTask: boolean;
+	agentMessageTasks: RpcExtensionAgentMessageTask[];
 };
 
 /**
@@ -322,22 +345,18 @@ type RpcExtensionUserMessageScope = {
 export class RpcExtensionUserMessageTracker {
 	#activePromptScopes = new Set<RpcExtensionUserMessageScope>();
 
-	markAgentMessageTask(): void {
+	trackAgentMessageTask(task: Promise<unknown>, disposition: ExtensionMessageLifecycleDisposition): void {
 		for (const scope of this.#activePromptScopes) {
-			scope.hasAgentMessageTask = true;
+			scope.agentMessageTasks.push({ task, disposition });
 		}
-	}
-
-	trackAgentMessageTask(_task: Promise<unknown>): void {
-		this.markAgentMessageTask();
 	}
 
 	watchPrompt<T>(startPrompt: () => Promise<T>): {
 		prompt: Promise<T>;
-		hasAgentMessageTask: () => boolean;
+		agentMessageTasks: () => readonly RpcExtensionAgentMessageTask[];
 	} {
 		const scope: RpcExtensionUserMessageScope = {
-			hasAgentMessageTask: false,
+			agentMessageTasks: [],
 		};
 		this.#activePromptScopes.add(scope);
 		let prompt: Promise<T>;
@@ -351,7 +370,7 @@ export class RpcExtensionUserMessageTracker {
 			prompt: prompt.finally(() => {
 				this.#activePromptScopes.delete(scope);
 			}),
-			hasAgentMessageTask: () => scope.hasAgentMessageTask,
+			agentMessageTasks: () => scope.agentMessageTasks,
 		};
 	}
 }
@@ -362,6 +381,8 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+	promptLifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">;
+	additionalAgentMessageTasks?: readonly RpcExtensionAgentMessageTask[];
 }): void {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
 	reportLocalOnlyPromptResult({
@@ -369,7 +390,11 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 		prompt: trackedPrompt.prompt,
 		output: input.output,
 		onError: input.onError,
-		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
+		promptLifecycleDisposition: input.promptLifecycleDisposition,
+		extensionAgentMessageTasks: () => [
+			...(input.additionalAgentMessageTasks ?? []),
+			...trackedPrompt.agentMessageTasks(),
+		],
 	});
 }
 
@@ -1199,6 +1224,7 @@ export async function runRpcMode(
 			type: "ready",
 			protocolVersion: 1,
 			supportedProtocolVersions: [1, 2],
+			capabilities: ["prompt_result", "prompt_lifecycle_disposition"],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		}),
@@ -1670,8 +1696,8 @@ export async function runRpcMode(
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
+		trackAgentInvokingMessage: (task, disposition) => {
+			extensionUserMessageTracker.trackAgentMessageTask(task, disposition);
 		},
 		uiContext: rpcUiContext,
 	});
@@ -1777,10 +1803,15 @@ export async function runRpcMode(
 		requestId: string | undefined,
 		commandName: "prompt" | "steer" | "follow_up" | "abort" | "abort_and_prompt",
 		route: () => void,
+		lifecycleDisposition?: Exclude<RpcPromptLifecycleDisposition, "none">,
+		emitPromptResult = false,
 	): RpcResponse => {
 		try {
 			route();
-			return success(requestId, commandName);
+			if (!lifecycleDisposition) return success(requestId, commandName);
+			const outcome = { agentInvoked: true, lifecycleDisposition };
+			if (emitPromptResult) output({ type: "prompt_result", id: requestId, ...outcome });
+			return success(requestId, commandName, outcome);
 		} catch (routeError) {
 			const message = routeError instanceof Error ? routeError.message : String(routeError);
 			const code = routeError instanceof rpcCollab.RpcCollabGuestRoutingError ? routeError.code : "operation_failed";
@@ -2070,71 +2101,101 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				const resolvedPrompt = (agentInvoked: boolean): RpcResponse => {
-					output({ type: "prompt_result", id, agentInvoked });
-					return success(id, "prompt", { agentInvoked });
+				const resolvedPrompt = (
+					agentInvoked: boolean,
+					lifecycleDisposition: RpcPromptLifecycleDisposition = agentInvoked ? "future" : "none",
+				): RpcResponse => {
+					const outcome = { agentInvoked, lifecycleDisposition };
+					output({ type: "prompt_result", id, ...outcome });
+					return success(id, "prompt", outcome);
 				};
 				if (rpcCollab.isRpcCollabGuest(session)) {
 					return routeRpcCollabGuestPrompt({
 						id,
 						relay: () => rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
 						output,
+						lifecycleDisposition: rpcCollab.getRpcCollabGuestLifecycleDisposition(session) ?? "future",
 					});
 				}
 				let message = command.message.trim();
 				let images = command.images ? [...command.images] : undefined;
-				let inputAgentInvoked = false;
+				let inputAgentMessageTasks: readonly RpcExtensionAgentMessageTask[] = [];
+				const resolveWithoutPrompt = (
+					agentInvoked = false,
+					lifecycleDisposition: Exclude<RpcPromptLifecycleDisposition, "none"> = "future",
+				): RpcResponse => {
+					if (inputAgentMessageTasks.length === 0) {
+						return resolvedPrompt(agentInvoked, agentInvoked ? lifecycleDisposition : "none");
+					}
+					reportLocalOnlyPromptResult({
+						id,
+						prompt: Promise.resolve(agentInvoked),
+						output,
+						onError: promptError => output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
+						promptLifecycleDisposition: lifecycleDisposition,
+						extensionAgentMessageTasks: () => inputAgentMessageTasks,
+					});
+					return success(id, "prompt");
+				};
 				const runner = session.extensionRunner;
 				if (runner?.hasHandlers("input")) {
 					const trackedInput = extensionUserMessageTracker.watchPrompt(() =>
 						runner.emitInput(message, images, "rpc"),
 					);
 					const inputResult = await trackedInput.prompt;
-					inputAgentInvoked = trackedInput.hasAgentMessageTask();
+					inputAgentMessageTasks = trackedInput.agentMessageTasks();
 					if (inputResult?.handled) {
-						return resolvedPrompt(inputAgentInvoked);
+						return resolveWithoutPrompt();
 					}
 					if (inputResult?.text !== undefined) message = inputResult.text.trim();
 					if (inputResult?.images !== undefined) images = inputResult.images;
 				}
 				if (!message && !images?.length) {
-					return resolvedPrompt(inputAgentInvoked);
+					return resolveWithoutPrompt();
 				}
 
 				recordPromptHistory(message);
+				const skillDisposition =
+					session.isStreaming && command.streamingBehavior !== "followUp" ? "current" : "future";
 				const skillResult = await tryRunRpcSkillCommand(session, message, command.streamingBehavior);
 				if (skillResult) {
-					return resolvedPrompt(skillResult.agentInvoked);
+					return resolveWithoutPrompt(skillResult.agentInvoked, skillDisposition);
 				}
 				const builtinResult = await executeRpcBuiltinSlashCommand(message);
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
+						const promptLifecycleDisposition = session.isStreaming ? "current" : "future";
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: async () =>
-								(await session.prompt(builtinResult.prompt, { images })) || inputAgentInvoked,
+							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
 							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
+							onError: promptError =>
+								output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
 							extensionUserMessageTracker,
+							promptLifecycleDisposition,
+							additionalAgentMessageTasks: inputAgentMessageTasks,
 						});
 						return success(id, "prompt");
 					}
-					return resolvedPrompt(inputAgentInvoked);
+					return resolveWithoutPrompt();
 				}
 
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
+				// Don't await - events will stream. Extension-injected agent tasks settle
+				// before the correlated outcome, while the acknowledgement remains immediate.
+				const promptLifecycleDisposition =
+					session.isStreaming && command.streamingBehavior !== "followUp" ? "current" : "future";
 				watchAndReportLocalOnlyPromptResult({
 					id,
-					startPrompt: async () =>
-						(await session.prompt(message, {
+					startPrompt: () =>
+						session.prompt(message, {
 							images,
 							streamingBehavior: command.streamingBehavior,
-						})) || inputAgentInvoked,
+						}),
 					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
+					onError: promptError => output(error(id, "prompt", promptError.message, "prompt_scheduling_failed")),
 					extensionUserMessageTracker,
+					promptLifecycleDisposition,
+					additionalAgentMessageTasks: inputAgentMessageTasks,
 				});
 				return success(id, "prompt");
 			}
@@ -2151,12 +2212,16 @@ export async function runRpcMode(
 
 			case "follow_up": {
 				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "follow_up", () =>
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+					const lifecycleDisposition = rpcCollab.getRpcCollabGuestLifecycleDisposition(session) ?? "future";
+					return routeCollabGuestCommand(
+						id,
+						"follow_up",
+						() => rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images),
+						lifecycleDisposition,
 					);
 				}
 				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
+				return success(id, "follow_up", { agentInvoked: true, lifecycleDisposition: "future" });
 			}
 
 			case "abort": {
@@ -2169,15 +2234,27 @@ export async function runRpcMode(
 
 			case "abort_and_prompt": {
 				if (rpcCollab.isRpcCollabGuest(session)) {
-					return routeCollabGuestCommand(id, "abort_and_prompt", () => {
-						rpcCollab.sendRpcCollabGuestAbort(session);
-						rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images);
-					});
+					return routeCollabGuestCommand(
+						id,
+						"abort_and_prompt",
+						() => {
+							rpcCollab.sendRpcCollabGuestAbort(session);
+							rpcCollab.sendRpcCollabGuestPrompt(session, command.message, command.images);
+						},
+						"future",
+						true,
+					);
 				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message, "prompt_scheduling_failed")));
+				watchAndReportLocalOnlyPromptResult({
+					id,
+					startPrompt: () => session.prompt(command.message, { images: command.images }),
+					output,
+					onError: promptError =>
+						output(error(id, "abort_and_prompt", promptError.message, "prompt_scheduling_failed")),
+					extensionUserMessageTracker,
+					promptLifecycleDisposition: "future",
+				});
 				return success(id, "abort_and_prompt");
 			}
 
