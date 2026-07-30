@@ -33,6 +33,10 @@ describe("RPC protocol TUI parity", () => {
 	let secondRoot: TempDir | undefined;
 	let frames: Frame[] = [];
 	let persistenceFrames: Frame[] = [];
+	let emptySessionFileExisted = true;
+	let emptySessionWasDiscoverable = true;
+	let emptySessionFileExistsAfterPersist = false;
+	let emptySessionWasDiscoverableAfterPersist = false;
 
 	beforeAll(async () => {
 		firstRoot = TempDir.createSync("@omp-rpc-parity-primary-");
@@ -73,8 +77,39 @@ describe("RPC protocol TUI parity", () => {
 			);
 
 			const stateData = record(response(primary.frames, "state").data, "get_state data");
-			if (typeof stateData.sessionFile !== "string")
-				throw new Error("get_state did not return an active sessionFile");
+			if (typeof stateData.sessionFile !== "string" || typeof stateData.sessionId !== "string")
+				throw new Error("get_state did not return an active session identity");
+			emptySessionFileExisted = await fs.access(stateData.sessionFile).then(
+				() => true,
+				error => {
+					if (isRecord(error) && error.code === "ENOENT") return false;
+					throw error;
+				},
+			);
+			const initialSessions = array(record(response(primary.frames, "sessions").data, "initial get_sessions data").sessions, "sessions");
+			emptySessionWasDiscoverable = initialSessions.some(
+				session => isRecord(session) && session.path === stateData.sessionFile,
+			);
+			await primary.collectUntil([{ id: "persist-session", type: "persist_session" }], current =>
+				current.some(frame => frame.type === "response" && frame.id === "persist-session"),
+			);
+			await primary.collectUntil([{ id: "sessions-after-persist", type: "get_sessions" }], current =>
+				current.some(frame => frame.type === "response" && frame.id === "sessions-after-persist"),
+			);
+			emptySessionFileExistsAfterPersist = await fs.access(stateData.sessionFile).then(
+				() => true,
+				error => {
+					if (isRecord(error) && error.code === "ENOENT") return false;
+					throw error;
+				},
+			);
+			const persistedSessions = array(
+				record(response(primary.frames, "sessions-after-persist").data, "get_sessions after persist data").sessions,
+				"sessions after persist",
+			);
+			emptySessionWasDiscoverableAfterPersist = persistedSessions.some(
+				session => isRecord(session) && session.id === stateData.sessionId && session.path === stateData.sessionFile,
+			);
 			await primary.collectUntil(
 				[{ id: "delete-active", type: "delete_session", sessionPath: stateData.sessionFile }],
 				current => current.some(frame => frame.type === "response" && frame.id === "delete-active"),
@@ -200,6 +235,19 @@ describe("RPC protocol TUI parity", () => {
 			.map((setting, index) => record(setting, `persisted setting ${index}`))
 			.find(setting => setting.path === "steeringMode");
 		expect(steeringMode).toMatchObject({ value: "all", configured: true });
+	});
+
+	it("materializes an otherwise empty session for discovery", () => {
+		const state = record(response(frames, "state").data, "initial get_state data");
+		if (typeof state.sessionId !== "string" || typeof state.sessionFile !== "string")
+			throw new Error("get_state did not return an active session identity");
+
+		expect(emptySessionFileExisted).toBe(false);
+		expect(emptySessionWasDiscoverable).toBe(false);
+		const persisted = record(response(frames, "persist-session").data, "persist_session data");
+		expect(persisted).toEqual({ sessionId: state.sessionId, sessionFile: state.sessionFile });
+		expect(emptySessionFileExistsAfterPersist).toBe(true);
+		expect(emptySessionWasDiscoverableAfterPersist).toBe(true);
 	});
 
 	it("lists and searches sessions without returning their full message text", () => {

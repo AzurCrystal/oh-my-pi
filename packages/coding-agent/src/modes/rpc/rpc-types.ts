@@ -322,6 +322,7 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "persist_session" }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "get_settings" }
 	| { id?: string; type: "set_setting"; path: string; value: unknown }
@@ -654,6 +655,12 @@ export interface RpcSessionState {
 	skillWarnings: Array<{ skillPath: string; message: string }>;
 }
 
+/** Canonical identity of an explicitly materialized session. */
+export interface RpcPersistSessionResult {
+	sessionId: string;
+	sessionFile: string;
+}
+
 export interface RpcAvailableSlashCommand {
 	name: string;
 	aliases?: string[];
@@ -895,6 +902,7 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "persist_session"; success: true; data: RpcPersistSessionResult }
 	| {
 			id?: string;
 			type: "response";

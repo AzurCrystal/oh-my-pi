@@ -103,6 +103,7 @@ import type {
 	RpcPlanFinalizationStrategy,
 	RpcPlanModeSnapshot,
 	RpcPlanProposalSnapshot,
+	RpcPersistSessionResult,
 	RpcPromptAcknowledgement,
 	RpcPromptErrorResponse,
 	RpcPromptHistoryEntry,
@@ -1056,6 +1057,12 @@ export class RpcClient {
 	 */
 	async getState(): Promise<RpcSessionState> {
 		const response = await this.#send({ type: "get_state" });
+		return this.#getData(response);
+	}
+
+	/** Materialize the active session without adding a transcript entry. */
+	async persistSession(): Promise<RpcPersistSessionResult> {
+		const response = await this.#send({ type: "persist_session" });
 		return this.#getData(response);
 	}
 

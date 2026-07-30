@@ -146,7 +146,7 @@ The high-level TypeScript `promptAndWait()` and Python `prompt_and_wait()` helpe
 
 ## Command Schema (canonical)
 
-`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 181 command discriminants; referenced TypeScript types are exported from the same module.
+`RpcCommand` is defined in `src/modes/rpc/rpc-types.ts`. The list below covers all 182 command discriminants; referenced TypeScript types are exported from the same module.
 
 ### Protocol
 
@@ -185,6 +185,7 @@ The client MUST send the unchanged buffer, cursor, and selected item to `apply_c
 ### State and host capabilities
 
 - `{ id?, type: "get_state" }`
+- `{ id?, type: "persist_session" }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_settings" }`
 - `{ id?, type: "set_setting", path: string, value: unknown }`
@@ -203,6 +204,8 @@ The client MUST send the unchanged buffer, cursor, and selected item to `apply_c
 `get_extensions` defaults to the session cwd and removes the secret-bearing `raw` capability field. Setting `disabledExtensions` configures the next boot; it does not unload active tools or hooks. MCP servers are enabled or disabled through `prompt` with `/mcp enable <name>` or `/mcp disable <name>`.
 
 `get_repo_status` defaults to the session cwd. `includePr` defaults to `false` because it may invoke `gh` and perform a network request. `get_usage_reports` returns `{ reports: UsageReport[] }`.
+
+`persist_session` forces the active session header onto disk and flushes pending writes without adding a transcript entry. It returns `{ sessionId, sessionFile }`; collaboration guests cannot invoke it because it mutates host-owned durable state.
 
 ### Settings
 

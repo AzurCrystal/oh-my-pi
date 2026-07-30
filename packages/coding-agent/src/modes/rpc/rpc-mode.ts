@@ -501,6 +501,7 @@ const RPC_COLLAB_GUEST_COMMAND_POLICY = {
 	publish_editor_text: "allow",
 	new_session: "block",
 	get_state: "allow",
+	persist_session: "block",
 	get_available_commands: "allow",
 	get_settings: "allow",
 	set_setting: "block",
@@ -2470,6 +2471,17 @@ export async function runRpcMode(
 
 			case "get_state":
 				return success(id, "get_state", buildRpcSessionState(session));
+
+			case "persist_session": {
+				await session.sessionManager.ensureOnDisk();
+				await session.sessionManager.flush();
+				const sessionFile = session.sessionManager.getSessionFile();
+				if (!sessionFile) return error(id, "persist_session", "Session persistence is disabled.", "operation_failed");
+				return success(id, "persist_session", {
+					sessionId: session.sessionManager.getSessionId(),
+					sessionFile,
+				});
+			}
 
 			case "get_available_commands": {
 				return success(id, "get_available_commands", { commands: await getAvailableCommands() });
