@@ -9,7 +9,9 @@ export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 
 const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
-export type RpcProtocolVersion = 1 | 2;
+export type RpcProtocolVersion = 1 | 2 | 3;
+
+const EMPTY_STREAMED_MESSAGES: unknown[] = [];
 
 interface PendingRpcChunks {
 	chunkId: string;
@@ -91,6 +93,7 @@ function encodedMessageSnapshot(encoded: string): { message: unknown } | undefin
  * `Buffer.byteLength` BEFORE any full-payload allocation.
  */
 function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): Generator<string> {
+	const runtimeId = isRecord(frame) && typeof frame.runtimeId === "string" ? frame.runtimeId : undefined;
 	const byteLength = Buffer.byteLength(json, "utf8");
 	if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
 		yield `${JSON.stringify(overflowFrame(frame))}\n`;
@@ -108,6 +111,7 @@ function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): 
 			data: bytes
 				.subarray(index * RPC_CHUNK_PAYLOAD_BYTES, (index + 1) * RPC_CHUNK_PAYLOAD_BYTES)
 				.toString("base64"),
+			...(runtimeId ? { runtimeId } : {}),
 		};
 		const line = `${JSON.stringify(chunk)}\n`;
 		if (serializedFrameBytes(line.slice(0, -1)) > MAX_RPC_FRAME_BYTES)
@@ -216,6 +220,7 @@ function compactTerminalFrame(
 
 function overflowFrame(frame: object): object {
 	if (!isRecord(frame)) return { type: "rpc_frame_error", error: "RPC frame exceeded the transport limit" };
+	const runtimeMetadata = typeof frame.runtimeId === "string" ? { runtimeId: frame.runtimeId } : {};
 	if (frame.type === "response") {
 		return {
 			id: typeof frame.id === "string" ? shrinkString(frame.id, METADATA_STRING_CAP) : undefined,
@@ -223,6 +228,7 @@ function overflowFrame(frame: object): object {
 			command: typeof frame.command === "string" ? shrinkString(frame.command, METADATA_STRING_CAP) : "unknown",
 			success: false,
 			error: "RPC response exceeded the transport limit",
+			...runtimeMetadata,
 		};
 	}
 	if (frame.type === "agent_end") {
@@ -230,12 +236,14 @@ function overflowFrame(frame: object): object {
 			type: "agent_end",
 			messages: [],
 			messageCount: typeof frame.messageCount === "number" ? frame.messageCount : 0,
+			...runtimeMetadata,
 		};
 	}
 	return {
 		type: "rpc_frame_error",
 		originalType: typeof frame.type === "string" ? shrinkString(frame.type, METADATA_STRING_CAP) : undefined,
 		error: "RPC frame exceeded the transport limit",
+		...runtimeMetadata,
 	};
 }
 
@@ -262,12 +270,19 @@ export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamed
 /** Stateful encoder that tracks which messages a client has already received. */
 export class RpcFrameEncoder {
 	#streamedMessages: unknown[] = [];
+	#runtimeStreamedMessages = new Map<string, unknown[]>();
 	#protocolVersion: RpcProtocolVersion = 1;
 	#chunkCounter = 0;
 
 	setProtocolVersion(version: number): void {
-		if (version !== 1 && version !== 2) throw new Error(`Unsupported RPC protocol version: ${version}`);
+		if (version !== 1 && version !== 2 && version !== 3) {
+			throw new Error(`Unsupported RPC protocol version: ${version}`);
+		}
 		this.#protocolVersion = version;
+	}
+
+	clearRuntime(runtimeId: string): void {
+		this.#runtimeStreamedMessages.delete(runtimeId);
 	}
 
 	/**
@@ -277,12 +292,19 @@ export class RpcFrameEncoder {
 	 * returned iterable MUST be fully consumed exactly once.
 	 */
 	encodeFrames(frame: object): Iterable<string> {
-		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessages = [];
+		const runtimeId = isRecord(frame) && typeof frame.runtimeId === "string" ? frame.runtimeId : undefined;
+		const runtimeStreamedMessages = runtimeId ? this.#runtimeStreamedMessages.get(runtimeId) : undefined;
+		const needsRuntimeStream = isRecord(frame) && (frame.type === "agent_start" || frame.type === "message_end");
+		const streamedMessages = runtimeId
+			? (runtimeStreamedMessages ??
+				(needsRuntimeStream ? this.#createRuntimeStream(runtimeId) : EMPTY_STREAMED_MESSAGES))
+			: this.#streamedMessages;
+		if (isRecord(frame) && frame.type === "agent_start") streamedMessages.length = 0;
 		const json = JSON.stringify(frame);
 		let frames: Iterable<string>;
 		let singleFrame: string | undefined;
-		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
-			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
+		if (this.#protocolVersion >= 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
+			const compacted = compactTerminalFrame(frame, streamedMessages.length, streamedMessages);
 			// Reuse the original serialization when compaction was a no-op.
 			const compactedJson = compacted === frame ? json : JSON.stringify(compacted);
 			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
@@ -292,20 +314,29 @@ export class RpcFrameEncoder {
 				frames = [singleFrame];
 			}
 		} else {
-			singleFrame = encodeRpcFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
+			singleFrame = encodeRpcFrame(frame, streamedMessages.length, streamedMessages);
 			frames = [singleFrame];
 		}
 		if (!isRecord(frame)) return frames;
 		if (frame.type === "message_end") {
 			const snapshot =
-				this.#protocolVersion === 2 && Object.hasOwn(frame, "message")
+				this.#protocolVersion >= 2 && Object.hasOwn(frame, "message")
 					? { message: jsonSnapshot(frame.message) }
 					: singleFrame !== undefined
 						? encodedMessageSnapshot(singleFrame)
 						: undefined;
-			if (snapshot) this.#streamedMessages.push(snapshot.message);
-		} else if (frame.type === "agent_end" && frame.isTerminal !== false) this.#streamedMessages = [];
+			if (snapshot) streamedMessages.push(snapshot.message);
+		} else if (frame.type === "agent_end" && frame.isTerminal !== false) {
+			if (runtimeId) this.#runtimeStreamedMessages.delete(runtimeId);
+			else streamedMessages.length = 0;
+		}
 		return frames;
+	}
+
+	#createRuntimeStream(runtimeId: string): unknown[] {
+		const streamedMessages: unknown[] = [];
+		this.#runtimeStreamedMessages.set(runtimeId, streamedMessages);
+		return streamedMessages;
 	}
 
 	encode(frame: object): string {

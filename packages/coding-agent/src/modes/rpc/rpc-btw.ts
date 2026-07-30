@@ -63,7 +63,8 @@ function failPending(bridge: BtwBridge, message: string): void {
 }
 
 function cancelPending(bridge: BtwBridge): void {
-	const pending = takePending(bridge);
+	const pending = bridge.active;
+	bridge.active = undefined;
 	if (!pending) return;
 	pending.resolve({ question: pending.question, answer: null, cancelled: true });
 }

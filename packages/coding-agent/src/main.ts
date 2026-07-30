@@ -22,6 +22,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
+import { AsyncJobManager } from "./async";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -59,6 +60,7 @@ import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
+import type { RpcServerSessionFactory } from "./modes/rpc/rpc-server";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
@@ -102,10 +104,10 @@ type RunRpcMode = (
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 	mcpManager?: MCPManager,
-) => Promise<never>;
+) => Promise<void>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
-	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
+	(parsedArgs.mode === "json" || parsedArgs.mode === "rpc-server" ? process.stderr : process.stdout).write(text);
 }
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
@@ -403,6 +405,73 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		}
 		applyExtensionFlags(nextSession.extensionRunner, args.rawArgs);
 		return nextSession;
+	};
+}
+
+export interface RpcServerSessionFactoryOptions {
+	baseOptions: CreateAgentSessionOptions;
+	settings: Settings;
+	sessionDir?: string;
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
+	parsedArgs: Pick<Args, "apiKey">;
+	rawArgs: string[];
+	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+}
+
+/**
+ * Build isolated per-runtime sessions for the multiplexed RPC host. The
+ * factory intentionally creates fresh EventBus, Settings, extensions and MCP
+ * state for each runtime; only auth/model catalog and the host async manager
+ * are process-owned.
+ */
+export function createRpcServerSessionFactory(args: RpcServerSessionFactoryOptions): RpcServerSessionFactory {
+	return async request => {
+		let sessionManager: SessionManager;
+		switch (request.kind) {
+			case "create":
+				sessionManager = SessionManager.create(request.cwd, args.sessionDir);
+				break;
+			case "resume":
+				sessionManager = await SessionManager.open(request.sessionPath ?? "", args.sessionDir, undefined, {
+					initialCwd: request.cwd,
+				});
+				break;
+			case "fork":
+				sessionManager = await SessionManager.forkFrom(
+					request.sourceSessionPath ?? "",
+					request.cwd,
+					args.sessionDir,
+				);
+				break;
+		}
+		const cwd = sessionManager.getCwd();
+		const nextSettings = await args.settings.cloneForCwd(cwd);
+		applyRpcDefaultSettingOverrides(nextSettings);
+		const titleSystemPrompt = await resolvePromptInput(discoverTitleSystemPromptFile(cwd), "title system prompt");
+		const eventBus = new EventBus();
+		const result = await args.createSession({
+			...args.baseOptions,
+			cwd,
+			sessionManager,
+			settings: nextSettings,
+			authStorage: args.authStorage,
+			modelRegistry: args.modelRegistry,
+			eventBus,
+			installGlobalMcpManager: false,
+			agentId: `rpc:${request.runtimeId}`,
+			titleSystemPrompt,
+		});
+		if (args.parsedArgs.apiKey && !args.baseOptions.model && result.session.model) {
+			args.authStorage.setRuntimeApiKey(result.session.model.provider, args.parsedArgs.apiKey);
+		}
+		applyExtensionFlags(result.session.extensionRunner, args.rawArgs);
+		return {
+			session: result.session,
+			setToolUIContext: result.setToolUIContext,
+			eventBus: result.eventBus,
+			mcpManager: result.mcpManager,
+		};
 	};
 }
 
@@ -1166,13 +1235,16 @@ export async function runRootCommand(
 		process.exit(0);
 	}
 
-	if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
+	if (
+		(parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "rpc-server") &&
+		parsedArgs.fileArgs.length > 0
+	) {
 		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 		process.exit(1);
 	}
 	const mode = parsedArgs.mode || "text";
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
-	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+	const rpcInput = mode === "rpc" || mode === "rpc-ui" || mode === "rpc-server" ? claimRpcInput() : undefined;
 
 	// Kick off plugin-root preload in parallel with the remaining startup work.
 	// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -1208,18 +1280,24 @@ export async function runRootCommand(
 		// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
 		settingsInstance.override("tools.approvalMode", "yolo");
 	}
-	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
+	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "rpc-server") {
 		applyRpcDefaultSettingOverrides(settingsInstance);
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
-	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
+	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "rpc-server") {
 		Bun.env.PI_NO_PTY = "1";
 	}
-	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+	if (
+		parsedArgs.noTitle ||
+		parsedArgs.mode === "rpc" ||
+		parsedArgs.mode === "rpc-ui" ||
+		parsedArgs.mode === "rpc-server" ||
+		parsedArgs.mode === "acp"
+	) {
 		Bun.env.PI_NO_TITLE = "1";
 	}
-	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "rpc-server" || mode === "acp";
 	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
@@ -1288,26 +1366,28 @@ export async function runRootCommand(
 	// prompt, --fork with --no-session): print + exit cleanly instead of letting
 	// it surface as `[Uncaught Exception]` (see issue #2084).
 	let sessionManager: SessionManager | undefined;
-	try {
-		sessionManager = await logger.time(
-			"createSessionManager",
-			createSessionManager,
-			parsedArgs,
-			cwd,
-			settingsInstance,
-		);
-	} catch (error: unknown) {
-		if (error instanceof SessionResolutionError) {
-			process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
-			if (error.hint) {
-				process.stderr.write(`${chalk.dim(error.hint)}\n`);
+	if (mode !== "rpc-server") {
+		try {
+			sessionManager = await logger.time(
+				"createSessionManager",
+				createSessionManager,
+				parsedArgs,
+				cwd,
+				settingsInstance,
+			);
+		} catch (error: unknown) {
+			if (error instanceof SessionResolutionError) {
+				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+				if (error.hint) {
+					process.stderr.write(`${chalk.dim(error.hint)}\n`);
+				}
+				process.exit(1);
 			}
-			process.exit(1);
+			throw error;
 		}
-		throw error;
 	}
 
-	if (typeof parsedArgs.resume === "string" && sessionManager) {
+	if (mode !== "rpc-server" && typeof parsedArgs.resume === "string" && sessionManager) {
 		const previousCwd = cwd;
 		cwd = await switchToResumedProject(sessionManager.getCwd(), settingsInstance, pluginPreloadPromise);
 		if (cwd !== previousCwd) {
@@ -1323,14 +1403,14 @@ export async function runRootCommand(
 
 	// User declined the missing-directory move prompt — exit cleanly instead of
 	// letting the cancellation fall through to a new session.
-	if (typeof parsedArgs.resume === "string" && !sessionManager) {
+	if (mode !== "rpc-server" && typeof parsedArgs.resume === "string" && !sessionManager) {
 		writeStartupNotice(parsedArgs, `${chalk.dim("Resume cancelled: session was not moved.")}\n`);
 		stopStartupWatchdog();
 		process.exit(0);
 	}
 
 	// Handle --resume (no value): show session picker
-	if (parsedArgs.resume === true && !parsedArgs.fork) {
+	if (mode !== "rpc-server" && parsedArgs.resume === true && !parsedArgs.fork) {
 		const folderSessions = await logger.time("SessionManager.list", SessionManager.list, cwd, parsedArgs.sessionDir);
 		let preloadedAllSessions: SessionInfo[] | undefined;
 		if (folderSessions.length === 0) {
@@ -1460,6 +1540,31 @@ export async function runRootCommand(
 		const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
 		stopStartupWatchdog();
 		await runAcpMode(createAcpSession);
+	} else if (mode === "rpc-server") {
+		const asyncJobManager = new AsyncJobManager({
+			maxRunningJobs: Math.min(100, Math.max(1, settingsInstance.get("async.maxJobs") ?? 100)),
+		});
+		AsyncJobManager.setInstance(asyncJobManager);
+		const createRpcSession = createRpcServerSessionFactory({
+			baseOptions: sessionOptions,
+			settings: settingsInstance,
+			sessionDir: parsedArgs.sessionDir,
+			authStorage,
+			modelRegistry,
+			parsedArgs,
+			rawArgs,
+			createSession,
+		});
+		const runRpcServer = (await import("./modes/rpc/rpc-server")).runRpcServer;
+		stopStartupWatchdog();
+		await runRpcServer({
+			createSession: createRpcSession,
+			input: rpcInput,
+			disposeHost: async () => {
+				if (AsyncJobManager.instance() === asyncJobManager) AsyncJobManager.setInstance(undefined);
+				await asyncJobManager.dispose({ timeoutMs: 3_000 });
+			},
+		});
 	} else {
 		// Resolve extension-registered CLI flags before creating the session so a
 		// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb

@@ -15,7 +15,7 @@ import {
 } from "./flag-tables";
 import { CliUsageError } from "./usage-error";
 
-export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
+export type Mode = "text" | "json" | "rpc" | "rpc-server" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;

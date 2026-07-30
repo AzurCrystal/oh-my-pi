@@ -196,6 +196,34 @@ describe("RPC parity regression contracts", () => {
 		for (const flag of ["isRetrying", "isBashRunning", "isAborting", "isGeneratingHandoff"]) {
 			expect(typeof state[flag]).toBe("boolean");
 		}
+
+		const contextBreakdown = record(state.contextBreakdown, "get_state contextBreakdown");
+		for (const field of ["contextWindow", "usedTokens", "autoCompactBufferTokens", "freeTokens"]) {
+			expect(typeof contextBreakdown[field]).toBe("number");
+		}
+		const categories = array(contextBreakdown.categories, "get_state contextBreakdown categories");
+		expect(categories).not.toHaveLength(0);
+		for (const category of categories) {
+			expect(record(category, "get_state context category")).toEqual({
+				id: expect.any(String),
+				label: expect.any(String),
+				tokens: expect.any(Number),
+			});
+		}
+		if (contextBreakdown.snapcompact !== undefined) {
+			const snapcompact = record(contextBreakdown.snapcompact, "get_state contextBreakdown snapcompact");
+			expect(snapcompact).toMatchObject({ visionCapable: expect.any(Boolean), savedTokens: expect.any(Number) });
+		}
+
+		const asyncJobs = record(state.asyncJobs, "get_state asyncJobs");
+		array(asyncJobs.running, "get_state asyncJobs running");
+		array(asyncJobs.recent, "get_state asyncJobs recent");
+		const delivery = record(asyncJobs.delivery, "get_state asyncJobs delivery");
+		expect(delivery).toMatchObject({
+			queued: expect.any(Number),
+			delivering: expect.any(Boolean),
+			pendingJobIds: expect.any(Array),
+		});
 		const configWarnings = array(state.configWarnings, "get_state configWarnings");
 		const skillWarnings = array(state.skillWarnings, "get_state skillWarnings");
 		expect(configWarnings.some(warning => typeof warning === "string" && warning.includes("missing-contract"))).toBe(

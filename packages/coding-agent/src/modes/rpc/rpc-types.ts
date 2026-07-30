@@ -14,6 +14,8 @@ import type {
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
 } from "../../extensibility/extensions/types";
+import type { AsyncJobSnapshot } from "../../session/agent-session-types";
+import type { ContextBreakdown } from "../utils/context-usage";
 import type { MentalModelDetail, MentalModelMode } from "../../hindsight";
 import type { SmitherySearchResult } from "../../mcp/smithery-registry";
 import type { MCPServerConfig } from "../../mcp/types";
@@ -228,6 +230,70 @@ export type { RpcRepoStatus } from "./rpc-workspace";
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
+
+/** Host-level lifecycle commands. They intentionally have no runtimeId. */
+export type RpcRuntimeHostCommand =
+	| { id?: string; type: "runtime_create"; cwd: string }
+	| { id?: string; type: "runtime_resume"; cwd: string; sessionPath: string }
+	| { id?: string; type: "runtime_fork"; cwd: string; sourceSessionPath: string }
+	| { id?: string; type: "runtime_close"; runtimeId: string }
+	| { id?: string; type: "runtime_list" };
+
+/** An existing RPC command scoped to one immutable rpc-server runtime handle. */
+export type RpcRuntimeCommand = RpcCommand & { runtimeId: string };
+
+/**
+ * v3 multiplexed server input. Lifecycle commands remain host-scoped; all
+ * existing commands and side-channel replies must name their target runtime.
+ */
+export type RpcServerCommand =
+	| RpcRuntimeHostCommand
+	| RpcRuntimeCommand
+	| (RpcExtensionUIResponse & { runtimeId: string })
+	| (RpcHostToolResult & { runtimeId: string })
+	| (RpcHostToolUpdate & { runtimeId: string })
+	| (RpcHostUriResult & { runtimeId: string });
+
+export interface RpcRuntimeDescriptor {
+	runtimeId: string;
+	state: RpcSessionState;
+}
+
+export type RpcRuntimeHostResponse =
+	| {
+			id?: string;
+			type: "response";
+			command: "runtime_create" | "runtime_resume" | "runtime_fork";
+			success: true;
+			data: RpcRuntimeDescriptor;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "runtime_close";
+			success: true;
+			runtimeId: string;
+			data: { closed: true };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "runtime_list";
+			success: true;
+			data: { runtimes: RpcRuntimeDescriptor[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code?: string;
+			runtimeId?: string;
+	  };
+
+/** A server-routed runtime frame carries its immutable runtime handle. */
+export type RpcRuntimeFrame = { runtimeId: string } & Record<string, unknown>;
 
 export type RpcCommand =
 	// Protocol
@@ -576,6 +642,12 @@ export interface RpcSessionState {
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
+	/** Semantic context-window accounting, without TUI rendering metadata. */
+	contextBreakdown?: Omit<ContextBreakdown, "model" | "categories"> & {
+		categories: Array<Pick<ContextBreakdown["categories"][number], "id" | "label" | "tokens">>;
+	};
+	/** Running, recent, and pending-delivery asynchronous jobs for this session. */
+	asyncJobs?: AsyncJobSnapshot;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
 	configWarnings: string[];
@@ -696,8 +768,8 @@ export interface RpcPromptResultFrame {
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
-	supportedProtocolVersions: [1, 2];
-	capabilities?: RpcCapability[];
+	supportedProtocolVersions: [1, 2] | [1, 2, 3];
+	capabilities?: RpcCapability[] | { multiSession: true };
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
 }
@@ -709,6 +781,8 @@ export interface RpcChunkFrame {
 	count: number;
 	byteLength: number;
 	data: string;
+	/** Present on v3 host chunks so physical frames remain runtime-routable. */
+	runtimeId?: string;
 }
 
 export interface RpcHandoffResult {
@@ -795,7 +869,7 @@ export type RpcResponse =
 			type: "response";
 			command: "negotiate_protocol";
 			success: true;
-			data: { protocolVersion: 2 };
+			data: { protocolVersion: 2 | 3 };
 	  }
 
 	// Prompting (async - events follow)

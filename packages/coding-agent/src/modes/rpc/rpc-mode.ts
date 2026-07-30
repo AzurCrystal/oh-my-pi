@@ -70,6 +70,7 @@ import {
 	type Theme,
 	theme,
 } from "../theme/theme";
+import { computeContextBreakdown } from "../utils/context-usage";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import * as rpcAccounts from "./rpc-accounts";
@@ -1187,6 +1188,65 @@ export function requestRpcDialog<T>(
 	return promise;
 }
 /**
+ * Optional embedding transport. rpc-server supplies one process-owned frame
+ * writer and suppresses per-runtime ready frames; standalone rpc keeps the
+ * historical stdin/stdout transport unchanged.
+ */
+export interface RpcModeTransport {
+	writeFrame?: (frame: object) => void;
+	emitReady?: boolean;
+	exitOnEof?: boolean;
+	onStopped?: () => void | Promise<void>;
+}
+
+/** Build the canonical state snapshot used by both rpc and rpc-server. */
+export function buildRpcSessionState(session: AgentSession): RpcSessionState {
+	const contextBreakdown = computeContextBreakdown(session, { snapcompactSavings: true });
+	return {
+		model: session.model,
+		thinkingLevel: session.thinkingLevel,
+		isStreaming: session.isStreaming,
+		isCompacting: session.isCompacting,
+		isRetrying: session.isRetrying,
+		isBashRunning: session.isBashRunning,
+		isAborting: session.isAborting,
+		isGeneratingHandoff: session.isGeneratingHandoff,
+		steeringMode: session.steeringMode,
+		followUpMode: session.followUpMode,
+		interruptMode: session.interruptMode,
+		sessionFile: session.sessionFile,
+		sessionId: session.sessionId,
+		sessionName: session.sessionName,
+		autoCompactionEnabled: session.autoCompactionEnabled,
+		messageCount: session.messages.length,
+		queuedMessageCount: session.queuedMessageCount,
+		todoPhases: session.getTodoPhases(),
+		systemPrompt: session.systemPrompt,
+		dumpTools: session.agent.state.tools.map(tool => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
+			examples: tool.examples,
+		})),
+		contextUsage: session.getContextUsage(),
+		contextBreakdown: {
+			contextWindow: contextBreakdown.contextWindow,
+			usedTokens: contextBreakdown.usedTokens,
+			autoCompactBufferTokens: contextBreakdown.autoCompactBufferTokens,
+			freeTokens: contextBreakdown.freeTokens,
+			categories: contextBreakdown.categories.map(({ id, label, tokens }) => ({ id, label, tokens })),
+			snapcompact: contextBreakdown.snapcompact,
+		},
+		asyncJobs: session.getAsyncJobSnapshot({ recentLimit: 5 }) ?? undefined,
+		configWarnings: [...session.configWarnings],
+		skillWarnings: session.skillWarnings.map(warning => ({
+			skillPath: warning.skillPath,
+			message: warning.message,
+		})),
+	};
+}
+
+/**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
@@ -1196,7 +1256,8 @@ export async function runRpcMode(
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
 	mcpManager?: MCPManager,
-): Promise<never> {
+	transport?: RpcModeTransport,
+): Promise<void> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -1204,7 +1265,15 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
-	const frameEncoder = new RpcFrameEncoder();
+	// Embedded runtimes route every frame through their host's single encoder.
+	// Standalone rpc retains its private JSONL encoder and stdout queue.
+	const frameEncoder = transport?.writeFrame ? undefined : new RpcFrameEncoder();
+	let stoppedNotified = false;
+	const notifyStopped = async (): Promise<void> => {
+		if (stoppedNotified) return;
+		stoppedNotified = true;
+		await transport?.onStopped?.();
+	};
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
@@ -1219,20 +1288,28 @@ export async function runRpcMode(
 			// stdout gone (host exited) — nothing left to deliver; keep the queue alive.
 			.catch(() => {});
 	};
-	writeFrames(
-		frameEncoder.encodeFrames({
+	const emitFrame = (frame: object) => {
+		if (transport?.writeFrame) {
+			transport.writeFrame(frame);
+			return;
+		}
+		writeFrames(frameEncoder!.encodeFrames(frame));
+	};
+	if (transport?.emitReady !== false) {
+		emitFrame({
 			type: "ready",
 			protocolVersion: 1,
 			supportedProtocolVersions: [1, 2],
 			capabilities: ["prompt_result", "prompt_lifecycle_disposition"],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-		}),
-	);
+		});
+	}
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeFrames(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
+		emitFrame(obj);
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true) {
+			frameEncoder?.setProtocolVersion(2);
+		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -2391,42 +2468,8 @@ export async function runRpcMode(
 			// State
 			// =================================================================
 
-			case "get_state": {
-				const state: RpcSessionState = {
-					model: session.model,
-					thinkingLevel: session.thinkingLevel,
-					isStreaming: session.isStreaming,
-					isCompacting: session.isCompacting,
-					isRetrying: session.isRetrying,
-					isBashRunning: session.isBashRunning,
-					isAborting: session.isAborting,
-					isGeneratingHandoff: session.isGeneratingHandoff,
-					steeringMode: session.steeringMode,
-					followUpMode: session.followUpMode,
-					interruptMode: session.interruptMode,
-					sessionFile: session.sessionFile,
-					sessionId: session.sessionId,
-					sessionName: session.sessionName,
-					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
-					queuedMessageCount: session.queuedMessageCount,
-					todoPhases: session.getTodoPhases(),
-					systemPrompt: session.systemPrompt,
-					dumpTools: session.agent.state.tools.map(tool => ({
-						name: tool.name,
-						description: tool.description,
-						parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
-						examples: tool.examples,
-					})),
-					contextUsage: session.getContextUsage(),
-					configWarnings: [...session.configWarnings],
-					skillWarnings: session.skillWarnings.map(warning => ({
-						skillPath: warning.skillPath,
-						message: warning.message,
-					})),
-				};
-				return success(id, "get_state", state);
-			}
+			case "get_state":
+				return success(id, "get_state", buildRpcSessionState(session));
 
 			case "get_available_commands": {
 				return success(id, "get_available_commands", { commands: await getAvailableCommands() });
@@ -3602,9 +3645,12 @@ export async function runRpcMode(
 			rpcWorkModes.disposeRpcWorkModes(session);
 			await releaseRpcSessionAttachments();
 			await session.dispose();
-			// See the EOF path: queued frames must reach stdout before the process dies.
+			// See the EOF path: queued frames must reach stdout before a standalone
+			// RPC process exits. Embedded runtimes hand lifecycle ownership back to
+			// their host instead.
 			await stdoutQueue;
-			process.exit(0);
+			if (transport?.exitOnEof !== false) process.exit(0);
+			await notifyStopped();
 		},
 	});
 
@@ -3668,5 +3714,6 @@ export async function runRpcMode(
 	// Frames handed to `writeFrames` are only queued; exiting without awaiting the
 	// queue drops already-produced responses and `exec_output` chunks mid-flight.
 	await stdoutQueue;
-	process.exit(0);
+	if (transport?.exitOnEof !== false) process.exit(0);
+	await notifyStopped();
 }

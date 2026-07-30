@@ -466,6 +466,8 @@ export interface CreateAgentSessionOptions {
 	enableMCP?: boolean;
 	/** Existing MCP manager to reuse when MCP is enabled (skips discovery, propagates to toolSession). */
 	mcpManager?: MCPManager;
+	/** Set false for concurrent embedded top-level sessions with private MCP handles. */
+	installGlobalMcpManager?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -1585,12 +1587,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Delivery is owner-routed: every AgentSession registers its own sink
 	// (see session/async-job-delivery.ts), so the manager takes no default
 	// onJobComplete here.
+	const inheritedAsyncJobManager = AsyncJobManager.instance();
 	const asyncJobManager =
-		!options.parentTaskPrefix && !AsyncJobManager.instance()
+		!options.parentTaskPrefix && !inheritedAsyncJobManager
 			? new AsyncJobManager({ maxRunningJobs: asyncMaxJobs })
 			: undefined;
 
-	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
+	const scopedAsyncJobManager =
+		asyncJobManager ?? (options.parentTaskPrefix || options.agentId ? inheritedAsyncJobManager : undefined);
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1869,11 +1873,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
-		// Only top-level sessions own the global MCPManager. Subagents already
-		// receive the parent's manager via `options.mcpManager`, and reassigning
-		// the singleton to the same value is a no-op — keep the gate explicit
-		// to mirror the AsyncJobManager ownership rule.
-		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
+		// Only ordinary top-level sessions install the process-global MCP handle.
+		// Concurrent rpc-server runtimes retain private managers and pass them to
+		// their own tools/subagents instead of overwriting another runtime's handle.
+		if (mcpManager && !options.parentTaskPrefix && options.installGlobalMcpManager !== false) {
+			MCPManager.setInstance(mcpManager);
+		}
 
 		const builtInToolNames = [...toolRegistry.keys()];
 		let customToolPaths: ToolPathWithSource[] = [];

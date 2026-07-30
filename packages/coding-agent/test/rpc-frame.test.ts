@@ -90,6 +90,23 @@ describe("RPC frame encoding", () => {
 		});
 	});
 
+	it("keeps terminal compaction snapshots isolated across interleaved runtime IDs", () => {
+		const messages = oversizedMessageHistory("runtime-a");
+		const encoder = new RpcFrameEncoder();
+		encoder.setProtocolVersion(3);
+		encoder.encode({ type: "agent_start", runtimeId: "a" });
+		for (const message of messages) encoder.encode({ type: "message_end", runtimeId: "a", message });
+		// A different active runtime must not reset runtime a's streamed history.
+		encoder.encode({ type: "agent_start", runtimeId: "b" });
+
+		expect(decode(encoder.encode({ type: "agent_end", runtimeId: "a", messages }))).toEqual({
+			type: "agent_end",
+			runtimeId: "a",
+			messages: [],
+			messageCount: messages.length,
+		});
+	});
+
 	it("does not let later mutation rewrite the message_end snapshot", () => {
 		const messages = oversizedMessageHistory("before");
 		const encoder = new RpcFrameEncoder();
@@ -177,24 +194,27 @@ describe("RPC frame encoding", () => {
 			command: "get_state",
 			success: true,
 			data: {},
+			runtimeId: "runtime-overflow",
 		});
 		const decoded = decode(encoded);
 
 		expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
 		expect(decoded.success).toBe(false);
 		expect(decoded.id).toContain("chars elided for RPC frame");
+		expect(decoded.runtimeId).toBe("runtime-overflow");
 	});
 
-	it("losslessly chunks oversized protocol v2 responses into bounded JSONL frames", () => {
+	it("losslessly chunks oversized v3 runtime responses into bounded, correlated JSONL frames", () => {
 		const frame = {
-			id: "request-v2",
+			id: "request-v3",
 			type: "response",
 			command: "get_messages",
 			success: true,
 			data: { messages: [{ role: "assistant", content: "😀".repeat(400_000) }] },
+			runtimeId: "runtime-1",
 		};
 		const encoder = new RpcFrameEncoder();
-		encoder.setProtocolVersion(2);
+		encoder.setProtocolVersion(3);
 		const encoded = encoder.encode(frame);
 		const lines = encoded.trimEnd().split("\n");
 		const decoder = new RpcFrameDecoder();
@@ -203,7 +223,9 @@ describe("RPC frame encoding", () => {
 		expect(lines.length).toBeGreaterThan(1);
 		for (const line of lines) {
 			expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
-			decoded = decoder.push(JSON.parse(line));
+			const parsed = JSON.parse(line);
+			expect(parsed).toHaveProperty("runtimeId", "runtime-1");
+			decoded = decoder.push(parsed);
 		}
 		expect(decoded).toEqual(frame);
 	});
